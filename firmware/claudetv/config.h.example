@@ -1,0 +1,6 @@
+// Copy this file to config.h (which is gitignored) and fill in your values.
+#pragma once
+#define WIFI_SSID  "YOUR_WIFI_SSID"
+#define WIFI_PASS  "YOUR_WIFI_PASSWORD"
+// URL of the host collector (host running claude_usage_server.py), e.g. your always-on box:
+#define USAGE_URL  "http://192.168.1.50:8088/usage"

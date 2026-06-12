@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude usage collector for SmallTV-Ultra
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=a
+WorkingDirectory=/home/a
+ExecStart=/usr/bin/python3 -u /home/a/claude_usage_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

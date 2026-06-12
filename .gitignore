@@ -1,0 +1,19 @@
+# secrets / local config — NEVER commit
+firmware/claudetv/config.h
+**/.credentials.json
+*.env
+
+# build artifacts
+build/
+**/build/
+*.bin
+*.bin.gz
+*.elf
+*.map
+*.d.o
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
