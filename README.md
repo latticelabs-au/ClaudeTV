@@ -79,7 +79,19 @@ xdg-open http://<host-ip>:8088/
 (`http://<host-ip>:8088/`) shows live status and lets you edit weather/Claude config, watch the
 token keeper, refresh the token, and restart the service — no SSH needed.
 
-### 2. Firmware
+### 2. Firmware — easy path (no build)
+1. Download the prebuilt **`claudetv-<version>-generic.bin`** from the
+   [latest release](https://github.com/latticelabs-au/ClaudeTV/releases/latest). It has no baked
+   secrets — WiFi and the collector URL are entered on the device.
+2. Flash it over the stock device's web updater (find the device's IP on your router):
+   ```bash
+   curl -F "firmware=@claudetv-<version>-generic.bin" http://<device-ip>/update
+   ```
+3. After it reboots it creates a WiFi hotspot **`ClaudeTV-Setup`**. Join it, pick your WiFi, and
+   paste your **Collector URL** (the master terminal shows it at the top — `http://<host-ip>:8088/usage`).
+   Done — the device finds your network and the collector and starts displaying.
+
+### 2b. Firmware — build it yourself
 1. `cp firmware/claudetv/config.h.example firmware/claudetv/config.h` and fill in your WiFi +
    the collector URL (`http://<host-ip>:8088/usage`).
 2. Copy `firmware/User_Setup.h` into your TFT_eSPI library folder (overwrites its `User_Setup.h`).

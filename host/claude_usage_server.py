@@ -30,10 +30,11 @@ ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 START_TS = time.time()
 
-EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT",
+EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", "DEVICE_URL",
             "CLAUDE_CREDENTIALS", "CLAUDE_BIN", "PING_MODEL", "REFRESH_MARGIN_MIN"]
 DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Australia/Melbourne",
             "USAGE_EVERY": "150", "WEATHER_EVERY": "900", "PORT": "8088",
+            "DEVICE_URL": "http://claudetv.local",
             "CLAUDE_CREDENTIALS": "~/.claude/.credentials.json", "CLAUDE_BIN": "",
             "PING_MODEL": "haiku", "REFRESH_MARGIN_MIN": "30"}
 CONFIG = {}
@@ -256,11 +257,17 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 </style></head><body>
 <h1>Claude<span class=c>TV</span> &middot; Master Terminal</h1>
 <div class=sub>collector + control plane &middot; <a href="https://latticelabs.au" target=_blank>lattice labs</a></div>
+<div class=card style="border-color:#39c3cd;background:#0d2025">
+<div class=muted>Paste this into your ClaudeTV device's <b>Collector URL</b> field:</div>
+<div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+<code id=ownUrl style="flex:1;font-size:15px;color:#3fd2dd">…</code>
+<button style="width:auto;padding:8px 14px" onclick="navigator.clipboard.writeText(ownUrl.textContent);this.textContent='Copied'">Copy</button></div></div>
 
 <div class=card><h2>Service</h2>
 <div class=row><span>Status</span><span class=pill ok id=svc>running</span></div>
 <div class=row><span>Uptime</span><span id=up>--</span></div>
-<button style="background:#39c3cd;color:#06222a;font-weight:700;margin-top:6px" onclick="window.open('http://claudetv.local','_blank')">Open ClaudeTV device &#8599;</button>
+<label style="margin-top:6px">ClaudeTV device URL</label><input id=DEVICE_URL>
+<button style="background:#39c3cd;color:#06222a;font-weight:700;margin-top:8px" onclick="window.open(devUrl||'http://claudetv.local','_blank')">Open ClaudeTV device &#8599;</button>
 <div class=grid style=margin-top:8px><button class=ghost onclick=restart()>Restart service</button><button class=ghost onclick=load()>Refresh</button></div></div>
 
 <div class=card><h2>Claude token keeper</h2>
@@ -300,6 +307,8 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 
 <div class=foot><a href="https://latticelabs.au" target=_blank>lattice labs &middot; ClaudeTV</a></div>
 <script>
+let devUrl='';
+ownUrl.textContent=location.origin+'/usage';
 function fmtUp(s){let h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h+'h '+m+'m'}
 function fmtAgo(s){if(s<0)return 'never';if(s<60)return s+'s ago';let m=Math.floor(s/60);return m<60?m+'m ago':Math.floor(m/60)+'h ago'}
 function pill(el,cls,txt){el.className='pill '+cls;el.textContent=txt}
@@ -314,6 +323,7 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  const w=s.weather;wx.textContent=w.city?(w.city+' '+w.wt+'°C '+w.wc+' · feels '+w.wfl+'° · '+w.wlo+'/'+w.whi+'° · rain '+w.wrain+'%'):'weather --';
  for(const k in s.config){const el=document.getElementById(k);if(el&&document.activeElement!==el)el.value=s.config[k];}
  CITY_disp.textContent=s.config.CITY||'--';geoMeta.textContent=s.config.LAT?('· '+s.config.TZ):'';
+ devUrl=s.config.DEVICE_URL||'';
 }).catch(()=>{pill(svc,'bad','unreachable')})}
 let geoT;
 citySearch.oninput=function(){clearTimeout(geoT);const q=this.value.trim();if(q.length<2){geoResults.innerHTML='';return;}
@@ -321,7 +331,7 @@ citySearch.oninput=function(){clearTimeout(geoT);const q=this.value.trim();if(q.
   rs.forEach(h=>{const b=document.createElement('button');b.className='ghost';b.style.marginBottom='4px';b.textContent=h.label;b.onclick=()=>pickCity(h);geoResults.appendChild(b);});});},350);};
 function pickCity(h){geoResults.innerHTML='';citySearch.value='';pill(svc,'warn','applying…');
  fetch('/api/config?CITY='+encodeURIComponent(h.city)+'&LAT='+h.lat+'&LON='+h.lon+'&TZ='+encodeURIComponent(h.tz),{method:'POST'}).then(()=>setTimeout(load,3500));}
-function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','CLAUDE_CREDENTIALS','CLAUDE_BIN','PING_MODEL','REFRESH_MARGIN_MIN','USAGE_EVERY','PORT'];
+function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','CLAUDE_CREDENTIALS','CLAUDE_BIN','PING_MODEL','REFRESH_MARGIN_MIN','USAGE_EVERY','PORT'];
  const q=ks.map(k=>k+'='+encodeURIComponent(document.getElementById(k).value)).join('&');
  if(!confirm('Save config and restart the collector?'))return;
  fetch('/api/config?'+q,{method:'POST'}).then(()=>{pill(svc,'warn','restarting');setTimeout(load,3500)})}

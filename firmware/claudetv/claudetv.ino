@@ -20,7 +20,7 @@
 #include "logo.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "4.1"
+#define FW_VER  "4.2"
 #define TZ_STR  "AEST-10AEDT,M10.1.0,M4.1.0/3"
 #define TFT_BL  5
 #define WX_CYCLE_MS 4000
@@ -35,8 +35,8 @@ int connOK=-1, wxIdx=0; bool haveData=false, nightActive=false;
 struct { int s=0, w=0, wt=-999, wfl=-999, whi=-999, wlo=-999, wrain=-999, whum=-999; String sr, wr, wc, city; } U;
 int pS=-99, pW=-99, pConn=-1; String pSR="\x01", pWR="\x01", pDate="\x01";
 
-struct Settings { uint8_t magic, bri, nEn, nStart, nEnd, nBri, rot; uint16_t refresh; } S;
-const uint8_t MAGIC = 0xC4;
+struct Settings { uint8_t magic, bri, nEn, nStart, nEnd, nBri, rot; uint16_t refresh; char usageUrl[100]; } S;
+const uint8_t MAGIC = 0xC5;
 
 // geometry (1:1 with emulator)
 const int UCX=8, UCY=33, UCW=224, UCH=79, LCX=64, RCX=176;
@@ -44,7 +44,7 @@ const int WCX=8, WCY=118, WCW=224, WCH=54;
 const int TIME_Y=196, DATE_Y=222;
 
 void saveSettings(){ EEPROM.put(0,S); EEPROM.commit(); }
-void defaults(){ S = {MAGIC, 60, 1, 21, 7, 30, 0, 20}; }
+void defaults(){ memset(&S,0,sizeof S); S.magic=MAGIC; S.bri=60; S.nEn=1; S.nStart=21; S.nEnd=7; S.nBri=30; S.rot=0; S.refresh=20; strncpy(S.usageUrl,USAGE_URL,sizeof(S.usageUrl)-1); }
 uint16_t lvl(int p){ if(p<0)return C_GRAY; if(p>=85)return C_RED; if(p>=50)return C_AMBER; return C_GREEN; }
 void applyBacklight(){ int b=nightActive?S.nBri:S.bri; b=constrain(b,0,100); analogWrite(TFT_BL,(100-b)*255/100); }
 bool isNight(int hr){ if(!S.nEn||S.nStart==S.nEnd)return false; return S.nStart<S.nEnd?(hr>=S.nStart&&hr<S.nEnd):(hr>=S.nStart||hr<S.nEnd); }
@@ -119,7 +119,7 @@ void splash(){
 
 void fetchUsage(){
   WiFiClient client; HTTPClient http; http.setTimeout(6000);
-  if(!http.begin(client,USAGE_URL)){connOK=0;return;}
+  if(!http.begin(client,S.usageUrl)){connOK=0;return;}
   int code=http.GET();
   if(code==200){
     JsonDocument doc;
@@ -152,6 +152,7 @@ button{cursor:pointer;width:100%}.grid{display:grid;grid-template-columns:1fr 1f
 <label>Night brightness <span id=nbril></span></label><input type=range min=0 max=100 id=nBri oninput="set('nb',this.value)"></div>
 <div class=card><div class=row><label>Flip display 180&deg;</label><button style="width:auto" onclick="set('rot',-1)">Rotate</button></div>
 <div class=row><label>Refresh (s)</label><input type=number min=5 max=120 id=refresh onchange="set('refresh',this.value)"></div></div>
+<div class=card><label>Collector URL (host service)</label><input id=usage onchange="fetch('/set?usage='+encodeURIComponent(this.value)).then(load)"></div>
 <div class=card><button style="background:#39c3cd;color:#06222a;font-weight:700" onclick="fetch('/state').then(r=>r.json()).then(s=>window.open(s.terminal||'/','_blank'))">Master Terminal &#8599;</button></div>
 <div class=card><div class=grid><button onclick="if(confirm('Reboot device?'))set('reboot',1)">Reboot</button><button onclick="location.href='/update'">Firmware OTA</button></div></div>
 <div class=foot><a href="https://latticelabs.au" target=_blank style="color:#3fd2dd;text-decoration:none">lattice labs</a></div>
@@ -161,7 +162,8 @@ function load(){fetch('/state').then(r=>r.json()).then(s=>{ver.textContent='v'+s
 sess.textContent=s.haveData?s.s+'%':'--';sessr.textContent=s.sr?('resets '+s.sr):'idle';
 week.textContent=s.haveData?s.w+'%':'--';weekr.textContent=s.wr?('resets '+s.wr):'';
 wx.textContent=s.city+' '+s.wt+'°C '+s.wc;clock.textContent=s.time;
-bri.value=s.bri;bril.textContent=s.bri+'%';nEn.checked=s.ne;nStart.value=s.ns;nEnd.value=s.nf;nBri.value=s.nb;nbril.textContent=s.nb+'%';refresh.value=s.refresh;}).catch(()=>{})}
+bri.value=s.bri;bril.textContent=s.bri+'%';nEn.checked=s.ne;nStart.value=s.ns;nEnd.value=s.nf;nBri.value=s.nb;nbril.textContent=s.nb+'%';refresh.value=s.refresh;
+if(document.activeElement!==usage)usage.value=s.usage||'';}).catch(()=>{})}
 load();setInterval(load,2000);
 </script></body></html>)HTML";
 
@@ -172,7 +174,8 @@ void handleState(){
   d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["s"]=U.s; d["w"]=U.w; d["sr"]=U.sr; d["wr"]=U.wr;
   d["city"]=U.city; d["wt"]=U.wt; d["wc"]=U.wc; d["time"]=hms;
   d["bri"]=S.bri; d["ne"]=S.nEn; d["ns"]=S.nStart; d["nf"]=S.nEnd; d["nb"]=S.nBri; d["rot"]=S.rot; d["refresh"]=S.refresh;
-  String tu=USAGE_URL; int i=tu.indexOf("/usage"); d["terminal"] = (i>0) ? tu.substring(0,i)+"/" : tu;
+  d["usage"]=S.usageUrl;
+  String tu=S.usageUrl; int i=tu.indexOf("/usage"); d["terminal"] = (i>0) ? tu.substring(0,i)+"/" : tu;
   String out; serializeJson(d,out); server.send(200,"application/json",out);
 }
 void handleSet(){
@@ -183,6 +186,7 @@ void handleSet(){
   if(server.hasArg("ns"))S.nStart=constrain(server.arg("ns").toInt(),0,23);
   if(server.hasArg("nf"))S.nEnd=constrain(server.arg("nf").toInt(),0,23);
   if(server.hasArg("refresh"))S.refresh=constrain(server.arg("refresh").toInt(),5,120);
+  if(server.hasArg("usage")){ String u=server.arg("usage"); if(u.length()>6){ strncpy(S.usageUrl,u.c_str(),sizeof(S.usageUrl)-1); S.usageUrl[sizeof(S.usageUrl)-1]=0; } }
   if(server.hasArg("rot")){S.rot=S.rot?0:2;redraw=true;}
   if(server.hasArg("reboot"))reboot=true;
   saveSettings();
@@ -193,7 +197,8 @@ void handleSet(){
 
 void setup(){
   Serial.begin(115200); Serial.println(F("\n[" FW_NAME " v" FW_VER "] boot"));
-  EEPROM.begin(64); EEPROM.get(0,S); if(S.magic!=MAGIC) defaults();
+  EEPROM.begin(256); EEPROM.get(0,S); if(S.magic!=MAGIC) defaults();
+  if(S.usageUrl[0]==0){ strncpy(S.usageUrl,USAGE_URL,sizeof(S.usageUrl)-1); }
   analogWriteRange(255); analogWriteFreq(22000); pinMode(TFT_BL,OUTPUT); applyBacklight();
 
   tft.init(); tft.setRotation(S.rot); tft.startWrite();
@@ -203,9 +208,18 @@ void setup(){
   C_GREEN=tft.color565(0x54,0xd3,0x6e); C_AMBER=tft.color565(0xf0,0xad,0x36); C_RED=tft.color565(0xff,0x4d,0x68); C_SKY=tft.color565(0x84,0xcd,0xf2);
   splash();
 
-  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_PASS);
-  unsigned long t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<25000){delay(250);yield();}
-  if(WiFi.status()!=WL_CONNECTED){ WiFiManager wm; wm.setConfigPortalTimeout(180); if(!wm.autoConnect("ClaudeTV-Setup")){delay(1000);ESP.restart();} }
+  WiFi.mode(WIFI_STA);
+  if(strlen(WIFI_SSID)>0){                      // baked creds (personal build) -> direct connect
+    WiFi.begin(WIFI_SSID,WIFI_PASS);
+    unsigned long t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<25000){delay(250);yield();}
+  }
+  if(WiFi.status()!=WL_CONNECTED){               // generic build / bad creds -> captive portal
+    WiFiManager wm; wm.setConfigPortalTimeout(180);
+    WiFiManagerParameter pUrl("usage","Collector URL (http://host:8088/usage)",S.usageUrl,sizeof(S.usageUrl)-1);
+    wm.addParameter(&pUrl);
+    if(!wm.autoConnect("ClaudeTV-Setup")){delay(1000);ESP.restart();}
+    if(strlen(pUrl.getValue())>6){ strncpy(S.usageUrl,pUrl.getValue(),sizeof(S.usageUrl)-1); S.usageUrl[sizeof(S.usageUrl)-1]=0; saveSettings(); }
+  }
   Serial.print(F("IP: ")); Serial.println(WiFi.localIP());
   configTime(TZ_STR,"pool.ntp.org","time.nist.gov");
   if(MDNS.begin("claudetv")) MDNS.addService("http","tcp",80);
