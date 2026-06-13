@@ -17,3 +17,7 @@ build/
 .idea/
 .DS_Store
 Thumbs.db
+
+# draft/marketing files — not for the public firmware repo
+docs/blog-post.md
+docs/reddit-post.md
