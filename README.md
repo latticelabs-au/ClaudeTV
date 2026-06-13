@@ -6,7 +6,13 @@ ST7789V 240×240) into a desk display for your **Claude subscription usage** —
 alongside a cycling local‑weather turntable and a clock. Ships with a branded **master
 terminal** for managing everything and an in‑browser **display emulator** for design work.
 
-<p align="center"><em>SESSION 7% · WEEK 2% · Melbourne 16°C · live clock · Lattice Labs mark</em></p>
+<p align="center"><img src="docs/images/hero.jpg" alt="ClaudeTV on a desk showing Claude session and weekly usage" width="640"></p>
+<p align="center"><img src="docs/images/device-screen.jpg" alt="ClaudeTV display: SESSION 14%, WEEK 3%, weather, clock" width="420"></p>
+
+> **Built on the GeekMagic SmallTV‑Ultra.** This is independent, open custom firmware for the
+> device whose stock firmware lives at [GeekMagicClock/smalltv-ultra](https://github.com/GeekMagicClock/smalltv-ultra).
+> It flashes over the stock web updater and is fully reversible (re‑flash the stock firmware the
+> same way). Hardware and stock firmware © GeekMagic; ClaudeTV firmware © Lattice Labs, MIT.
 
 ---
 
