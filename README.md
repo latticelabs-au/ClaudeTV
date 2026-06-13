@@ -1,136 +1,122 @@
 # ClaudeTV
 
-Custom firmware + host service that turns a **GeekMagic SmallTV‑Ultra** (ESP8266 / ESP‑12F,
-ST7789V 240×240) into a desk display for your **Claude subscription usage** — the same
-5‑hour session % and 7‑day week % you see in Claude Code's `/usage`, with reset times —
-alongside a cycling local‑weather turntable and a clock. Ships with a branded **master
-terminal** for managing everything and an in‑browser **display emulator** for design work.
+**A tiny desk display that always shows your Claude usage** — the 5‑hour session % and 7‑day
+week % from Claude Code's `/usage`, with reset times, plus a weather turntable and a clock.
 
-<p align="center"><img src="docs/images/hero.jpg" alt="ClaudeTV on a desk showing Claude session and weekly usage" width="640"></p>
-<p align="center"><img src="docs/images/device-screen.jpg" alt="ClaudeTV display: SESSION 14%, WEEK 3%, weather, clock" width="420"></p>
+It runs on a **$15 WiFi clock** ([GeekMagic SmallTV‑Ultra on AliExpress](https://www.aliexpress.com/item/1005007937948865.html))
+that you reflash **over WiFi — no soldering, fully reversible.**
 
-> **Built on the GeekMagic SmallTV‑Ultra.** This is independent, open custom firmware for the
-> device whose stock firmware lives at [GeekMagicClock/smalltv-ultra](https://github.com/GeekMagicClock/smalltv-ultra).
-> It flashes over the stock web updater and is fully reversible (re‑flash the stock firmware the
-> same way). Hardware and stock firmware © GeekMagic; ClaudeTV firmware © Lattice Labs, MIT.
+<p align="center"><img src="docs/images/hero.jpg" alt="ClaudeTV on a desk" width="560"></p>
+<p align="center"><img src="docs/images/device-screen.jpg" alt="ClaudeTV display close-up" width="380"></p>
+
+> Independent open firmware for the GeekMagic SmallTV‑Ultra (stock firmware:
+> [GeekMagicClock/smalltv-ultra](https://github.com/GeekMagicClock/smalltv-ultra)). Hardware ©
+> GeekMagic; ClaudeTV firmware © Lattice Labs, MIT. Reflash the stock firmware any time to revert.
+
+---
+
+## What you need
+
+- A **GeekMagic SmallTV‑Ultra** (the **ESP8266** model — [~$15 on AliExpress](https://www.aliexpress.com/item/1005007937948865.html)).
+- An **always‑on Linux box** on your LAN (a NAS VM, a Pi, an old laptop) that has **Claude Code
+  installed and logged in**. The device can't hold your Claude credentials, so this box reads your
+  usage and feeds it to the display over your network — and keeps the auth token fresh for you.
+
+---
+
+## Quick start
+
+### 1 · Set up the host (one command)
+
+On the always‑on box (with Claude Code logged in):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/latticelabs-au/ClaudeTV/main/host/install.sh | bash
+```
+
+This installs the **collector + master terminal** as a systemd service (auto‑start, auto‑restart).
+When it finishes it prints two URLs — your **master terminal** (`http://<host>:8088/`) and the
+**Collector URL** to paste into the device (`http://<host>:8088/usage`).
+
+### 2 · Flash the device (no build)
+
+Grab the prebuilt image from the [latest release](https://github.com/latticelabs-au/ClaudeTV/releases/latest)
+and flash it over the clock's stock web updater (find its IP on your router):
+
+```bash
+curl -F "firmware=@claudetv-v4.2-generic.bin" http://<device-ip>/update
+```
+
+On first boot the device opens a **`ClaudeTV-Setup`** WiFi hotspot. Join it, pick your WiFi, and
+paste the **Collector URL** from step 1. Done — it finds your network and the collector and starts
+displaying. Afterwards it lives at **`http://claudetv.local/`**.
+
+That's it. Two commands and a WiFi prompt.
 
 ---
 
 ## How it works
 
 ```
- Claude Code (on an always-on host)              ESP8266 (SmallTV-Ultra)
-        │  keeps OAuth token fresh                       │
-        ▼                                                ▼
-  ~/.claude/.credentials.json                      ┌───────────────┐
-        │                                           │  ClaudeTV fw  │
-   collector ──► api.anthropic.com/api/oauth/usage  │  GET /usage   │◄── LAN
-   (Python)  ──► open-meteo.com (weather, no key)   └───────────────┘
-        │                                                ▲
-   GET /usage ──────────────────────────────────────────┘
-   GET /  (master terminal: status, config, token keeper, service control)
+ Claude Code (on the always-on host)             ESP8266 clock
+        │  keeps the OAuth token fresh                  │
+        ▼                                               ▼
+  ~/.claude/.credentials.json                    ┌──────────────┐
+        │                                         │  ClaudeTV fw │
+   collector ─► api.anthropic.com/api/oauth/usage │   /usage  ◄──┼── LAN
+   (Python)  ─► open-meteo.com (weather, no key)  └──────────────┘
+        │
+   http://<host>:8088/usage   ← the device polls this
+   http://<host>:8088/        ← master terminal (status, config, token keeper)
 ```
 
-- **Collector** (`host/claude_usage_server.py`) polls Anthropic's `/api/oauth/usage` (the exact
-  endpoint Claude Code's `/usage` view uses) with your local Claude OAuth token, plus keyless
-  weather from open‑meteo. It **always serves the last‑good value** and backs off on HTTP 429, so a
-  rate‑limit blip never blanks the screen.
-- **Token keeper** (built into the collector): the Claude access token is short‑lived (~8 h). The
-  keeper runs `claude -p "ping" --model haiku` before expiry, which makes **Claude Code refresh its
-  own token** and write it back to the credentials file. The collector reads the token fresh each
-  poll, so it always picks up the refresh. (Negligible usage cost.)
-- **Firmware** (`firmware/claudetv/`) fetches the collector JSON over your LAN and renders it.
-  Rendering uses **TFT_eSPI with one held‑open SPI transaction** (CS stays low continuously, like the
-  stock firmware) so there is **no per‑redraw coil/cap tick**.
+- **Collector** (`host/claude_usage_server.py`) polls Anthropic's `/api/oauth/usage` (the same
+  endpoint Claude Code's `/usage` uses) and keyless weather from open‑meteo, then serves a small
+  JSON. It **always returns the last‑good value** and backs off on rate limits, so the screen never
+  blanks.
+- **Token keeper** — the Claude token is short‑lived (~8 h). The collector runs a tiny
+  `claude -p "ping" --model haiku` before it expires, which makes **Claude Code refresh its own
+  token**. Self‑sustaining; the master terminal shows token status and a manual *Refresh now*.
+- **Firmware** (`firmware/claudetv/`) fetches that JSON over your LAN and draws it. Rendering uses
+  TFT_eSPI with **one held‑open SPI transaction** (CS stays low, like the stock firmware) so there's
+  **no per‑redraw coil/cap tick** — it's silent.
 
-The OAuth token is **never logged, shown, or sent anywhere except `api.anthropic.com`**.
-
----
-
-## Prerequisites
-
-**On the host that runs the collector** (any always‑on box on your LAN — a NAS VM, a Pi, etc.):
-
-1. **Python 3.9+**
-2. **Claude Code installed *and logged in*** (`claude` on the box, `claude /login` done).
-   This is required — Claude Code is what refreshes the OAuth token the collector reads. If Claude
-   Code is not logged in, the token will eventually expire and usage will stop updating. The master
-   terminal shows token status (`valid` / `expired`) and a **Refresh now** button.
-3. The host must be reachable from the device's network on the collector port (default **8088**).
-
-**For building/flashing firmware:** Arduino IDE or `arduino-cli` with the ESP8266 core, plus the
-**TFT_eSPI** and **ArduinoJson** libraries. (First flash to a stock GeekMagic device is done over
-the air — no serial adapter needed.)
-
----
-
-## Setup
-
-### 1. Host collector + master terminal
-```bash
-# on the always-on host (Claude Code installed + logged in):
-git clone https://github.com/latticelabs-au/ClaudeTV.git && cd ClaudeTV/host
-cp .env.example .env                 # optional — or just edit live in the terminal
-sudo bash install.sh                 # installs + starts the systemd service
-# open the master terminal:
-xdg-open http://<host-ip>:8088/
-```
-`install.sh` creates a `systemd` unit (auto‑start on boot, auto‑restart). The **master terminal**
-(`http://<host-ip>:8088/`) shows live status and lets you edit weather/Claude config, watch the
-token keeper, refresh the token, and restart the service — no SSH needed.
-
-### 2. Firmware — easy path (no build)
-1. Download the prebuilt **`claudetv-<version>-generic.bin`** from the
-   [latest release](https://github.com/latticelabs-au/ClaudeTV/releases/latest). It has no baked
-   secrets — WiFi and the collector URL are entered on the device.
-2. Flash it over the stock device's web updater (find the device's IP on your router):
-   ```bash
-   curl -F "firmware=@claudetv-<version>-generic.bin" http://<device-ip>/update
-   ```
-3. After it reboots it creates a WiFi hotspot **`ClaudeTV-Setup`**. Join it, pick your WiFi, and
-   paste your **Collector URL** (the master terminal shows it at the top — `http://<host-ip>:8088/usage`).
-   Done — the device finds your network and the collector and starts displaying.
-
-### 2b. Firmware — build it yourself
-1. `cp firmware/claudetv/config.h.example firmware/claudetv/config.h` and fill in your WiFi +
-   the collector URL (`http://<host-ip>:8088/usage`).
-2. Copy `firmware/User_Setup.h` into your TFT_eSPI library folder (overwrites its `User_Setup.h`).
-3. Build (board = generic ESP8266, 4 MB, FS 1 MB):
-   ```bash
-   arduino-cli compile --fqbn esp8266:esp8266:generic:eesz=4M1M --output-dir build firmware/claudetv
-   ```
-4. **Flash over the air** to the stock device's web updater (no serial needed):
-   ```bash
-   curl -F "firmware=@build/claudetv.ino.bin" http://<device-ip>/update
-   ```
-   After it reboots, the device is at `http://claudetv.local/` (mDNS) with its own control panel and
-   OTA. To revert, flash the stock GeekMagic firmware the same way (its saved settings survive — OTA
-   only replaces the app, not the SPIFFS partition).
+Your Claude token is **never logged, shown, or sent anywhere except `api.anthropic.com`.**
 
 ---
 
 ## Features
 
-**Display:** two‑column SESSION / WEEK hero cards with reset times · cycling weather turntable
-(now / feels‑like / high / low / rain % / humidity) · big clock · auto night‑dim · Lattice Labs logo.
-
-**Device control panel** (`http://claudetv.local/`): brightness, night mode (default **30 % from
-21:00–07:00**, fully configurable), flip display 180°, refresh interval, reboot, firmware OTA.
-
-**Master terminal** (`http://<host-ip>:8088/`): live service/token/usage/weather status, weather
-config CRUD (city, lat/lon, poll interval, timezone), Claude config (credentials path, claude
-binary, ping model, refresh margin), token keeper with **Refresh now**, restart service.
-
-**Emulator** (`emulator/index.html`): a pixel‑accurate 240×240 canvas mirror of the firmware layout
-that pulls live data from the collector — for iterating the design in a browser before flashing.
+- **Two hero cards** — SESSION (5h) and WEEK (7d) usage %, green/amber/red by level, with reset times.
+- **Weather turntable** — cycles now / feels‑like / high / low / rain % / humidity.
+- **Clock** + auto‑dimming **night mode** (default 30 %, 21:00–07:00, configurable).
+- **Device control panel** (`http://claudetv.local/`) — brightness, night mode, flip display,
+  refresh interval, collector URL, reboot, OTA, and a link to the master terminal.
+- **Master terminal** (`http://<host>:8088/`) — live status, **city search** (sets location +
+  timezone automatically), token keeper, service control, device link.
+- **Emulator** (`emulator/index.html`) — a pixel‑accurate 240×240 browser preview that pulls live
+  collector data, for tweaking the layout without reflashing.
 
 ---
 
-## Hardware notes (ESP‑12F / ST7789V 240×240)
+## Build from source (optional)
 
-The device: **GeekMagic SmallTV‑Ultra** (ESP8266 variant) —
-[AliExpress](https://www.aliexpress.com/item/1005007937948865.html). ~$15, ships with stock
-firmware; ClaudeTV flashes over the air, no soldering.
+If you'd rather build the firmware yourself instead of using the release image:
+
+1. `cp firmware/claudetv/config.h.example firmware/claudetv/config.h` and fill in your WiFi + the
+   collector URL.
+2. Copy `firmware/User_Setup.h` over your TFT_eSPI library's `User_Setup.h`.
+3. Build with the ESP8266 Arduino core (libs: TFT_eSPI, ArduinoJson, WiFiManager):
+   ```bash
+   arduino-cli compile --fqbn esp8266:esp8266:generic:eesz=4M1M --output-dir build firmware/claudetv
+   ```
+4. Flash: `curl -F "firmware=@build/claudetv.ino.bin" http://<device-ip>/update`
+
+To run the collector from a clone instead of the curl installer: `cd host && sudo bash install.sh`.
+
+---
+
+## Hardware (ESP‑12F / ST7789V 240×240)
 
 | Signal | GPIO | | Signal | GPIO |
 |---|---|---|---|---|
@@ -138,21 +124,10 @@ firmware; ClaudeTV flashes over the air, no soldering.
 | SCLK | 14 | | DC | 0 |
 | RST | 2 | | Backlight | 5 (active‑low PWM) |
 
-The stock web updater (`/update`) is a standard `ESP8266HTTPUpdateServer` — it accepts custom
-images, which is why first flash works over the air. Backlight is PWM'd at ~22 kHz; never hold it
-steady full‑on (it overdrives/overheats the backlight boost converter).
-
----
-
-## Repo layout
-
-```
-firmware/claudetv/   ClaudeTV firmware (.ino, config.h.example, logo.h)
-firmware/User_Setup.h TFT_eSPI board config for this panel
-host/                collector + master terminal + systemd installer
-emulator/            in-browser 240x240 display emulator
-```
+The stock `/update` endpoint is a plain `ESP8266HTTPUpdateServer`, which is why custom firmware
+flashes over the air and the stock firmware re‑flashes the same way. The backlight is PWM'd at
+22 kHz — never DC‑drive it at 100 % (it overheats the boost converter).
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE). Built by [Lattice Labs](https://latticelabs.au).
