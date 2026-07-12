@@ -76,7 +76,13 @@ def wx_url(): return ("https://api.open-meteo.com/v1/forecast?latitude=%s&longit
 
 _lock = threading.Lock()
 _usage = None; _usage_ts = 0; _usage_err = "starting"; _wx = None; _wx_err = ""
-_last_refresh = 0; _refresh_err = ""; _refreshing = False
+_last_refresh = 0; _refresh_err = ""; _refreshing = False; _auth_dead = False
+
+# substrings in `claude` output that mean the OAuth session itself is dead
+# (the refresh token is invalid/revoked -> a silent re-refresh can never recover it;
+#  only a manual `claude /login` on this host fixes it)
+_DEAD_MARKERS = ("401", "invalid authentication", "please run /login", "unauthorized",
+                 "oauth token expired", "authentication_error")
 
 # ---------- token keeper ----------
 def _creds():
@@ -99,7 +105,7 @@ def find_claude():
 
 def refresh_token(reason=""):
     """Force Claude Code to refresh its token via a tiny ping. Returns True on success."""
-    global _last_refresh, _refresh_err, _refreshing
+    global _last_refresh, _refresh_err, _refreshing, _auth_dead
     if _refreshing: return False
     binp = find_claude()
     if not binp:
@@ -108,16 +114,27 @@ def refresh_token(reason=""):
     try:
         before = token_expiry_ms()
         env = os.environ.copy(); env.setdefault("HOME", os.path.expanduser("~"))
-        subprocess.run([binp, "-p", "ping", "--model", CONFIG["PING_MODEL"]],
-                       cwd=os.path.expanduser("~"), env=env,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+        # capture output (stderr merged into stdout): the ping's error text is the ONLY
+        # signal that the refresh token is dead and a manual re-login is required. Never
+        # contains the token itself. Previously sent to DEVNULL -> silent outages.
+        p = subprocess.run([binp, "-p", "ping", "--model", CONFIG["PING_MODEL"]],
+                           cwd=os.path.expanduser("~"), env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
         after = token_expiry_ms()
         if after > before or after > time.time() * 1000:
-            _last_refresh = int(time.time()); _refresh_err = ""
+            _last_refresh = int(time.time()); _refresh_err = ""; _auth_dead = False
             print("[%s] token refreshed (%s) valid +%dm" % (time.strftime("%H:%M:%S"), reason or "keeper",
                   (after - time.time()*1000)/60000))
             return True
-        _refresh_err = "ping ran but token unchanged"
+        out = (p.stdout or b"").decode("utf-8", "replace").strip().replace("\n", " ")
+        low = out.lower()
+        if p.returncode != 0 and any(m in low for m in _DEAD_MARKERS):
+            _auth_dead = True
+            _refresh_err = "login expired - re-auth on host: claude /login"
+        elif p.returncode != 0:
+            _refresh_err = ("ping failed: " + out)[:90]
+        else:
+            _refresh_err = "ping ran but token unchanged"
         print("[%s] token refresh: %s" % (time.strftime("%H:%M:%S"), _refresh_err)); return False
     except subprocess.TimeoutExpired:
         _refresh_err = "claude ping timed out"; return False
@@ -144,6 +161,13 @@ def token_status():
         return "valid", c.get("subscriptionType", "?"), int(exp - time.time()) if exp else 0
     except Exception as e:
         return "missing", str(e)[:40], 0
+
+def auth_state():
+    """Compact state the device reacts to: ok | dead | pending.
+    dead    = refresh confirmed failing (401) -> needs a manual `claude /login` on host.
+    pending = token expired/missing but the keeper may still recover it (transient)."""
+    if _auth_dead: return "dead"
+    return "ok" if token_status()[0] == "valid" else "pending"
 
 # ---------- data fetchers ----------
 def _clock(dt): h = dt.hour % 12 or 12; return "%d:%02d%s" % (h, dt.minute, "am" if dt.hour < 12 else "pm")
@@ -187,19 +211,20 @@ def fetch_weather():
             "wlo": di("temperature_2m_min"), "wrain": di("precipitation_probability_max")}
 
 def poller():
-    global _usage, _usage_ts, _usage_err, _wx, _wx_err
+    global _usage, _usage_ts, _usage_err, _wx, _wx_err, _auth_dead
     next_u = 0.0; backoff = int(CONFIG["USAGE_EVERY"]); next_w = 0.0
     while True:
         now = time.time()
         if now >= next_u:
             try:
                 u = fetch_usage()
-                with _lock: _usage = u; _usage_ts = int(now); _usage_err = ""
+                with _lock: _usage = u; _usage_ts = int(now); _usage_err = ""; _auth_dead = False
                 backoff = int(CONFIG["USAGE_EVERY"]); next_u = now + backoff
             except urllib.error.HTTPError as e:
                 with _lock: _usage_err = "http %d" % e.code
-                if e.code in (401, 403):                 # auth -> refresh now, retry soon
-                    refresh_token("auth-fail"); next_u = now + 10
+                if e.code in (401, 403):                 # auth -> try refresh; back off HARD if the
+                    refresh_token("auth-fail")           # session is dead (no 10s hammer -> no 429 spin)
+                    next_u = now + (300 if _auth_dead else 30)
                 else:
                     ra = e.headers.get("Retry-After"); wait = int(ra) if (ra and ra.isdigit()) else min(backoff * 2, 600)
                     backoff = wait; next_u = now + wait
@@ -218,7 +243,8 @@ def poller():
 
 def device_json():
     with _lock: u, ts, err, wx = _usage, _usage_ts, _usage_err, _wx
-    st = {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err}
+    st = {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err,
+          "auth": auth_state()}
     st.update(u or {"s": 0, "w": 0, "sr": "", "wr": ""})
     if wx: st.update(wx)
     return st
@@ -227,7 +253,7 @@ def full_state():
     tok, sub, exp_in = token_status()
     with _lock: u, ts, err, wx, wxe, lr, re_, refg = _usage, _usage_ts, _usage_err, _wx, _wx_err, _last_refresh, _refresh_err, _refreshing
     return {"service": {"uptime_s": int(time.time() - START_TS), "port": PORT},
-            "token": {"status": tok, "plan": sub, "expires_in_s": exp_in,
+            "token": {"status": tok, "plan": sub, "expires_in_s": exp_in, "auth": auth_state(),
                       "last_refresh_s": (int(time.time()) - lr) if lr else -1,
                       "refresh_err": re_, "refreshing": refg, "claude_bin": find_claude() or "NOT FOUND"},
             "usage": {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err, **(u or {})},

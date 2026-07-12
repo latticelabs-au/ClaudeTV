@@ -21,7 +21,7 @@
 #include "panel.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "4.3"
+#define FW_VER  "4.4"
 #define TZ_STR  "AEST-10AEDT,M10.1.0,M4.1.0/3"
 #define TFT_BL  5
 #define WX_CYCLE_MS 4000
@@ -33,6 +33,7 @@ ESP8266HTTPUpdateServer httpUpdater;
 uint16_t C_BG, C_PANEL, C_LINE, C_CORAL, C_CYAN, C_WHITE, C_GRAY, C_DIM, C_GREEN, C_AMBER, C_RED, C_SKY;
 unsigned long lastFetch=0, lastClock=0, lastWx=0;
 int connOK=-1, wxIdx=0; bool haveData=false, nightActive=false;
+int authState=0, dataAge=-1, pAuth=-1;   // authState: 0 ok, 1 pending, 2 dead (needs re-login on host)
 struct { int s=0, w=0, wt=-999, wfl=-999, whi=-999, wlo=-999, wrain=-999, whum=-999; String sr, wr, wc, city; } U;
 int pS=-99, pW=-99, pConn=-1; String pSR="\x01", pWR="\x01", pDate="\x01";
 
@@ -86,7 +87,18 @@ void drawWeatherCard(){
             tft.drawCircle(WCX+WCW-14,WCY+31,2,C_WHITE); }
   else    { snprintf(b,sizeof b,"%d%%",val); str(b,WCX+WCW-14,WCY+38,&FreeSansBold12pt7b,C_WHITE,MR_DATUM,C_PANEL); }
 }
-void drawDot(){ tft.fillCircle(18,DATE_Y,3,connOK==1?C_GREEN:C_RED); }
+void fmtAge(int s,char* out,size_t n){
+  if(s<0){ out[0]=0; return; }
+  if(s<3600) snprintf(out,n,"stale %dm",s/60); else snprintf(out,n,"stale %dh",s/3600);
+}
+void drawUsageError(){          // dead Claude auth -> takeover the hero card (weather/clock keep running)
+  tft.fillRoundRect(UCX,UCY,UCW,UCH,10,C_PANEL);
+  str("LOGIN EXPIRED",120,UCY+24,&FreeSansBold12pt7b,C_RED,MC_DATUM,C_PANEL);
+  str("re-auth on host",120,UCY+46,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
+  char ag[16]; fmtAge(dataAge,ag,sizeof ag);
+  if(ag[0]) str(ag,120,UCY+66,&FreeSans9pt7b,C_DIM,MC_DATUM,C_PANEL);
+}
+void drawDot(){ uint16_t c=(connOK!=1||authState==2)?C_RED:(authState==1?C_AMBER:C_GREEN); tft.fillCircle(18,DATE_Y,3,c); }
 void drawClock(){
   time_t now=time(nullptr); char hms[12],dat[18];
   if(now<100000){strcpy(hms,"--:--:--");strcpy(dat,"syncing");}
@@ -103,12 +115,15 @@ void header(){
   str("CLAUDE USAGE",26,9,&FreeSansBold12pt7b,C_WHITE,TL_DATUM,C_BG);
 }
 void render(bool force){
-  if(force||U.s!=pS||U.w!=pW||U.sr!=pSR||U.wr!=pWR){drawUsageCard();pS=U.s;pW=U.w;pSR=U.sr;pWR=U.wr;}
-  if(force||connOK!=pConn){drawDot();pConn=connOK;}
+  bool cardChg=force||authState!=pAuth||U.s!=pS||U.w!=pW||U.sr!=pSR||U.wr!=pWR;
+  bool dotChg =force||connOK!=pConn||authState!=pAuth;
+  if(cardChg){ if(authState==2)drawUsageError(); else drawUsageCard(); pS=U.s;pW=U.w;pSR=U.sr;pWR=U.wr; }
+  if(dotChg){ drawDot(); pConn=connOK; }
+  pAuth=authState;
 }
 void fullRedraw(){
   tft.fillScreen(C_BG); header(); drawLogo();
-  pS=pW=-99; pConn=-1; pSR=pWR=pDate="\x01";
+  pS=pW=-99; pConn=-1; pAuth=-1; pSR=pWR=pDate="\x01";
   render(true); drawWeatherCard(); drawClock();
 }
 
@@ -126,7 +141,11 @@ void fetchUsage(){
     JsonDocument doc;
     if(deserializeJson(doc,http.getString())==DeserializationError::Ok){
       connOK=1;
+      const char* a=doc["auth"]|"ok";
+      authState=(!strcmp(a,"dead"))?2:(!strcmp(a,"pending"))?1:0;
+      dataAge=doc["age"]|-1;
       if((doc["ok"]|0)==1){haveData=true; U.s=doc["s"]|0; U.w=doc["w"]|0; U.sr=String((const char*)(doc["sr"]|"")); U.wr=String((const char*)(doc["wr"]|""));}
+      else if(authState==2){haveData=false;}   // dead session -> stop showing phantom stale %
       if(doc["wt"].is<int>()){ U.wt=doc["wt"]|-999; U.wfl=doc["wfl"]|-999; U.whi=doc["whi"]|-999; U.wlo=doc["wlo"]|-999;
         U.wrain=doc["wrain"]|-999; U.whum=doc["whum"]|-999; U.wc=String((const char*)(doc["wc"]|"")); U.city=String((const char*)(doc["city"]|"")); drawWeatherCard(); }
     } else connOK=0;
@@ -140,7 +159,7 @@ void handleRoot(){ server.send_P(200,"text/html",PANEL); }
 void handleState(){
   time_t now=time(nullptr); char hms[12]="--:--:--"; if(now>=100000){struct tm* t=localtime(&now);strftime(hms,sizeof hms,"%H:%M:%S",t);}
   JsonDocument d;
-  d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["s"]=U.s; d["w"]=U.w; d["sr"]=U.sr; d["wr"]=U.wr;
+  d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["auth"]=authState; d["age"]=dataAge; d["s"]=U.s; d["w"]=U.w; d["sr"]=U.sr; d["wr"]=U.wr;
   d["city"]=U.city; d["wt"]=U.wt; d["wc"]=U.wc; d["time"]=hms;
   d["bri"]=S.bri; d["ne"]=S.nEn; d["ns"]=S.nStart; d["nf"]=S.nEnd; d["nb"]=S.nBri; d["rot"]=S.rot; d["refresh"]=S.refresh;
   d["usage"]=S.usageUrl;

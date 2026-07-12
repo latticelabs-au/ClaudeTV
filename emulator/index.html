@@ -6,7 +6,8 @@ canvas{image-rendering:pixelated;width:480px;height:480px;display:block}
 </head><body>
 <div id=wrap><canvas id=c width=240 height=240></canvas></div>
 <div id=ctl><b>live from collector</b> &middot; metric <span id=mi>0</span>
-<br><textarea id=d></textarea><br><button onclick=render()>Render</button> <button onclick=step()>Next metric</button></div>
+<br><textarea id=d></textarea><br><button onclick=render()>Render</button> <button onclick=step()>Next metric</button>
+<button onclick="data.auth=(data.auth=='dead'?'ok':'dead');document.getElementById('d').value=JSON.stringify(data,null,1);render()">Toggle auth-dead</button></div>
 <script>
 const C={bg:'#000000',panel:'#171f2e',line:'#2c374a',coral:'#ff7a55',cyan:'#3fd2dd',white:'#ffffff',
 gray:'#a4b0c2',dim:'#74859b',green:'#54d36e',amber:'#f0ad36',red:'#ff4d68',sky:'#84cdf2'};
@@ -15,7 +16,7 @@ const F={tiny:'13px Arial',s9:'15px Arial',b12:'bold 20px Arial',b18:'bold 28px 
 // geometry (shared 1:1 with firmware)
 const UCX=8,UCY=28,UCW=224,UCH=84,LCX=64,RCX=176, WCX=8,WCY=118,WCW=224,WCH=54, TIMEY=196,DATEY=222;
 let data={s:7,w:2,sr:"6:30pm",wr:"Jun 15 10am",haveData:true,city:"Melbourne",wc:"Overcast",
- wt:16,wfl:14,whi:16,wlo:13,wrain:100,whum:82,time:"13:48:50",date:"Sat 13 Jun",conn:1};
+ wt:16,wfl:14,whi:16,wlo:13,wrain:100,whum:82,time:"13:48:50",date:"Sat 13 Jun",conn:1,auth:"ok",age:120};
 let mi=0;
 document.getElementById('d').value=JSON.stringify(data,null,1);
 const x=document.getElementById('c').getContext('2d');
@@ -36,6 +37,13 @@ function col(cx,label,pct,reset){
  T(pct<0?"--":pct+"%",cx,UCY+47,F.b18,lvl(pct),'center');
  T(reset,cx,UCY+72,F.tiny,C.dim,'center');
 }
+function fmtAge(s){if(s==null||s<0)return "";return s<3600?("stale "+Math.floor(s/60)+"m"):("stale "+Math.floor(s/3600)+"h");}
+function errorCard(){   // dead Claude auth -> takeover the hero card (1:1 with firmware drawUsageError)
+ rr(UCX,UCY,UCW,UCH,10,C.panel);
+ T("LOGIN EXPIRED",120,UCY+28,F.b12,C.red,'center');
+ T("re-auth on host",120,UCY+52,F.s9,C.gray,'center');
+ const ag=fmtAge(data.age); if(ag)T(ag,120,UCY+74,F.s9,C.dim,'center');
+}
 function weatherCard(){
  rr(WCX,WCY,WCW,WCH,10,C.panel);
  T(data.city||"weather",WCX+12,WCY+19,F.s9,C.white,'left');
@@ -51,14 +59,14 @@ function render(){
  x.fillStyle=C.bg;x.fillRect(0,0,240,240);
  rr(12,12,9,9,2,C.coral);
  T("CLAUDE USAGE",26,18,F.b12,C.white,'left');
- usageCard(); weatherCard();
+ (data.auth=='dead'?errorCard:usageCard)(); weatherCard();
  T(data.time,16,TIMEY,F.b18,C.white,'left');
- x.fillStyle=data.conn==1?C.green:C.red;x.beginPath();x.arc(18,DATEY,3,0,7);x.fill();
+ x.fillStyle=(data.conn!=1||data.auth=='dead')?C.red:(data.auth=='pending'?C.amber:C.green);x.beginPath();x.arc(18,DATEY,3,0,7);x.fill();
  T(data.date,28,DATEY,F.s9,C.gray,'left');
  if(logoImg.complete)x.drawImage(logoImg,186,184,48,48);
 }
 function pull(){fetch('http://10.0.0.5:8088/usage').then(r=>r.json()).then(s=>{const d=new Date();
- data=Object.assign(data,{s:s.s,w:s.w,sr:s.sr,wr:s.wr,haveData:!!s.ok,city:s.city,wc:s.wc,wt:s.wt,wfl:s.wfl,whi:s.whi,wlo:s.wlo,wrain:s.wrain,whum:s.whum,
+ data=Object.assign(data,{s:s.s,w:s.w,sr:s.sr,wr:s.wr,haveData:!!s.ok,auth:s.auth||'ok',age:s.age,city:s.city,wc:s.wc,wt:s.wt,wfl:s.wfl,whi:s.whi,wlo:s.wlo,wrain:s.wrain,whum:s.whum,
   time:d.toTimeString().slice(0,8),date:d.toLocaleDateString('en-AU',{weekday:'short',day:'2-digit',month:'short'})});
  document.getElementById('d').value=JSON.stringify(data,null,1);render();}).catch(e=>render())}
 pull(); setInterval(()=>{mi=(mi+1)%6;document.getElementById('mi').textContent=mi;pull();},4000);
