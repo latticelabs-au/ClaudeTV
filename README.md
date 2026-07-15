@@ -1,7 +1,8 @@
 # ClaudeTV
 
-**A tiny desk display that always shows your Claude usage** — the 5‑hour session % and 7‑day
-week % from Claude Code's `/usage`, with reset times, plus a weather turntable and a clock.
+**A tiny desk display that always shows your Claude usage** — the 5‑hour session %, 7‑day
+week %, **and your model‑scoped weekly limit (e.g. Fable)** from Claude Code's `/usage`, with
+reset times, plus a weather turntable and a clock.
 
 It runs on a **$15 WiFi clock** ([GeekMagic SmallTV‑Ultra on AliExpress](https://www.aliexpress.com/item/1005007937948865.html))
 that you reflash **over WiFi — no soldering, fully reversible.**
@@ -44,7 +45,7 @@ Grab the prebuilt image from the [latest release](https://github.com/latticelabs
 and flash it over the clock's stock web updater (find its IP on your router):
 
 ```bash
-curl -F "firmware=@claudetv-v4.2-generic.bin" http://<device-ip>/update
+curl -F "firmware=@claudetv-v4.6-generic.bin" http://<device-ip>/update
 ```
 
 On first boot the device opens a **`ClaudeTV-Setup`** WiFi hotspot. Join it, pick your WiFi, and
@@ -71,9 +72,10 @@ That's it. Two commands and a WiFi prompt.
 ```
 
 - **Collector** (`host/claude_usage_server.py`) polls Anthropic's `/api/oauth/usage` (the same
-  endpoint Claude Code's `/usage` uses) and keyless weather from open‑meteo, then serves a small
-  JSON. It **always returns the last‑good value** and backs off on rate limits, so the screen never
-  blanks.
+  endpoint Claude Code's `/usage` uses) — session, week, and the model‑scoped weekly limit (read
+  generically from `limits[]`, so it follows whatever model Anthropic scopes, Fable today) — plus
+  keyless weather from open‑meteo, then serves a small JSON. It **always returns the last‑good
+  value** and backs off on rate limits, so the screen never blanks.
 - **Token keeper** — the Claude token is short‑lived (~8 h). The collector runs a tiny
   `claude -p "ping" --model haiku` before it expires, which makes **Claude Code refresh its own
   token**. Self‑sustaining; the master terminal shows token status and a manual *Refresh now*.
@@ -87,15 +89,20 @@ Your Claude token is **never logged, shown, or sent anywhere except `api.anthrop
 
 ## Features
 
-- **Two hero cards** — SESSION (5h) and WEEK (7d) usage %, green/amber/red by level, with reset times.
+- **Three hero numbers** — S (5h session) | W (7d week) + F (model‑scoped weekly, e.g. **Fable**),
+  green/amber/red by level. Week and the scoped limit share one reset line (same 7‑day window);
+  accounts without a scoped limit automatically get the classic two‑column card.
+- **Auth outage on‑screen** — if the host's Claude login dies, the card flips to a red
+  **LOGIN EXPIRED / re‑auth on host** state instead of silently showing stale numbers.
 - **Weather turntable** — cycles now / feels‑like / high / low / rain % / humidity.
 - **Clock** + auto‑dimming **night mode** (default 30 %, 21:00–07:00, configurable).
 - **Device control panel** (`http://claudetv.local/`) — brightness, night mode, flip display,
   refresh interval, collector URL, reboot, OTA, and a link to the master terminal.
 - **Master terminal** (`http://<host>:8088/`) — live status, **city search** (sets location +
   timezone automatically), token keeper, service control, device link.
-- **Emulator** (`emulator/index.html`) — a pixel‑accurate 240×240 browser preview that pulls live
-  collector data, for tweaking the layout without reflashing.
+- **Emulator** (`emulator/index.html`) — a 240×240 browser preview that pulls live collector data
+  and positions text with the **device's real GFX font advance tables**, so string widths match the
+  ESP render exactly — tweak the layout without reflashing.
 
 ---
 
