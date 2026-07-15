@@ -1,7 +1,9 @@
 /*
  * ClaudeTV — GeekMagic SmallTV-Ultra (ESP8266 / ESP-12F, ST7789V 240x240)
- * Dashboard: Claude session(5h)/week(7d) usage % + reset times (two-column hero cards),
- * cycling weather turntable, big clock, Lattice Labs logo. Web control panel + OTA.
+ * Dashboard: Claude session(5h) | week(7d) + the model-scoped weekly limit (e.g. Fable) as
+ * usage % + reset times — week and the scoped limit share one 7d reset line; falls back to the
+ * classic two-column card when the account has no scoped limit.
+ * Cycling weather turntable, big clock, Lattice Labs logo. Web control panel + OTA.
  * Silent: TFT_eSPI with ONE held-open SPI transaction (CS low). Settings persist in EEPROM.
  * Full rounded-card redraws (no partial-clear seams). Secrets in config.h (gitignored).
  *   http://claudetv.local/
@@ -21,7 +23,7 @@
 #include "panel.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "4.4"
+#define FW_VER  "4.6"
 #define TZ_STR  "AEST-10AEDT,M10.1.0,M4.1.0/3"
 #define TFT_BL  5
 #define WX_CYCLE_MS 4000
@@ -34,14 +36,21 @@ uint16_t C_BG, C_PANEL, C_LINE, C_CORAL, C_CYAN, C_WHITE, C_GRAY, C_DIM, C_GREEN
 unsigned long lastFetch=0, lastClock=0, lastWx=0;
 int connOK=-1, wxIdx=0; bool haveData=false, nightActive=false;
 int authState=0, dataAge=-1, pAuth=-1;   // authState: 0 ok, 1 pending, 2 dead (needs re-login on host)
-struct { int s=0, w=0, wt=-999, wfl=-999, whi=-999, wlo=-999, wrain=-999, whum=-999; String sr, wr, wc, city; } U;
-int pS=-99, pW=-99, pConn=-1; String pSR="\x01", pWR="\x01", pDate="\x01";
+struct { int s=0, w=0, f=-1, wt=-999, wfl=-999, whi=-999, wlo=-999, wrain=-999, whum=-999; String sr, wr, fl, wc, city; } U;
+int pS=-99, pW=-99, pF=-99, pConn=-1; String pSR="\x01", pWR="\x01", pFL="\x01", pDate="\x01";
 
 struct Settings { uint8_t magic, bri, nEn, nStart, nEnd, nBri, rot; uint16_t refresh; char usageUrl[100]; } S;
 const uint8_t MAGIC = 0xC5;
 
 // geometry (1:1 with emulator)
 const int UCX=8, UCY=33, UCW=224, UCH=79, LCX=64, RCX=176;
+// 3-metric geometry (account has a model-scoped weekly limit, e.g. Fable). Single-letter
+// labels (S/W/F) free the label row so ALL THREE numbers run at Bold18. Sized from the fonts'
+// REAL xAdvance tables: "88%"@18=69px per ~74px column; 100 renders WITHOUT '%' ("100%"@18 is
+// 88px and would not fit). Worst cases: sr "12:39pm"=71px -> 9.5..80.5; week 84.5..153.5;
+// fable 160.5..229.5; shared reset "Dec 30 12:59pm"=134px -> 90..224 (NO "resets" prefix —
+// with it the line is 174px and clips the card). All inside the card (8..232).
+const int FDIV=82, FSCX=45, FWCX=119, FFCX=195, FRSTX=157;
 const int WCX=8, WCY=118, WCW=224, WCH=54;
 const int TIME_Y=196, DATE_Y=222;
 
@@ -61,8 +70,28 @@ void wxMetric(int i,const char*& lbl,int& val,bool& temp){
 }
 void drawLogo(){ tft.setSwapBytes(true); tft.pushImage(186,184,LOGO_W,LOGO_H,LOGO); tft.setSwapBytes(false); }
 
+void drawMetric(int cx,const char* label,int pct,const GFXfont* f){
+  str(label,cx,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
+  char b[8];
+  if(!haveData) strcpy(b,"--");
+  else if(pct==100) strcpy(b,"100");             // no '%': 88px at 18pt won't fit the column
+  else snprintf(b,sizeof b,"%d%%",pct);
+  str(b,cx,UCY+43,f,lvl(haveData?pct:-1),MC_DATUM,C_PANEL);
+}
 void drawUsageCard(){
   tft.fillRoundRect(UCX,UCY,UCW,UCH,10,C_PANEL);
+  if(U.f>=0){                     // S (5h) | W + F (7d) — one shared reset, three Bold18 heroes
+    tft.drawFastVLine(FDIV,UCY+14,UCH-28,C_LINE);   // divider = the 5h | 7d window boundary
+    drawMetric(FSCX,"S",U.s,&FreeSansBold18pt7b);
+    str(U.sr.length()?U.sr.c_str():"idle",FSCX,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
+    drawMetric(FWCX,"W",U.w,&FreeSansBold18pt7b);
+    char fLbl[2]={U.fl.length()?U.fl[0]:'F',0};     // first letter of the scoped-model name
+    drawMetric(FFCX,fLbl,U.f,&FreeSansBold18pt7b);
+    // week + fable share the same 7d window (their resets land ~1s apart) -> ONE reset line
+    if(U.wr.length()) str(U.wr.c_str(),FRSTX,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
+    return;
+  }
+  // classic 2-col — account has no model-scoped weekly limit
   tft.drawFastVLine(120,UCY+14,UCH-28,C_LINE);
   // session (left col): reset centered under the column
   str("SESSION",LCX,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
@@ -115,15 +144,15 @@ void header(){
   str("CLAUDE USAGE",26,9,&FreeSansBold12pt7b,C_WHITE,TL_DATUM,C_BG);
 }
 void render(bool force){
-  bool cardChg=force||authState!=pAuth||U.s!=pS||U.w!=pW||U.sr!=pSR||U.wr!=pWR;
+  bool cardChg=force||authState!=pAuth||U.s!=pS||U.w!=pW||U.f!=pF||U.sr!=pSR||U.wr!=pWR||U.fl!=pFL;
   bool dotChg =force||connOK!=pConn||authState!=pAuth;
-  if(cardChg){ if(authState==2)drawUsageError(); else drawUsageCard(); pS=U.s;pW=U.w;pSR=U.sr;pWR=U.wr; }
+  if(cardChg){ if(authState==2)drawUsageError(); else drawUsageCard(); pS=U.s;pW=U.w;pF=U.f;pSR=U.sr;pWR=U.wr;pFL=U.fl; }
   if(dotChg){ drawDot(); pConn=connOK; }
   pAuth=authState;
 }
 void fullRedraw(){
   tft.fillScreen(C_BG); header(); drawLogo();
-  pS=pW=-99; pConn=-1; pAuth=-1; pSR=pWR=pDate="\x01";
+  pS=pW=pF=-99; pConn=-1; pAuth=-1; pSR=pWR=pFL=pDate="\x01";
   render(true); drawWeatherCard(); drawClock();
 }
 
@@ -144,7 +173,8 @@ void fetchUsage(){
       const char* a=doc["auth"]|"ok";
       authState=(!strcmp(a,"dead"))?2:(!strcmp(a,"pending"))?1:0;
       dataAge=doc["age"]|-1;
-      if((doc["ok"]|0)==1){haveData=true; U.s=doc["s"]|0; U.w=doc["w"]|0; U.sr=String((const char*)(doc["sr"]|"")); U.wr=String((const char*)(doc["wr"]|""));}
+      if((doc["ok"]|0)==1){haveData=true; U.s=doc["s"]|0; U.w=doc["w"]|0; U.sr=String((const char*)(doc["sr"]|"")); U.wr=String((const char*)(doc["wr"]|""));
+        U.f=doc["f"]|-1; U.fl=String((const char*)(doc["fl"]|""));}   // model-scoped weekly (e.g. Fable); -1 = account has none
       else if(authState==2){haveData=false;}   // dead session -> stop showing phantom stale %
       if(doc["wt"].is<int>()){ U.wt=doc["wt"]|-999; U.wfl=doc["wfl"]|-999; U.whi=doc["whi"]|-999; U.wlo=doc["wlo"]|-999;
         U.wrain=doc["wrain"]|-999; U.whum=doc["whum"]|-999; U.wc=String((const char*)(doc["wc"]|"")); U.city=String((const char*)(doc["city"]|"")); drawWeatherCard(); }
@@ -159,7 +189,7 @@ void handleRoot(){ server.send_P(200,"text/html",PANEL); }
 void handleState(){
   time_t now=time(nullptr); char hms[12]="--:--:--"; if(now>=100000){struct tm* t=localtime(&now);strftime(hms,sizeof hms,"%H:%M:%S",t);}
   JsonDocument d;
-  d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["auth"]=authState; d["age"]=dataAge; d["s"]=U.s; d["w"]=U.w; d["sr"]=U.sr; d["wr"]=U.wr;
+  d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["auth"]=authState; d["age"]=dataAge; d["s"]=U.s; d["w"]=U.w; d["f"]=U.f; d["fl"]=U.fl; d["sr"]=U.sr; d["wr"]=U.wr;
   d["city"]=U.city; d["wt"]=U.wt; d["wc"]=U.wc; d["time"]=hms;
   d["bri"]=S.bri; d["ne"]=S.nEn; d["ns"]=S.nStart; d["nf"]=S.nEnd; d["nb"]=S.nBri; d["rot"]=S.rot; d["refresh"]=S.refresh;
   d["usage"]=S.usageUrl;

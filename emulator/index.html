@@ -11,10 +11,19 @@ canvas{image-rendering:pixelated;width:480px;height:480px;display:block}
 <script>
 const C={bg:'#000000',panel:'#171f2e',line:'#2c374a',coral:'#ff7a55',cyan:'#3fd2dd',white:'#ffffff',
 gray:'#a4b0c2',dim:'#74859b',green:'#54d36e',amber:'#f0ad36',red:'#ff4d68',sky:'#84cdf2'};
-// fonts calibrated UP to match device GFX FreeSans rendering (it renders larger than CSS px)
-const F={tiny:'13px Arial',s9:'15px Arial',b12:'bold 20px Arial',b18:'bold 28px Arial',b24:'bold 37px Arial'};
+// Arial only supplies glyph SHAPES; all positioning uses the device's real GFX xAdvance
+// tables (ADV below, generated from TFT_eSPI FreeSans*.h) so string widths are 1:1 device-true.
+const F={tiny:'bold 14px Arial',s9:'15px Arial',b12:'bold 21px Arial',b18:'bold 31px Arial'};
+const GFXMAP={[F.s9]:'FreeSans9pt7b',[F.tiny]:'FreeSansBold9pt7b',[F.b12]:'FreeSansBold12pt7b',[F.b18]:'FreeSansBold18pt7b'};
+const ADV={"FreeSans9pt7b":[5,6,6,10,10,16,12,4,6,6,7,11,5,6,5,5,10,10,10,10,10,10,10,10,10,10,5,5,11,11,11,10,18,12,12,13,13,11,11,14,13,5,10,12,10,15,13,14,12,14,13,12,11,13,12,17,12,12,11,5,5,5,8,10,5,10,10,9,10,10,5,10,10,4,4,9,4,15,10,10,10,10,6,9,5,10,9,13,9,9,9,6,4,6,9],"FreeSansBold9pt7b":[5,6,9,10,10,16,13,5,6,6,7,11,4,6,4,5,10,10,10,10,10,10,10,10,10,10,4,4,11,11,11,11,18,13,13,13,13,12,11,14,13,6,10,13,11,16,14,14,12,14,13,12,12,13,12,17,12,12,11,6,5,6,11,10,5,10,11,10,11,10,6,11,11,5,5,10,5,16,11,11,11,11,7,10,6,11,10,14,10,10,9,7,5,7,9],"FreeSansBold12pt7b":[7,8,11,13,13,21,17,6,8,8,9,14,6,8,6,7,13,14,13,13,13,13,13,13,13,13,6,6,14,14,14,15,23,17,17,17,17,16,15,18,18,7,14,17,15,21,18,19,16,19,17,16,15,18,16,23,16,15,15,8,7,8,14,13,6,14,15,13,15,14,8,15,14,7,7,14,6,21,15,15,15,15,9,13,8,15,13,19,13,13,12,9,7,9,12],"FreeSansBold18pt7b":[10,12,17,19,19,31,25,9,12,12,14,20,9,12,9,10,19,19,19,19,19,19,19,19,19,19,9,9,20,20,20,21,34,24,25,25,25,23,22,27,26,11,20,25,22,30,26,27,24,27,25,24,23,26,23,34,24,22,21,12,10,12,20,19,9,20,22,20,22,20,12,21,21,10,10,20,9,31,21,21,22,22,14,19,12,21,19,27,19,19,18,14,10,14,18]}; // per-font xAdvance for ASCII 32..126, straight from the firmware's font headers
 // geometry (shared 1:1 with firmware)
 const UCX=8,UCY=28,UCW=224,UCH=84,LCX=64,RCX=176, WCX=8,WCY=118,WCW=224,WCH=54, TIMEY=196,DATEY=222;
+// 3-metric geometry: divider encodes the 5h | 7d boundary; W+F share one 7d reset.
+// Single-letter labels (S/W/F) free the label row, so ALL THREE numbers run at Bold18.
+// Sized from the REAL GFX xAdvance tables: "88%"@18=69px per ~74px column; 100 renders
+// WITHOUT '%' ("100%"@18=88px would not fit). Worst cases: sr "12:39pm"=71px -> 9.5..80.5;
+// week 84.5..153.5; fable 160.5..229.5; reset "Dec 30 12:59pm"=134px -> 90..224. All clear.
+const FDIV=82,FSCX=45,FWCX=119,FFCX=195,FRSTX=157;
 let data={s:7,w:2,sr:"6:30pm",wr:"Jun 15 10am",haveData:true,city:"Melbourne",wc:"Overcast",
  wt:16,wfl:14,whi:16,wlo:13,wrain:100,whum:82,time:"13:48:50",date:"Sat 13 Jun",conn:1,auth:"ok",age:120};
 let mi=0;
@@ -22,20 +31,46 @@ document.getElementById('d').value=JSON.stringify(data,null,1);
 const x=document.getElementById('c').getContext('2d');
 const logoImg=new Image(); logoImg.src='labs-icon.svg'; logoImg.onload=render;
 function lvl(p){if(p<0)return C.gray;if(p>=85)return C.red;if(p>=50)return C.amber;return C.green;}
-function T(s,px,py,font,col,align){x.font=font;x.fillStyle=col;x.textAlign=align;x.textBaseline='middle';x.fillText(s,px,py);}
+function mw(s,font){s=String(s);const t=ADV[GFXMAP[font]];if(!t){x.font=font;return x.measureText(s).width;}
+ let w=0;for(const ch of s)w+=t[ch.charCodeAt(0)-32]||0;return w;}
+// device-true text: each glyph is placed inside its REAL GFX xAdvance cell, so string
+// extents and alignment are exactly what the ESP renders — Arial only paints the shapes.
+function T(s,px,py,font,col,align){
+ s=String(s);const t=ADV[GFXMAP[font]];x.font=font;x.fillStyle=col;x.textBaseline='middle';
+ if(!t){x.textAlign=align;x.fillText(s,px,py);return;}
+ const w=mw(s,font);let cx=align=='center'?px-w/2:align=='right'?px-w:px;
+ x.textAlign='left';
+ for(const ch of s){const a=t[ch.charCodeAt(0)-32]||0;x.fillText(ch,cx+(a-x.measureText(ch).width)/2,py);cx+=a;}
+}
 function rr(px,py,w,h,r,fill){x.beginPath();x.moveTo(px+r,py);x.arcTo(px+w,py,px+w,py+h,r);x.arcTo(px+w,py+h,px,py+h,r);x.arcTo(px,py+h,px,py,r);x.arcTo(px,py,px+w,py,r);x.closePath();x.fillStyle=fill;x.fill();}
 function metrics(d){return [['NOW',d.wt,'°'],['FEELS',d.wfl,'°'],['HIGH',d.whi,'°'],['LOW',d.wlo,'°'],['RAIN',d.wrain,'%'],['HUM',d.whum,'%']];}
 function step(){mi=(mi+1)%6;document.getElementById('mi').textContent=mi;render();}
 function usageCard(){
  rr(UCX,UCY,UCW,UCH,10,C.panel);
- x.strokeStyle=C.line;x.lineWidth=1;x.beginPath();x.moveTo(120.5,UCY+14);x.lineTo(120.5,UCY+UCH-14);x.stroke();
+ if((data.f==null?-1:data.f)>=0) usageCard3(); else usageCard2();
+}
+function vline(px){x.strokeStyle=C.line;x.lineWidth=1;x.beginPath();x.moveTo(px+0.5,UCY+14);x.lineTo(px+0.5,UCY+UCH-14);x.stroke();}
+function usageCard2(){   // classic 2-col — account has no model-scoped weekly limit
+ vline(120);
  col(LCX,"SESSION",data.haveData?data.s:-1,data.sr||"idle");
  col(RCX,"WEEK",data.haveData?data.w:-1,data.wr||"--");
 }
+function usageCard3(){   // S (5h) | W + F (7d) sharing ONE reset — three Bold18 heroes
+ vline(FDIV);
+ col(FSCX,"S",data.haveData?data.s:-1,data.sr||"idle");
+ num(FWCX,"W",data.haveData?data.w:-1);
+ num(FFCX,(data.fl||"F")[0],data.haveData?data.f:-1);   // first letter of the scoped-model name
+ if(data.wr)T(data.wr,FRSTX,UCY+72,F.tiny,C.dim,'center');   // no "resets" prefix — 174px wouldn't fit
+}
+function pctStr(p){return p<0?"--":(p==100?"100":p+"%");}   // 100 drops the % (width, see geometry note)
 function col(cx,label,pct,reset){
  T(label,cx,UCY+18,F.s9,C.gray,'center');
- T(pct<0?"--":pct+"%",cx,UCY+47,F.b18,lvl(pct),'center');
+ T(pctStr(pct),cx,UCY+47,F.b18,lvl(pct),'center');
  T(reset,cx,UCY+72,F.tiny,C.dim,'center');
+}
+function num(cx,label,pct){   // weekly metric — no own reset, shares the 7d line
+ T(label,cx,UCY+18,F.s9,C.gray,'center');
+ T(pctStr(pct),cx,UCY+47,F.b18,lvl(pct),'center');
 }
 function fmtAge(s){if(s==null||s<0)return "";return s<3600?("stale "+Math.floor(s/60)+"m"):("stale "+Math.floor(s/3600)+"h");}
 function errorCard(){   // dead Claude auth -> takeover the hero card (1:1 with firmware drawUsageError)
@@ -50,9 +85,9 @@ function weatherCard(){
  T(data.wc||"--",WCX+12,WCY+38,F.s9,C.sky,'left');
  const m=metrics(data)[mi],val=(m[1]==null?'--':m[1]);
  T(m[0],WCX+WCW-14,WCY+15,F.tiny,C.gray,'right');
- if(m[2]=='°'){T(val,WCX+WCW-22,WCY+37,F.b18,C.white,'right');
+ if(m[2]=='°'){T(val,WCX+WCW-22,WCY+37,F.b12,C.white,'right');   // device uses Bold12 here
    x.strokeStyle=C.white;x.lineWidth=1.5;x.beginPath();x.arc(WCX+WCW-16,WCY+29,3,0,7);x.stroke();}
- else T(val+m[2],WCX+WCW-14,WCY+37,F.b18,C.white,'right');
+ else T(val+m[2],WCX+WCW-14,WCY+37,F.b12,C.white,'right');
 }
 function render(){
  try{data=JSON.parse(document.getElementById('d').value);}catch(e){}
@@ -66,7 +101,7 @@ function render(){
  if(logoImg.complete)x.drawImage(logoImg,186,184,48,48);
 }
 function pull(){fetch('http://10.0.0.5:8088/usage').then(r=>r.json()).then(s=>{const d=new Date();
- data=Object.assign(data,{s:s.s,w:s.w,sr:s.sr,wr:s.wr,haveData:!!s.ok,auth:s.auth||'ok',age:s.age,city:s.city,wc:s.wc,wt:s.wt,wfl:s.wfl,whi:s.whi,wlo:s.wlo,wrain:s.wrain,whum:s.whum,
+ data=Object.assign(data,{s:s.s,w:s.w,f:(s.f==null?-1:s.f),fl:s.fl||'',sr:s.sr,wr:s.wr,haveData:!!s.ok,auth:s.auth||'ok',age:s.age,city:s.city,wc:s.wc,wt:s.wt,wfl:s.wfl,whi:s.whi,wlo:s.wlo,wrain:s.wrain,whum:s.whum,
   time:d.toTimeString().slice(0,8),date:d.toLocaleDateString('en-AU',{weekday:'short',day:'2-digit',month:'short'})});
  document.getElementById('d').value=JSON.stringify(data,null,1);render();}).catch(e=>render())}
 pull(); setInterval(()=>{mi=(mi+1)%6;document.getElementById('mi').textContent=mi;pull();},4000);

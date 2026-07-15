@@ -5,8 +5,9 @@ ClaudeTV collector + Master Terminal.
 - Serves the ESP display its data at  GET /usage
 - Serves a branded management terminal at  GET /  (live status, weather/Claude config CRUD,
   token-keeper status, service control)
-- Polls Anthropic /api/oauth/usage (the Claude Code /usage endpoint) for session/week %,
-  and open-meteo (no key) for weather. Always serves last-good; backs off on HTTP 429.
+- Polls Anthropic /api/oauth/usage (the Claude Code /usage endpoint) for session/week % plus
+  the model-scoped weekly limit (e.g. Fable) out of limits[], and open-meteo (no key) for
+  weather. Always serves last-good; backs off on HTTP 429.
 
 TOKEN KEEPER: the Claude OAuth access token is short-lived (~8h). This box must have
 Claude Code installed + logged in; the keeper periodically runs `claude -p "ping" --model haiku`
@@ -179,6 +180,20 @@ def _parse(iso):
     if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
     tz = TZ(); return dt.astimezone(tz) if tz else dt.astimezone()
 
+def _scoped_weekly(data):
+    """The model-scoped weekly limit (e.g. Fable), read GENERICALLY out of limits[].
+    There is no top-level key for it — seven_day_opus/seven_day_sonnet are a different
+    (null) thing. Shape: {kind:'weekly_scoped', percent, scope:{model:{display_name}}}.
+    It shares the seven_day reset window (they land 1s apart), so it needs no own reset.
+    Returns (percent, LABEL) or (-1, "") when the account has no scoped limit."""
+    for lim in (data.get("limits") or []):
+        if lim.get("kind") != "weekly_scoped": continue
+        pct = lim.get("percent")
+        if pct is None: continue
+        name = (((lim.get("scope") or {}).get("model") or {}).get("display_name") or "").strip()
+        return round(float(pct)), name.upper()[:7]
+    return -1, ""
+
 def fetch_usage():
     req = urllib.request.Request(USAGE_URL, headers={"Authorization": "Bearer " + _creds()["accessToken"],
         "Content-Type": "application/json", "Accept": "application/json"})
@@ -188,6 +203,7 @@ def fetch_usage():
     if fh.get("resets_at"): out["sr"] = _clock(_parse(fh["resets_at"]))
     if sw.get("resets_at"):
         d = _parse(sw["resets_at"]); out["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
+    out["f"], out["fl"] = _scoped_weekly(data)
     return out
 
 def geocode(q):
@@ -245,7 +261,7 @@ def device_json():
     with _lock: u, ts, err, wx = _usage, _usage_ts, _usage_err, _wx
     st = {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err,
           "auth": auth_state()}
-    st.update(u or {"s": 0, "w": 0, "sr": "", "wr": ""})
+    st.update(u or {"s": 0, "w": 0, "f": -1, "fl": "", "sr": "", "wr": ""})
     if wx: st.update(wx)
     return st
 
