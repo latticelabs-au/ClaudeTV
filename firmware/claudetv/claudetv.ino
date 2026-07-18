@@ -23,7 +23,7 @@
 #include "panel.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "4.6"
+#define FW_VER  "4.7"
 #define TZ_STR  "AEST-10AEDT,M10.1.0,M4.1.0/3"
 #define TFT_BL  5
 #define WX_CYCLE_MS 4000

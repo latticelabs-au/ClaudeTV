@@ -2,7 +2,8 @@
 
 **A tiny desk display that always shows your Claude usage** — the 5‑hour session %, 7‑day
 week %, **and your model‑scoped weekly limit (e.g. Fable)** from Claude Code's `/usage`, with
-reset times, plus a weather turntable and a clock.
+reset times, plus a weather turntable and a clock. Optional **email / Discord / Slack alerts**
+when a usage window resets.
 
 It runs on a **$15 WiFi clock** ([GeekMagic SmallTV‑Ultra on AliExpress](https://www.aliexpress.com/item/1005007937948865.html))
 that you reflash **over WiFi — no soldering, fully reversible.**
@@ -45,7 +46,7 @@ Grab the prebuilt image from the [latest release](https://github.com/latticelabs
 and flash it over the clock's stock web updater (find its IP on your router):
 
 ```bash
-curl -F "firmware=@claudetv-v4.6-generic.bin" http://<device-ip>/update
+curl -F "firmware=@claudetv-v4.7-generic.bin" http://<device-ip>/update
 ```
 
 On first boot the device opens a **`ClaudeTV-Setup`** WiFi hotspot. Join it, pick your WiFi, and
@@ -92,6 +93,10 @@ Your Claude token is **never logged, shown, or sent anywhere except `api.anthrop
 - **Three hero numbers** — S (5h session) | W (7d week) + F (model‑scoped weekly, e.g. **Fable**),
   green/amber/red by level. Week and the scoped limit share one reset line (same 7‑day window);
   accounts without a scoped limit automatically get the classic two‑column card.
+- **Reset alerts** — get pinged by **email, Discord, and Slack** the moment a usage window
+  (5‑hour session and/or 7‑day week) rolls over to a fresh quota — the reset Anthropic only posts
+  on X. Configure it in the master terminal's Notifications card; secrets are write‑only and each
+  channel has a Test button.
 - **Auth outage on‑screen** — if the host's Claude login dies, the card flips to a red
   **LOGIN EXPIRED / re‑auth on host** state instead of silently showing stale numbers.
 - **Weather turntable** — cycles now / feels‑like / high / low / rain % / humidity.

@@ -13,6 +13,7 @@ button{cursor:pointer;width:100%}.grid{display:grid;grid-template-columns:1fr 1f
 <h1>Claude<span class=coral>TV</span> <span class=muted id=ver></span></h1>
 <div class=card><div class=row><span>Session (5h)</span><span class=big id=sess>--</span></div><div class=muted id=sessr></div>
 <div class=row><span>Week (7d)</span><span class=big id=week>--</span></div><div class=muted id=weekr></div>
+<div class=row id=fablerow style="display:none"><span id=fablelbl>Fable (7d)</span><span class=big id=fable>--</span></div>
 <div class=row><span class=muted id=wx></span><span class=muted id=clock></span></div></div>
 <div class=card><label>Brightness <span id=bril></span></label><input type=range min=0 max=100 id=bri oninput="set('bri',this.value)"></div>
 <div class=card><div class=row><label>Night mode (auto-dim)</label><input type=checkbox id=nEn onchange="set('ne',this.checked?1:0)"></div>
@@ -32,6 +33,7 @@ function applyUsage(){cstat.textContent='Saving & testing…';fetch('/set?usage=
 function load(){fetch('/state').then(r=>r.json()).then(s=>{ver.textContent='v'+s.ver;
 sess.textContent=s.haveData?s.s+'%':'--';sessr.textContent=s.sr?('resets '+s.sr):'idle';
 week.textContent=s.haveData?s.w+'%':'--';weekr.textContent=s.wr?('resets '+s.wr):'';
+if(s.f>=0){fablerow.style.display='';fablelbl.textContent=(s.fl||'Fable')+' (7d)';fable.textContent=s.haveData?s.f+'%':'--';}else fablerow.style.display='none';
 wx.textContent=s.city+' '+s.wt+'°C '+s.wc;clock.textContent=s.time;
 bri.value=s.bri;bril.textContent=s.bri+'%';nEn.checked=s.ne;nStart.value=s.ns;nEnd.value=s.nf;nBri.value=s.nb;nbril.textContent=s.nb+'%';refresh.value=s.refresh;
 if(document.activeElement!==usage)usage.value=s.usage||'';
