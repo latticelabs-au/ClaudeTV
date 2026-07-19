@@ -97,13 +97,6 @@ _lock = threading.Lock()
 _usage = None; _usage_ts = 0; _usage_err = "starting"; _wx = None; _wx_err = ""
 _last_refresh = 0; _refresh_err = ""; _refreshing = False; _auth_dead = False
 
-# substrings in `claude` output that mean the OAuth session itself is dead
-# (the refresh token is invalid/revoked -> a silent re-refresh can never recover it;
-#  only a manual `claude /login` on this host fixes it)
-_DEAD_MARKERS = ("401", "invalid authentication", "please run /login", "unauthorized",
-                 "oauth token expired", "authentication_error",
-                 "failed to authenticate", "session expired", "could not be refreshed")
-
 # ---------- token keeper ----------
 def _creds():
     for _ in range(3):
@@ -124,9 +117,17 @@ def find_claude():
     return None
 
 def refresh_token(reason=""):
-    """Force Claude Code to refresh its token via a tiny ping. Returns True on success."""
-    global _last_refresh, _refresh_err, _refreshing, _auth_dead
+    """Best-effort: nudge Claude Code to renew its access token via a tiny ping. Returns True on
+    success. Does NOT decide auth-dead — that is driven solely by whether the USAGE endpoint accepts
+    the token (a refresh can fail while the access token still works, e.g. a long-lived setup-token
+    that has no refresh token at all)."""
+    global _last_refresh, _refresh_err, _refreshing
     if _refreshing: return False
+    try:
+        if not _creds().get("refreshToken"):        # long-lived / setup-token -> nothing to refresh
+            _refresh_err = "long-lived token (no refresh token) — refresh not applicable"; return False
+    except Exception:
+        pass
     binp = find_claude()
     if not binp:
         _refresh_err = "claude binary not found (install Claude Code on this host)"; return False
@@ -134,27 +135,17 @@ def refresh_token(reason=""):
     try:
         before = token_expiry_ms()
         env = os.environ.copy(); env.setdefault("HOME", os.path.expanduser("~"))
-        # capture output (stderr merged into stdout): the ping's error text is the ONLY
-        # signal that the refresh token is dead and a manual re-login is required. Never
-        # contains the token itself. Previously sent to DEVNULL -> silent outages.
         p = subprocess.run([binp, "-p", "ping", "--model", CONFIG["PING_MODEL"]],
                            cwd=os.path.expanduser("~"), env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
         after = token_expiry_ms()
         if after > before or after > time.time() * 1000:
-            _last_refresh = int(time.time()); _refresh_err = ""; _auth_dead = False
+            _last_refresh = int(time.time()); _refresh_err = ""
             print("[%s] token refreshed (%s) valid +%dm" % (time.strftime("%H:%M:%S"), reason or "keeper",
                   (after - time.time()*1000)/60000))
             return True
         out = (p.stdout or b"").decode("utf-8", "replace").strip().replace("\n", " ")
-        low = out.lower()
-        if p.returncode != 0 and any(m in low for m in _DEAD_MARKERS):
-            _auth_dead = True
-            _refresh_err = "login expired - re-auth on host: claude /login"
-        elif p.returncode != 0:
-            _refresh_err = ("ping failed: " + out)[:90]
-        else:
-            _refresh_err = "ping ran but token unchanged"
+        _refresh_err = ("refresh failed: " + out)[:100] if p.returncode != 0 else "ping ran but token unchanged"
         print("[%s] token refresh: %s" % (time.strftime("%H:%M:%S"), _refresh_err)); return False
     except subprocess.TimeoutExpired:
         _refresh_err = "claude ping timed out"; return False
@@ -166,14 +157,14 @@ def refresh_token(reason=""):
 def keeper():
     while True:
         try:
-            exp = token_expiry_ms()
+            c = _creds(); exp = int(c.get("expiresAt", 0))
             margin = int(CONFIG["REFRESH_MARGIN_MIN"]) * 60 * 1000
-            if exp == 0 or (exp - time.time() * 1000) < margin:
+            # only refresh a token that HAS a refresh token and is near expiry; a long-lived / setup
+            # token (no refreshToken) needs no keeping alive, so don't ping the API pointlessly.
+            if c.get("refreshToken") and (exp == 0 or (exp - time.time() * 1000) < margin):
                 refresh_token("proactive")
         except Exception as e:
             print("[%s] keeper error: %s" % (time.strftime("%H:%M:%S"), e))
-        # back off hard once the session is confirmed dead — pinging every 2 min can't fix a dead
-        # refresh token and just wastes requests until someone runs `claude /login` on the host.
         time.sleep(900 if _auth_dead else 120)
 
 def token_status():
@@ -493,9 +484,10 @@ def poller():
                 notify_check(u, resets)                 # detect/log/notify resets (never raises)
             except urllib.error.HTTPError as e:
                 with _lock: _usage_err = "http %d" % e.code
-                if e.code in (401, 403):                 # auth -> try refresh; back off HARD if the
-                    refresh_token("auth-fail")           # session is dead (no 10s hammer -> no 429 spin)
-                    next_u = now + (300 if _auth_dead else 30)
+                if e.code in (401, 403):                 # the USAGE endpoint rejected the token = dead
+                    with _lock: _auth_dead = True         # (only 401/403 means dead; 429 is rate-limit)
+                    refresh_token("auth-fail")            # best-effort recovery (only if a refresh token exists)
+                    next_u = now + 300
                 else:
                     ra = e.headers.get("Retry-After"); wait = int(ra) if (ra and ra.isdigit()) else min(backoff * 2, 600)
                     backoff = wait; next_u = now + wait
