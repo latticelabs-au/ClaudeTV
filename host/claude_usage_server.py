@@ -101,7 +101,8 @@ _last_refresh = 0; _refresh_err = ""; _refreshing = False; _auth_dead = False
 # (the refresh token is invalid/revoked -> a silent re-refresh can never recover it;
 #  only a manual `claude /login` on this host fixes it)
 _DEAD_MARKERS = ("401", "invalid authentication", "please run /login", "unauthorized",
-                 "oauth token expired", "authentication_error")
+                 "oauth token expired", "authentication_error",
+                 "failed to authenticate", "session expired", "could not be refreshed")
 
 # ---------- token keeper ----------
 def _creds():
@@ -171,7 +172,9 @@ def keeper():
                 refresh_token("proactive")
         except Exception as e:
             print("[%s] keeper error: %s" % (time.strftime("%H:%M:%S"), e))
-        time.sleep(120)
+        # back off hard once the session is confirmed dead — pinging every 2 min can't fix a dead
+        # refresh token and just wastes requests until someone runs `claude /login` on the host.
+        time.sleep(900 if _auth_dead else 120)
 
 def token_status():
     try:
