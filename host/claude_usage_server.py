@@ -18,7 +18,7 @@ refresh. (Negligible usage cost.) The token is NEVER logged, shown, or sent anyw
 Config is read from environment / a .env beside this file and is editable from the terminal.
 """
 import json, os, time, threading, subprocess, shutil, urllib.request, urllib.error, urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -34,7 +34,7 @@ START_TS = time.time()
 EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", "DEVICE_URL",
             "CLAUDE_CREDENTIALS", "CLAUDE_BIN", "PING_MODEL", "REFRESH_MARGIN_MIN",
             # --- reset notifications (non-secret; secrets live in SECRET_KEYS below) ---
-            "NOTIFY_SESSION_RESET", "NOTIFY_WEEK_RESET", "NOTIFY_EMAIL",
+            "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_EMAIL",
             "SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_FROM", "SMTP_USER", "NOTIFY_EMAIL_TO"]
 # Bearer secrets: settable from the (unauthenticated, LAN) terminal but NEVER read back —
 # /api/state reports only "<key>_set": bool, and a save that submits the mask leaves them intact.
@@ -45,7 +45,8 @@ DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Au
             "DEVICE_URL": "http://claudetv.local",
             "CLAUDE_CREDENTIALS": "~/.claude/.credentials.json", "CLAUDE_BIN": "",
             "PING_MODEL": "haiku", "REFRESH_MARGIN_MIN": "30",
-            "NOTIFY_SESSION_RESET": "false", "NOTIFY_WEEK_RESET": "false", "NOTIFY_EMAIL": "false",
+            "NOTIFY_SESSION_RESET": "false", "NOTIFY_SESSION_MAXED": "false",
+            "NOTIFY_WEEK_RESET": "false", "NOTIFY_EMAIL": "false",
             "SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls", "SMTP_FROM": "",
             "SMTP_USER": "", "NOTIFY_EMAIL_TO": "",
             "NOTIFY_DISCORD_WEBHOOK": "", "NOTIFY_SLACK_WEBHOOK": "", "SMTP_PASS": ""}
@@ -244,22 +245,35 @@ def fetch_weather():
             "wlo": di("temperature_2m_min"), "wrain": di("precipitation_probability_max")}
 
 # ---------- reset notifier ----------
-# Fires email / Discord / Slack when a usage window (5h session, 7d week) rolls over to a fresh
-# quota. A window resets exactly when its resets_at jumps forward; we persist the last-seen instant
-# per window and fire on a >60s forward jump (the API jitters resets_at by microseconds in-window).
-# Cold start records a baseline silently. Sends run off-thread and can never crash the poller.
+# Logs + notifies (email / Discord / Slack) when a usage window (5h session, 7d week) resets.
+# resets_at is the NEXT *scheduled* reset on a FIXED schedule — a surprise Anthropic reset ('gift')
+# zeroes your usage but does NOT move it. So a reset is detected from EITHER:
+#   - resets_at rolling forward  (the scheduled reset arrived), OR
+#   - utilisation dropping >= RESET_DROP  (a gift, or a scheduled reset whose resets_at lags),
+# then classified by TIMING: at/after the scheduled reset time (prev resets_at) -> 'expected';
+# before it -> 'gift'. Every reset (expected + gifts) is appended to resets.log; cold start baselines
+# silently; fires once per reset; sends run off-thread and can never crash the poller.
 NOTIFY_STATE_PATH = os.path.join(os.path.dirname(ENV_PATH), "notify_state.json")
+RESET_LOG_PATH = os.path.join(os.path.dirname(ENV_PATH), "resets.log")
 _notify_state = None
+_reset_log = None                                      # in-memory tail of resets.log (last 30)
 _notify_last = {"event": "", "at": 0, "results": {}}   # last dispatch, surfaced in the terminal
 
 def _truthy(v): return str(v).strip().lower() in ("1", "true", "yes", "on")
-
+def _now_utc(): return datetime.fromtimestamp(time.time(), tz=timezone.utc)
 def _iso_dt(iso):
     try:
-        dt = datetime.fromisoformat(iso)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
+        dt = datetime.fromisoformat(iso); return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception: return None
+
+# Drop guard: a gift (or a scheduled reset whose resets_at lags) shows as a utilisation fall; require
+# >= RESET_DROP points so rounding jitter can't false-trigger. A scheduled reset also moves resets_at
+# (usage-independent) so a light-usage scheduled reset is still caught; a light-usage gift is a
+# non-event (nothing meaningful was freed).
+RESET_DROP = 5
+# A session "hit its cap" if it was at/above this before resetting. Near-max (not strictly 100) so a
+# maxed session polled at 96-99% — or one that maxed between polls — isn't missed.
+SESSION_MAXED_PCT = 95
 
 def _load_notify_state():
     global _notify_state
@@ -272,6 +286,38 @@ def _save_notify_state():
     try:
         with open(NOTIFY_STATE_PATH, "w", encoding="utf-8") as f: json.dump(_notify_state, f)
     except Exception as e: print("[notify] state save failed: %s" % e)
+
+def _load_reset_log():
+    global _reset_log
+    if _reset_log is None:
+        _reset_log = []
+        try:
+            for line in open(RESET_LOG_PATH, encoding="utf-8"):
+                line = line.strip()
+                if line: _reset_log.append(json.loads(line))
+            _reset_log = _reset_log[-30:]
+        except Exception: _reset_log = []
+    return _reset_log
+
+def _log_reset(window, cls, detail):
+    """Append-only record of every reset — expected rollovers AND Anthropic 'gifts'."""
+    entry = {"at": _now_utc().isoformat(timespec="seconds"), "window": window, "class": cls, "detail": detail}
+    log = _load_reset_log(); log.append(entry); del log[:-30]
+    try:
+        with open(RESET_LOG_PATH, "a", encoding="utf-8") as f: f.write(json.dumps(entry) + "\n")
+    except Exception as e: print("[notify] reset-log write failed: %s" % e)
+    print("[%s] RESET %s (%s): %s" % (time.strftime("%H:%M:%S"), window, cls, detail))
+
+def _reset_detail(kind, prev, u):
+    """Human before->after string for the log, e.g. 'W 79%->2%, FABLE 100%->3%'."""
+    parts = []
+    for k in (("s",) if kind == "session" else ("w", "f")):
+        cur = u.get(k)
+        if cur is None or cur < 0: continue
+        lbl = {"s": "S", "w": "W", "f": (u.get("fl") or "F")}[k]
+        before = prev.get(k)
+        parts.append("%s %s%%->%d%%" % (lbl, before if before is not None else "?", cur))
+    return ", ".join(parts)
 
 def _channels():
     """Configured sinks -> list of channel names."""
@@ -333,37 +379,71 @@ def _dispatch(title, body, channels, event):
     _notify_last.update({"event": event, "at": int(time.time()), "results": results})
     return results
 
-def _reset_message(kind, u):
+def _reset_message(kind, u, cls="expected", maxed=False):
+    window = "session (5h)" if kind == "session" else "weekly (7d)"
     parts = ["S %d%%" % u.get("s", 0), "W %d%%" % u.get("w", 0)]
     if u.get("f", -1) >= 0: parts.append("%s %d%%" % (u.get("fl") or "F", u["f"]))
     now = " · ".join(parts)
-    if kind == "session":
-        nxt = ("Next reset ~%s. " % u["sr"]) if u.get("sr") else ""
-        return ("Claude session usage reset (5h)",
-                "Your 5-hour session quota just refreshed. %sNow: %s." % (nxt, now))
-    nxt = ("Next reset %s. " % u["wr"]) if u.get("wr") else ""
-    return ("Claude weekly usage reset (7d)",
-            "Your 7-day quota just refreshed. %sNow: %s." % (nxt, now))
+    nxt_v = u.get("sr") if kind == "session" else u.get("wr")
+    nxt = (" Next reset %s%s." % ("~" if kind == "session" else "", nxt_v)) if nxt_v else ""
+    if maxed:                                          # session that had hit its cap
+        return ("%s Maxed session reset — you're unblocked" % ("\U0001F381" if cls == "gift" else "✅"),
+                "Your session hit its cap and just reset%s. Now: %s.%s"
+                % (" EARLY — a gift!" if cls == "gift" else "", now, nxt))
+    if cls == "gift":
+        return ("\U0001F381 Anthropic gift — %s usage reset early" % window,
+                "Your %s quota was reset ahead of schedule — free capacity. Now: %s.%s" % (window, now, nxt))
+    return ("Claude %s usage reset" % window,
+            "Your %s quota just refreshed. Now: %s.%s" % (window, now, nxt))
 
-def notify_check(resets, u):
-    """Detect window rollovers and fire enabled events. Wrapped so it never breaks the poller."""
+def _was_maxed(prev):
+    s = prev.get("s")
+    return s is not None and s >= SESSION_MAXED_PCT
+
+def _should_notify(kind, prev):
+    """Session has TWO independent toggles: NOTIFY_SESSION_RESET (every reset) and
+    NOTIFY_SESSION_MAXED (only when the ending session had hit its cap). Week: NOTIFY_WEEK_RESET."""
+    if kind == "session":
+        return (_truthy(CONFIG.get("NOTIFY_SESSION_RESET"))
+                or (_was_maxed(prev) and _truthy(CONFIG.get("NOTIFY_SESSION_MAXED"))))
+    return _truthy(CONFIG.get("NOTIFY_WEEK_RESET"))
+
+def notify_check(u, resets):
+    """Detect + log usage-window resets (see the section header), then notify per the toggles.
+    Per window: session=s / resets_at.five_hour; week=(w OR f) / resets_at.seven_day. Baselines
+    silently on first sight; fires once per reset. Never breaks the poller."""
     try:
-        st = _load_notify_state(); changed = False
-        for kind, toggle in (("session", "NOTIFY_SESSION_RESET"), ("week", "NOTIFY_WEEK_RESET")):
-            iso = resets.get(kind); new = _iso_dt(iso) if iso else None
-            if not new: continue
-            prev = _iso_dt(st.get(kind)) if st.get(kind) else None
-            if prev is None:                            # baseline — no fire on first sight
-                st[kind] = iso; changed = True; continue
-            delta = (new - prev).total_seconds()
-            if delta > 60:                              # forward jump = the window reset
-                st[kind] = iso; changed = True
-                if _truthy(CONFIG.get(toggle)) and _channels():
-                    title, body = _reset_message(kind, u)
+        st = _load_notify_state(); changed = False; now = _now_utc()
+        for kind, keys in (("session", ("s",)), ("week", ("w", "f"))):
+            ra_iso = resets.get(kind)
+            prev = st.get(kind) if isinstance(st.get(kind), dict) else {}   # migrate old formats
+            cur = dict(prev); prev_ra = _iso_dt(prev.get("ra"))
+            if ra_iso: cur["ra"] = ra_iso
+            usable = {}
+            for k in keys:                              # f == -1 when the account has no scoped limit
+                v = u.get(k)
+                if v is not None and v >= 0: cur[k] = v; usable[k] = v
+            reset = False
+            if prev:                                    # not first sight
+                new_ra = _iso_dt(ra_iso)
+                rolled = bool(new_ra and prev_ra and (new_ra - prev_ra).total_seconds() > 60)
+                dropped = any(prev.get(k) is not None and (prev[k] - v) >= RESET_DROP
+                              for k, v in usable.items())
+                reset = rolled or dropped
+            ended = prev.get("ra")
+            # dedup: a rolling resets_at can lag its reset, so the drop and the later ra-roll are the
+            # SAME reset — fire once per ended window.
+            if reset and ended is not None and prev.get("fired_for") == ended: reset = False
+            if reset:
+                cls = "expected" if (prev_ra and now >= prev_ra - timedelta(minutes=5)) else "gift"
+                cur["fired_for"] = ended
+            if cur != prev: st[kind] = cur; changed = True
+            if reset:
+                _log_reset(kind, cls, _reset_detail(kind, prev, u))
+                if _should_notify(kind, prev) and _channels():
+                    title, body = _reset_message(kind, u, cls, kind == "session" and _was_maxed(prev))
                     threading.Thread(target=_dispatch, args=(title, body, _channels(), kind + "_reset"),
                                      daemon=True).start()
-            elif delta > 0:                             # microsecond jitter — advance, no fire
-                st[kind] = iso; changed = True
         if changed: _save_notify_state()
     except Exception as e:
         print("[notify] check error: %s" % e)
@@ -388,13 +468,14 @@ def notify_test(channel):
 def notify_status():
     st = _load_notify_state()
     return {"session_enabled": _truthy(CONFIG.get("NOTIFY_SESSION_RESET")),
+            "session_maxed_enabled": _truthy(CONFIG.get("NOTIFY_SESSION_MAXED")),
             "week_enabled": _truthy(CONFIG.get("NOTIFY_WEEK_RESET")),
             "channels": _channels(),
             "discord_set": bool(CONFIG.get("NOTIFY_DISCORD_WEBHOOK")),
             "slack_set": bool(CONFIG.get("NOTIFY_SLACK_WEBHOOK")),
             "smtp_pass_set": bool(CONFIG.get("SMTP_PASS")),
-            "last_session_reset": st.get("session", ""), "last_week_reset": st.get("week", ""),
-            "last_sent": _notify_last}
+            "tracking": {k: v for k, v in st.items() if isinstance(v, dict)},
+            "recent_resets": _load_reset_log()[-10:], "last_sent": _notify_last}
 
 def poller():
     global _usage, _usage_ts, _usage_err, _wx, _wx_err, _auth_dead
@@ -406,7 +487,7 @@ def poller():
                 u, resets = fetch_usage()
                 with _lock: _usage = u; _usage_ts = int(now); _usage_err = ""; _auth_dead = False
                 backoff = int(CONFIG["USAGE_EVERY"]); next_u = now + backoff
-                notify_check(resets, u)                 # fire on window rollover (never raises)
+                notify_check(u, resets)                 # detect/log/notify resets (never raises)
             except urllib.error.HTTPError as e:
                 with _lock: _usage_err = "http %d" % e.code
                 if e.code in (401, 403):                 # auth -> try refresh; back off HARD if the
@@ -515,7 +596,8 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 
 <div class=card><h2>Reset notifications</h2>
 <div class=muted>Get pinged when your Claude usage window rolls over to a fresh quota (the reset Anthropic only posts on X).</div>
-<div class=row style="margin-top:8px"><span>Session reset (5h)</span><input type=checkbox id=NOTIFY_SESSION_RESET></div>
+<div class=row style="margin-top:8px"><span>Session reset (5h) &mdash; every reset</span><input type=checkbox id=NOTIFY_SESSION_RESET></div>
+<div class=row><span class=muted>&nbsp;&nbsp;&#8627; only when the session maxed out (hit its cap)</span><input type=checkbox id=NOTIFY_SESSION_MAXED></div>
 <div class=row><span>Week reset (7d)</span><input type=checkbox id=NOTIFY_WEEK_RESET></div>
 <div class=muted id=nstat></div>
 <label style="margin-top:10px">Discord webhook URL</label>
@@ -529,7 +611,8 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <label>Send alerts to</label>
 <div style="display:flex;gap:8px"><input id=NOTIFY_EMAIL_TO placeholder=you@example.com style="flex:1"><button class=ghost style="width:auto" onclick="ntest('email')">Test</button></div>
 <div class=muted style="margin-top:8px">Secrets are write-only: once saved a webhook/password shows as <code>********</code> (never sent back) — leave it to keep, paste a new value to replace. Test uses the last <b>saved</b> config.</div>
-<div class=row><span class=muted id=nres></span></div></div>
+<div class=row><span class=muted id=nres></span></div>
+<div class=muted id=nlog style="margin-top:8px"></div></div>
 
 <button onclick=saveCfg()>Save config &amp; restart</button>
 
@@ -561,8 +644,9 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  // a saved secret shows the mask as its VALUE (looks filled = obviously saved); saveCfg skips it
  [['discord_set',NOTIFY_DISCORD_WEBHOOK],['slack_set',NOTIFY_SLACK_WEBHOOK],['smtp_pass_set',SMTP_PASS]].forEach(([k,el])=>{
    if(n[k]&&document.activeElement!==el&&!el.value)el.value='********';});
- nstat.textContent='Channels: '+((n.channels||[]).join(', ')||'none configured')+(n.last_week_reset?(' · last week reset '+n.last_week_reset.slice(0,16).replace('T',' ')):'');
+ nstat.textContent='Channels: '+((n.channels||[]).join(', ')||'none configured');
  const ls=n.last_sent||{};if(ls.event)nres.textContent='last: '+ls.event+' — '+Object.entries(ls.results||{}).map(([k,v])=>k+' '+v).join(', ');
+ const rr=n.recent_resets||[];nlog.innerHTML=rr.length?('<b>Recent resets</b><br>'+rr.slice().reverse().map(e=>e.at.slice(0,16).replace('T',' ')+' · '+e.window+' · '+(e.class=='gift'?'🎁 gift':'scheduled')+(e.detail?(' · '+e.detail):'')).join('<br>')):'';
  CITY_disp.textContent=s.config.CITY||'--';geoMeta.textContent=s.config.LAT?('· '+s.config.TZ):'';
  devUrl=s.config.DEVICE_URL||'';
 }).catch(()=>{pill(svc,'bad','unreachable')})}
@@ -575,7 +659,7 @@ function pickCity(h){geoResults.innerHTML='';citySearch.value='';pill(svc,'warn'
 function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','CLAUDE_CREDENTIALS','CLAUDE_BIN','PING_MODEL','REFRESH_MARGIN_MIN','USAGE_EVERY','PORT',
   'SMTP_HOST','SMTP_PORT','SMTP_SECURITY','SMTP_FROM','SMTP_USER','NOTIFY_EMAIL_TO'];
  const parts=ks.map(k=>k+'='+encodeURIComponent(document.getElementById(k).value));
- ['NOTIFY_SESSION_RESET','NOTIFY_WEEK_RESET','NOTIFY_EMAIL'].forEach(k=>parts.push(k+'='+(document.getElementById(k).checked?'true':'false')));
+ ['NOTIFY_SESSION_RESET','NOTIFY_SESSION_MAXED','NOTIFY_WEEK_RESET','NOTIFY_EMAIL'].forEach(k=>parts.push(k+'='+(document.getElementById(k).checked?'true':'false')));
  ['NOTIFY_DISCORD_WEBHOOK','NOTIFY_SLACK_WEBHOOK','SMTP_PASS'].forEach(k=>{const v=document.getElementById(k).value.trim();if(v&&v!=='********')parts.push(k+'='+encodeURIComponent(v));});
  if(!confirm('Save config and restart the collector?'))return;
  fetch('/api/config?'+parts.join('&'),{method:'POST'}).then(()=>{pill(svc,'warn','restarting');setTimeout(load,3500)})}

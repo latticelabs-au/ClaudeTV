@@ -3,6 +3,7 @@ firmware/claudetv/config.h
 **/.credentials.json
 *.env
 **/notify_state.json
+**/resets.log
 **/__pycache__/
 
 # build artifacts
