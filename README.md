@@ -88,6 +88,23 @@ Your Claude token is **never logged, shown, or sent anywhere except `api.anthrop
 
 ---
 
+## Authentication — one login, self-maintaining
+
+The host authenticates with your **Claude subscription login**, not an API key. Run `claude` once on
+the box and `/login` (interactive OAuth); the collector reads that OAuth token from
+`~/.claude/.credentials.json`, and the token keeper refreshes it automatically every few hours — so
+it runs unattended. You only re-login if the token is **genuinely rejected** (a real 401/403, shown
+as **LOGIN EXPIRED** on the device), not for routine operation.
+
+Two things that look like they should work but **don't** — save yourself the detour:
+
+- **API keys (`sk-ant-api…`)** — the `api/oauth/usage` endpoint reports your *subscription* limits
+  (5h / 7d / model-scoped), which API-key accounts don't have. Wrong credential entirely.
+- **`claude setup-token`** — that long-lived token is scoped for Claude Code *inference* and is
+  rejected (**403**) by the usage endpoint. Use the interactive `/login`.
+
+---
+
 ## Features
 
 - **Three hero numbers** — S (5h session) | W (7d week) + F (model‑scoped weekly, e.g. **Fable**),
