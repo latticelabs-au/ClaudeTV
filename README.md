@@ -1,5 +1,10 @@
 # ClaudeTV
 
+[![Release](https://img.shields.io/github/v/release/latticelabs-au/ClaudeTV?style=flat-square&labelColor=0C1E3C&color=00B4D8)](https://github.com/latticelabs-au/ClaudeTV/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-B8860B?style=flat-square&labelColor=0C1E3C)](LICENSE)
+![Device](https://img.shields.io/badge/device-GeekMagic%20SmallTV--Ultra%20(ESP8266)-1E3A5F?style=flat-square&labelColor=0C1E3C)
+![Made for Claude Code](https://img.shields.io/badge/made%20for-Claude%20Code-00B4D8?style=flat-square&labelColor=0C1E3C)
+
 **A tiny desk display that always shows your Claude usage** — the 5‑hour session %, 7‑day
 week %, **and your model‑scoped weekly limit (e.g. Fable)** from Claude Code's `/usage`, with
 reset times, plus a weather turntable and a clock. Optional **email / Discord / Slack alerts**
