@@ -37,7 +37,8 @@ START_TS = time.time()
 EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", "DEVICE_URL",
             "CLAUDE_CREDENTIALS", "REFRESH_MARGIN_MIN",
             # --- reset notifications (non-secret; secrets live in SECRET_KEYS below) ---
-            "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_EMAIL",
+            "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_AUTH",
+            "NOTIFY_EMAIL",
             "SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_FROM", "SMTP_USER", "NOTIFY_EMAIL_TO"]
 # Bearer secrets: settable from the (unauthenticated, LAN) terminal but NEVER read back —
 # /api/state reports only "<key>_set": bool, and a save that submits the mask leaves them intact.
@@ -48,7 +49,7 @@ DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Au
             "DEVICE_URL": "http://claudetv.local",
             "CLAUDE_CREDENTIALS": "", "REFRESH_MARGIN_MIN": "30",
             "NOTIFY_SESSION_RESET": "false", "NOTIFY_SESSION_MAXED": "false",
-            "NOTIFY_WEEK_RESET": "false", "NOTIFY_EMAIL": "false",
+            "NOTIFY_WEEK_RESET": "false", "NOTIFY_AUTH": "true", "NOTIFY_EMAIL": "false",
             "SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls", "SMTP_FROM": "",
             "SMTP_USER": "", "NOTIFY_EMAIL_TO": "",
             "NOTIFY_DISCORD_WEBHOOK": "", "NOTIFY_SLACK_WEBHOOK": "", "SMTP_PASS": ""}
@@ -94,9 +95,14 @@ PORT = int(CONFIG["PORT"])
 # Claude Code login. Both stores use Claude Code's {"claudeAiOauth": {...}} format.
 CRED_OWN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
 CRED_CLAUDE_CODE = os.path.expanduser("~/.claude/.credentials.json")
-def cred_path():
-    if CONFIG["CLAUDE_CREDENTIALS"]: return os.path.expanduser(CONFIG["CLAUDE_CREDENTIALS"])
-    return CRED_OWN if os.path.exists(CRED_OWN) else CRED_CLAUDE_CODE
+def cred_stores():
+    """Ordered list of available credential stores. When BOTH exist they are independent OAuth
+    token families for the same account (Anthropic allows concurrent logins), giving a hot
+    standby: the keeper keeps every family's rolling window fresh and the poller fails over
+    if the primary is rejected. An explicit config path pins a single store."""
+    if CONFIG["CLAUDE_CREDENTIALS"]: return [os.path.expanduser(CONFIG["CLAUDE_CREDENTIALS"])]
+    return [p for p in (CRED_OWN, CRED_CLAUDE_CODE) if os.path.exists(p)] or [CRED_CLAUDE_CODE]
+def cred_path(): return cred_stores()[0]
 def wx_url(): return ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
     "&current=temperature_2m,weather_code,apparent_temperature,relative_humidity_2m"
     "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1"
@@ -105,13 +111,16 @@ def wx_url(): return ("https://api.open-meteo.com/v1/forecast?latitude=%s&longit
 _lock = threading.Lock()
 _usage = None; _usage_ts = 0; _usage_err = "starting"; _wx = None; _wx_err = ""
 _last_refresh = 0; _refresh_err = ""; _refreshing = False; _auth_dead = False
+_cred_used = ""       # store that served the last successful poll (standby detection + display)
+_dead_alerted = False  # one auth-dead alert per outage episode
 
 # ---------- token keeper ----------
-def _creds():
+def _creds(path=None):
+    p = path or cred_path()
     for _ in range(3):
-        try: return json.load(open(cred_path(), encoding="utf-8"))["claudeAiOauth"]
+        try: return json.load(open(p, encoding="utf-8"))["claudeAiOauth"]
         except Exception: time.sleep(0.2)
-    return json.load(open(cred_path(), encoding="utf-8"))["claudeAiOauth"]
+    return json.load(open(p, encoding="utf-8"))["claudeAiOauth"]
 
 # Anthropic's public OAuth client (the one Claude Code itself uses). Not a secret: it is a
 # public PKCE client id, the same value shipped in every Claude Code install.
@@ -152,7 +161,7 @@ def _write_creds(resp, path):
     with os.fdopen(fd, "w", encoding="utf-8") as f: json.dump(full, f)
     os.replace(tmp, path)
 
-def refresh_token(reason=""):
+def refresh_token(reason="", path=None):
     """Refresh the OAuth access token NATIVELY via the token endpoint (no Claude Code needed) and
     write the rotated pair back. The refresh token's ~28-day window rolls forward on every refresh,
     so this keeps one login alive indefinitely. Returns True on success. Does NOT decide auth-dead:
@@ -161,9 +170,9 @@ def refresh_token(reason=""):
     if _refreshing: return False
     _refreshing = True
     try:
-        path = cred_path()
+        path = path or cred_path()
         try:
-            rt = _creds().get("refreshToken")
+            rt = _creds(path).get("refreshToken")
         except Exception as e:
             _refresh_err = "credentials unreadable: %s" % str(e)[:40]; return False
         if not rt:
@@ -179,7 +188,7 @@ def refresh_token(reason=""):
                 if e.code == 400 and "invalid_grant" in body and attempt == 1:
                     # Someone else (e.g. an interactive Claude Code session) may have rotated the
                     # pair after we read it; re-read the file and retry once with the newer token.
-                    try: nrt = _creds().get("refreshToken")
+                    try: nrt = _creds(path).get("refreshToken")
                     except Exception: nrt = None
                     if nrt and nrt != rt:
                         rt = nrt; continue
@@ -200,12 +209,21 @@ def refresh_token(reason=""):
 def keeper():
     while True:
         try:
-            c = _creds(); exp = int(c.get("expiresAt", 0))
             margin = int(CONFIG["REFRESH_MARGIN_MIN"]) * 60 * 1000
-            # only refresh a token that HAS a refresh token and is near expiry; a long-lived token
-            # (no refreshToken) needs no keeping alive, so don't hit the token endpoint pointlessly.
-            if c.get("refreshToken") and (exp == 0 or (exp - time.time() * 1000) < margin):
-                refresh_token("proactive")
+            for path in cred_stores():                  # keep EVERY family's rolling window fresh
+                if not os.path.exists(path): continue
+                try: c = _creds(path)
+                except Exception: continue
+                # only refresh a token that HAS a refresh token; a long-lived token (no
+                # refreshToken) needs no keeping alive, so don't hit the token endpoint pointlessly.
+                if not c.get("refreshToken"): continue
+                exp = int(c.get("expiresAt", 0)); rt_exp = int(c.get("refreshTokenExpiresAt", 0))
+                # refresh near access-token expiry, and ALSO if the ~28-day refresh window has
+                # somehow run below 21 days: it re-arms to ~28d on every refresh, so a low window
+                # means refreshes have been stuck (stale expiresAt, clock skew) and must not wait.
+                if (exp == 0 or (exp - time.time() * 1000) < margin) or \
+                   (rt_exp and (rt_exp - time.time() * 1000) < 21 * 86400 * 1000):
+                    refresh_token("proactive", path)
         except Exception as e:
             print("[%s] keeper error: %s" % (time.strftime("%H:%M:%S"), e))
         time.sleep(900 if _auth_dead else 120)
@@ -251,9 +269,33 @@ def _scoped_weekly(data):
     return -1, ""
 
 def fetch_usage():
-    req = urllib.request.Request(USAGE_URL, headers={"Authorization": "Bearer " + _creds()["accessToken"],
-        "Content-Type": "application/json", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=8) as r: data = json.loads(r.read().decode())
+    """Poll the usage endpoint, failing over across credential stores: if the primary family is
+    rejected (401/403) and a standby store exists, try it before giving up. Whichever store
+    answers becomes _cred_used; dropping to a standby fires a one-shot alert."""
+    global _cred_used
+    stores = cred_stores(); data = None; served = None; last = None
+    for i, path in enumerate(stores):
+        try:
+            tok = _creds(path)["accessToken"]
+        except Exception as e:
+            last = e; continue
+        req = urllib.request.Request(USAGE_URL, headers={"Authorization": "Bearer " + tok,
+            "Content-Type": "application/json", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r: data = json.loads(r.read().decode())
+            served = path; break
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (401, 403) and i < len(stores) - 1:
+                print("[%s] store rejected (http %d), trying standby: %s" % (
+                    time.strftime("%H:%M:%S"), e.code, stores[i + 1])); continue
+            raise
+    if data is None: raise last if last else RuntimeError("no credential store")
+    if served != stores[0] and _cred_used != served:
+        _auth_alert("standby", "Anthropic rejected the primary Claude login; the display is now "
+                    "running on the standby login (%s). Everything keeps working, but re-login "
+                    "the primary when convenient." % served)
+    _cred_used = served
     fh, sw = data.get("five_hour") or {}, data.get("seven_day") or {}
     out = {"s": round(float(fh.get("utilization", 0))), "w": round(float(sw.get("utilization", 0))), "sr": "", "wr": ""}
     if fh.get("resets_at"): out["sr"] = _clock(_parse(fh["resets_at"]))
@@ -417,6 +459,20 @@ def _dispatch(title, body, channels, event):
     _notify_last.update({"event": event, "at": int(time.time()), "results": results})
     return results
 
+_AUTH_TITLES = {"dead": "\U0001F534 ClaudeTV: Claude login dead (action needed)",
+                "standby": "\U0001F7E0 ClaudeTV: failed over to standby login",
+                "recovered": "\U0001F7E2 ClaudeTV: Claude auth recovered"}
+
+def _auth_alert(event, body):
+    """Auth outage/failover alerts through the configured notify channels. Edge-triggered by
+    callers (one alert per episode). NOTIFY_AUTH toggle, on by default. Never raises."""
+    try:
+        if not (_truthy(CONFIG.get("NOTIFY_AUTH")) and _channels()): return
+        threading.Thread(target=_dispatch, args=(_AUTH_TITLES[event], body, _channels(),
+                         "auth_" + event), daemon=True).start()
+    except Exception as e:
+        print("[notify] auth alert error: %s" % e)
+
 def _reset_message(kind, u, cls="expected", maxed=False):
     window = "session (5h)" if kind == "session" else "weekly (7d)"
     parts = ["S %d%%" % u.get("s", 0), "W %d%%" % u.get("w", 0)]
@@ -516,20 +572,32 @@ def notify_status():
             "recent_resets": _load_reset_log()[-10:], "last_sent": _notify_last}
 
 def poller():
-    global _usage, _usage_ts, _usage_err, _wx, _wx_err, _auth_dead
+    global _usage, _usage_ts, _usage_err, _wx, _wx_err, _auth_dead, _dead_alerted
     next_u = 0.0; backoff = int(CONFIG["USAGE_EVERY"]); next_w = 0.0
     while True:
         now = time.time()
         if now >= next_u:
             try:
                 u, resets = fetch_usage()
-                with _lock: _usage = u; _usage_ts = int(now); _usage_err = ""; _auth_dead = False
+                with _lock:
+                    was_dead = _auth_dead
+                    _usage = u; _usage_ts = int(now); _usage_err = ""; _auth_dead = False
+                if was_dead and _dead_alerted:
+                    _auth_alert("recovered", "The usage endpoint is accepting the Claude login "
+                                "again. The display is back to live data.")
+                _dead_alerted = False
                 backoff = int(CONFIG["USAGE_EVERY"]); next_u = now + backoff
                 notify_check(u, resets)                 # detect/log/notify resets (never raises)
             except urllib.error.HTTPError as e:
                 with _lock: _usage_err = "http %d" % e.code
-                if e.code in (401, 403):                 # the USAGE endpoint rejected the token = dead
+                if e.code in (401, 403):                 # EVERY credential store rejected = dead
                     with _lock: _auth_dead = True         # (only 401/403 means dead; 429 is rate-limit)
+                    if not _dead_alerted:
+                        _dead_alerted = True
+                        _auth_alert("dead", "Anthropic rejected every Claude login on the host "
+                                    "(http %d). The display shows LOGIN EXPIRED until you log in "
+                                    "again: python3 claude_usage_server.py --login (or claude "
+                                    "/login if Claude Code is on the box)." % e.code)
                     refresh_token("auth-fail")            # best-effort recovery (only if a refresh token exists)
                     next_u = now + 300
                 else:
@@ -562,7 +630,9 @@ def full_state():
     return {"service": {"uptime_s": int(time.time() - START_TS), "port": PORT},
             "token": {"status": tok, "plan": sub, "expires_in_s": exp_in, "auth": auth_state(),
                       "last_refresh_s": (int(time.time()) - lr) if lr else -1,
-                      "refresh_err": re_, "refreshing": refg, "cred": cred_path()},
+                      "refresh_err": re_, "refreshing": refg, "cred": _cred_used or cred_path(),
+                      "stores": len(cred_stores()),
+                      "standby": bool(_cred_used and _cred_used != cred_stores()[0])},
             "usage": {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err, **(u or {})},
             "weather": (wx or {}), "weather_err": wxe, "config": {k: CONFIG[k] for k in EDITABLE},
             "notify": notify_status()}
@@ -638,6 +708,7 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <div class=row style="margin-top:8px"><span>Session reset (5h) &mdash; every reset</span><input type=checkbox id=NOTIFY_SESSION_RESET></div>
 <div class=row><span class=muted>&nbsp;&nbsp;&#8627; only when the session maxed out (hit its cap)</span><input type=checkbox id=NOTIFY_SESSION_MAXED></div>
 <div class=row><span>Week reset (7d)</span><input type=checkbox id=NOTIFY_WEEK_RESET></div>
+<div class=row><span>Auth outage / failover alerts</span><input type=checkbox id=NOTIFY_AUTH></div>
 <div class=muted id=nstat></div>
 <label style="margin-top:10px">Discord webhook URL</label>
 <div style="display:flex;gap:8px"><input id=NOTIFY_DISCORD_WEBHOOK placeholder="https://discord.com/api/webhooks/…" style="flex:1"><button class=ghost style="width:auto" onclick="ntest('discord')">Test</button></div>
@@ -671,7 +742,8 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  up.textContent=fmtUp(s.service.uptime_s);
  const t=s.token;pill(tok,t.status=='valid'?'ok':(t.status=='expired'?'warn':'bad'),t.status+' ('+t.plan+')');
  texp.textContent=t.refreshing?'refreshing…':(t.expires_in_s>0?fmtUp(t.expires_in_s):'--');
- tref.textContent=fmtAgo(t.last_refresh_s);cred.textContent=t.cred;terr.textContent=t.refresh_err?('⚠ '+t.refresh_err):'';
+ tref.textContent=fmtAgo(t.last_refresh_s);cred.textContent=t.cred+(t.stores>1?' (+standby)':'');
+ terr.textContent=(t.standby?'⚠ running on STANDBY login · ':'')+(t.refresh_err?('⚠ '+t.refresh_err):'');
  const u=s.usage;sess.textContent=u.ok?u.s+'%':'--';sessr.textContent=u.sr?('resets '+u.sr):'idle';
  week.textContent=u.ok?u.w+'%':'--';weekr.textContent=u.wr?('resets '+u.wr):'';
  if(u.f>=0){fablerow.style.display='';fablelbl.textContent=(u.fl||'Fable')+' (7d)';fable.textContent=u.ok?u.f+'%':'--';}else fablerow.style.display='none';
@@ -698,7 +770,7 @@ function pickCity(h){geoResults.innerHTML='';citySearch.value='';pill(svc,'warn'
 function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','CLAUDE_CREDENTIALS','REFRESH_MARGIN_MIN','USAGE_EVERY','PORT',
   'SMTP_HOST','SMTP_PORT','SMTP_SECURITY','SMTP_FROM','SMTP_USER','NOTIFY_EMAIL_TO'];
  const parts=ks.map(k=>k+'='+encodeURIComponent(document.getElementById(k).value));
- ['NOTIFY_SESSION_RESET','NOTIFY_SESSION_MAXED','NOTIFY_WEEK_RESET','NOTIFY_EMAIL'].forEach(k=>parts.push(k+'='+(document.getElementById(k).checked?'true':'false')));
+ ['NOTIFY_SESSION_RESET','NOTIFY_SESSION_MAXED','NOTIFY_WEEK_RESET','NOTIFY_AUTH','NOTIFY_EMAIL'].forEach(k=>parts.push(k+'='+(document.getElementById(k).checked?'true':'false')));
  ['NOTIFY_DISCORD_WEBHOOK','NOTIFY_SLACK_WEBHOOK','SMTP_PASS'].forEach(k=>{const v=document.getElementById(k).value.trim();if(v&&v!=='********')parts.push(k+'='+encodeURIComponent(v));});
  if(!confirm('Save config and restart the collector?'))return;
  fetch('/api/config?'+parts.join('&'),{method:'POST'}).then(()=>{pill(svc,'warn','restarting');setTimeout(load,3500)})}

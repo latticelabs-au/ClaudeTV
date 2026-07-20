@@ -126,6 +126,14 @@ Two ways to do the one login:
 You only re‑login if the credential is **genuinely revoked** (a real 401/403 from the usage
 endpoint, shown as **LOGIN EXPIRED** on the device), not for routine operation.
 
+**Want a hot standby?** Do both logins. Each login is its own independent OAuth token family
+(Anthropic allows concurrent logins), the keeper keeps every family's window rolling, and the
+collector **fails over automatically** if the primary is ever rejected, with an alert on your
+configured channels. Auth outages themselves also alert (dead / failover / recovered), so you
+hear about a needed re‑login from Discord or email within minutes instead of noticing a frozen
+display. The only unfixables: the box being offline for 28+ days, or an account‑wide revocation
+(password change, "log out everywhere"), which kills every family at once.
+
 Two things that look like they should work but **don't** (save yourself the detour):
 
 - **API keys (`sk-ant-api…`)**: the `api/oauth/usage` endpoint reports your *subscription* limits
@@ -144,8 +152,10 @@ Two things that look like they should work but **don't** (save yourself the deto
   (5‑hour session and/or 7‑day week) rolls over to a fresh quota — the reset Anthropic only posts
   on X. Configure it in the master terminal's Notifications card; secrets are write‑only and each
   channel has a Test button.
-- **Auth outage on‑screen** — if the host's Claude login dies, the card flips to a red
-  **LOGIN EXPIRED / re‑auth on host** state instead of silently showing stale numbers.
+- **Auth outage: on‑screen + alerted + self‑healing**: if the Claude login dies the card flips
+  to a red **LOGIN EXPIRED / re‑auth on host** state instead of silently showing stale numbers,
+  an alert goes out on your configured channels, and if you've set up a standby login the
+  collector fails over to it automatically and keeps the display live.
 - **Weather turntable** — cycles now / feels‑like / high / low / rain % / humidity.
 - **Clock** + auto‑dimming **night mode** (default 30 %, 21:00–07:00, configurable).
 - **Device control panel** (`http://claudetv.local/`) — brightness, night mode, flip display,
