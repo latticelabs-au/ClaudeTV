@@ -1,6 +1,7 @@
 # secrets / local config — NEVER commit
 firmware/claudetv/config.h
 **/.credentials.json
+**/credentials.json
 *.env
 **/notify_state.json
 **/resets.log

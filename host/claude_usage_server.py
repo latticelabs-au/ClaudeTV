@@ -9,15 +9,18 @@ ClaudeTV collector + Master Terminal.
   the model-scoped weekly limit (e.g. Fable) out of limits[], and open-meteo (no key) for
   weather. Always serves last-good; backs off on HTTP 429.
 
-TOKEN KEEPER: the Claude OAuth access token is short-lived (~8h). This box must have
-Claude Code installed + logged in; the keeper periodically runs `claude -p "ping" --model haiku`
-which makes Claude Code refresh its own token and write it back to the credentials file. The
-collector reads the token fresh from the credentials file each poll, so it always picks up the
-refresh. (Negligible usage cost.) The token is NEVER logged, shown, or sent anywhere but Anthropic.
+TOKEN KEEPER: the Claude OAuth access token is short-lived (~8h) but comes with a refresh
+token whose ~28-day validity window ROLLS FORWARD on every refresh, so one login lasts
+indefinitely as long as the keeper refreshes at least monthly (it refreshes every ~8h). The
+keeper speaks the OAuth refresh grant natively (the same public-client token endpoint Claude
+Code uses) and writes the rotated pair back atomically, so Claude Code is NOT required on this
+box: either reuse a co-located Claude Code login (~/.claude/.credentials.json) or run
+`python claude_usage_server.py --login` once to mint the collector's own credentials.
+The token is NEVER logged, shown, or sent anywhere but Anthropic.
 
 Config is read from environment / a .env beside this file and is editable from the terminal.
 """
-import json, os, time, threading, subprocess, shutil, urllib.request, urllib.error, urllib.parse
+import base64, hashlib, json, os, secrets, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -32,7 +35,7 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 START_TS = time.time()
 
 EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", "DEVICE_URL",
-            "CLAUDE_CREDENTIALS", "CLAUDE_BIN", "PING_MODEL", "REFRESH_MARGIN_MIN",
+            "CLAUDE_CREDENTIALS", "REFRESH_MARGIN_MIN",
             # --- reset notifications (non-secret; secrets live in SECRET_KEYS below) ---
             "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_EMAIL",
             "SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_FROM", "SMTP_USER", "NOTIFY_EMAIL_TO"]
@@ -43,8 +46,7 @@ SECRET_MASK = "********"   # what the terminal shows for a set secret; submittin
 DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Australia/Melbourne",
             "USAGE_EVERY": "150", "WEATHER_EVERY": "900", "PORT": "8088",
             "DEVICE_URL": "http://claudetv.local",
-            "CLAUDE_CREDENTIALS": "~/.claude/.credentials.json", "CLAUDE_BIN": "",
-            "PING_MODEL": "haiku", "REFRESH_MARGIN_MIN": "30",
+            "CLAUDE_CREDENTIALS": "", "REFRESH_MARGIN_MIN": "30",
             "NOTIFY_SESSION_RESET": "false", "NOTIFY_SESSION_MAXED": "false",
             "NOTIFY_WEEK_RESET": "false", "NOTIFY_EMAIL": "false",
             "SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls", "SMTP_FROM": "",
@@ -66,7 +68,7 @@ def load_config():
                 if k in DEFAULTS: env[k] = v.strip()
     for k in DEFAULTS:
         ev = os.environ.get("CLAUDETV_" + k)
-        if ev is None and k in ("CLAUDE_CREDENTIALS", "CLAUDE_BIN"): ev = os.environ.get(k)
+        if ev is None and k == "CLAUDE_CREDENTIALS": ev = os.environ.get(k)
         if ev: env[k] = ev
     return env
 
@@ -80,14 +82,21 @@ def save_config(updates):
     with open(ENV_PATH, "w", encoding="utf-8") as f:
         f.write("# ClaudeTV collector config (managed by the master terminal)\n")
         for k in EDITABLE + SECRET_KEYS:
-            key = k if k in ("CLAUDE_CREDENTIALS", "CLAUDE_BIN") else "CLAUDETV_" + k
+            key = k if k == "CLAUDE_CREDENTIALS" else "CLAUDETV_" + k
             f.write("%s=%s\n" % (key, CONFIG.get(k, "")))
     try: os.chmod(ENV_PATH, 0o600)                      # .env now holds webhook URLs + SMTP pass
     except OSError: pass
 
 CONFIG = load_config()
 PORT = int(CONFIG["PORT"])
-def cred_path(): return os.path.expanduser(CONFIG["CLAUDE_CREDENTIALS"])
+# Credential store resolution: an explicit config path wins; else the collector's own store
+# (created by --login, lives beside .env so it follows the install dir); else a co-located
+# Claude Code login. Both stores use Claude Code's {"claudeAiOauth": {...}} format.
+CRED_OWN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
+CRED_CLAUDE_CODE = os.path.expanduser("~/.claude/.credentials.json")
+def cred_path():
+    if CONFIG["CLAUDE_CREDENTIALS"]: return os.path.expanduser(CONFIG["CLAUDE_CREDENTIALS"])
+    return CRED_OWN if os.path.exists(CRED_OWN) else CRED_CLAUDE_CODE
 def wx_url(): return ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
     "&current=temperature_2m,weather_code,apparent_temperature,relative_humidity_2m"
     "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1"
@@ -104,53 +113,87 @@ def _creds():
         except Exception: time.sleep(0.2)
     return json.load(open(cred_path(), encoding="utf-8"))["claudeAiOauth"]
 
-def token_expiry_ms():
-    try: return int(_creds().get("expiresAt", 0))
-    except Exception: return 0
+# Anthropic's public OAuth client (the one Claude Code itself uses). Not a secret: it is a
+# public PKCE client id, the same value shipped in every Claude Code install.
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
+OAUTH_REDIRECT = "https://console.anthropic.com/oauth/code/callback"
+OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
 
-def find_claude():
-    if CONFIG["CLAUDE_BIN"] and os.path.exists(os.path.expanduser(CONFIG["CLAUDE_BIN"])):
-        return os.path.expanduser(CONFIG["CLAUDE_BIN"])
-    for c in [os.path.expanduser("~/.local/bin/claude"), shutil.which("claude"),
-              os.path.expanduser("~/.claude/local/claude"), "/usr/local/bin/claude"]:
-        if c and os.path.exists(c): return c
-    return None
+def _oauth_post(payload):
+    req = urllib.request.Request(OAUTH_TOKEN_URL, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json", "User-Agent": "ClaudeTV/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+def _write_creds(resp, path):
+    """Merge a token-endpoint response into the credentials file ATOMICALLY (tmp+rename), in
+    Claude Code's format so a co-located CLI keeps working off the same file. Rotation matters:
+    each refresh invalidates the old pair, so a lost write here = a dead login."""
+    now_ms = int(time.time() * 1000)
+    full = {}
+    try: full = json.load(open(path, encoding="utf-8"))
+    except Exception: pass
+    d = full.get("claudeAiOauth") or {}
+    d["accessToken"] = resp["access_token"]
+    if resp.get("refresh_token"): d["refreshToken"] = resp["refresh_token"]
+    if resp.get("expires_in"): d["expiresAt"] = now_ms + int(resp["expires_in"]) * 1000
+    if resp.get("refresh_token_expires_in"):
+        d["refreshTokenExpiresAt"] = now_ms + int(resp["refresh_token_expires_in"]) * 1000
+    if resp.get("scope"): d.setdefault("scopes", resp["scope"].split())
+    d.setdefault("subscriptionType", "unknown")
+    full["claudeAiOauth"] = d
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    with os.fdopen(fd, "w", encoding="utf-8") as f: json.dump(full, f)
+    os.replace(tmp, path)
 
 def refresh_token(reason=""):
-    """Best-effort: nudge Claude Code to renew its access token via a tiny ping. Returns True on
-    success. Does NOT decide auth-dead — that is driven solely by whether the USAGE endpoint accepts
-    the token (a refresh can fail while the access token still works, e.g. a long-lived setup-token
-    that has no refresh token at all)."""
+    """Refresh the OAuth access token NATIVELY via the token endpoint (no Claude Code needed) and
+    write the rotated pair back. The refresh token's ~28-day window rolls forward on every refresh,
+    so this keeps one login alive indefinitely. Returns True on success. Does NOT decide auth-dead:
+    that is driven solely by whether the USAGE endpoint accepts the token."""
     global _last_refresh, _refresh_err, _refreshing
     if _refreshing: return False
-    try:
-        if not _creds().get("refreshToken"):        # long-lived / setup-token -> nothing to refresh
-            _refresh_err = "long-lived token (no refresh token) — refresh not applicable"; return False
-    except Exception:
-        pass
-    binp = find_claude()
-    if not binp:
-        _refresh_err = "claude binary not found (install Claude Code on this host)"; return False
     _refreshing = True
     try:
-        before = token_expiry_ms()
-        env = os.environ.copy(); env.setdefault("HOME", os.path.expanduser("~"))
-        p = subprocess.run([binp, "-p", "ping", "--model", CONFIG["PING_MODEL"]],
-                           cwd=os.path.expanduser("~"), env=env,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
-        after = token_expiry_ms()
-        if after > before or after > time.time() * 1000:
+        path = cred_path()
+        try:
+            rt = _creds().get("refreshToken")
+        except Exception as e:
+            _refresh_err = "credentials unreadable: %s" % str(e)[:40]; return False
+        if not rt:
+            _refresh_err = "no refresh token in credentials (log in again)"; return False
+        for attempt in (1, 2):
+            try:
+                resp = _oauth_post({"grant_type": "refresh_token", "refresh_token": rt,
+                                    "client_id": OAUTH_CLIENT_ID})
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode()[:200]
+                except Exception: pass
+                if e.code == 400 and "invalid_grant" in body and attempt == 1:
+                    # Someone else (e.g. an interactive Claude Code session) may have rotated the
+                    # pair after we read it; re-read the file and retry once with the newer token.
+                    try: nrt = _creds().get("refreshToken")
+                    except Exception: nrt = None
+                    if nrt and nrt != rt:
+                        rt = nrt; continue
+                _refresh_err = "refresh http %d%s" % (e.code, " (re-login needed)" if e.code == 400 else "")
+                print("[%s] token refresh: %s" % (time.strftime("%H:%M:%S"), _refresh_err)); return False
+            except Exception as e:
+                _refresh_err = "refresh: %s" % str(e)[:50]; return False
+            _write_creds(resp, path)
             _last_refresh = int(time.time()); _refresh_err = ""
-            print("[%s] token refreshed (%s) valid +%dm" % (time.strftime("%H:%M:%S"), reason or "keeper",
-                  (after - time.time()*1000)/60000))
+            print("[%s] token refreshed (%s) valid +%dm, refresh window +%dd" % (
+                time.strftime("%H:%M:%S"), reason or "keeper", int(resp.get("expires_in", 0)) / 60,
+                int(resp.get("refresh_token_expires_in", 0)) / 86400))
             return True
-        out = (p.stdout or b"").decode("utf-8", "replace").strip().replace("\n", " ")
-        _refresh_err = ("refresh failed: " + out)[:100] if p.returncode != 0 else "ping ran but token unchanged"
-        print("[%s] token refresh: %s" % (time.strftime("%H:%M:%S"), _refresh_err)); return False
-    except subprocess.TimeoutExpired:
-        _refresh_err = "claude ping timed out"; return False
-    except Exception as e:
-        _refresh_err = str(e)[:60]; return False
+        return False
     finally:
         _refreshing = False
 
@@ -159,8 +202,8 @@ def keeper():
         try:
             c = _creds(); exp = int(c.get("expiresAt", 0))
             margin = int(CONFIG["REFRESH_MARGIN_MIN"]) * 60 * 1000
-            # only refresh a token that HAS a refresh token and is near expiry; a long-lived / setup
-            # token (no refreshToken) needs no keeping alive, so don't ping the API pointlessly.
+            # only refresh a token that HAS a refresh token and is near expiry; a long-lived token
+            # (no refreshToken) needs no keeping alive, so don't hit the token endpoint pointlessly.
             if c.get("refreshToken") and (exp == 0 or (exp - time.time() * 1000) < margin):
                 refresh_token("proactive")
         except Exception as e:
@@ -177,7 +220,8 @@ def token_status():
 
 def auth_state():
     """Compact state the device reacts to: ok | dead | pending.
-    dead    = refresh confirmed failing (401) -> needs a manual `claude /login` on host.
+    dead    = the usage endpoint rejected the token (401/403) -> log in again on the host
+              (`--login`, or `claude /login` when co-located with Claude Code).
     pending = token expired/missing but the keeper may still recover it (transient)."""
     if _auth_dead: return "dead"
     return "ok" if token_status()[0] == "valid" else "pending"
@@ -518,7 +562,7 @@ def full_state():
     return {"service": {"uptime_s": int(time.time() - START_TS), "port": PORT},
             "token": {"status": tok, "plan": sub, "expires_in_s": exp_in, "auth": auth_state(),
                       "last_refresh_s": (int(time.time()) - lr) if lr else -1,
-                      "refresh_err": re_, "refreshing": refg, "claude_bin": find_claude() or "NOT FOUND"},
+                      "refresh_err": re_, "refreshing": refg, "cred": cred_path()},
             "usage": {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err, **(u or {})},
             "weather": (wx or {}), "weather_err": wxe, "config": {k: CONFIG[k] for k in EDITABLE},
             "notify": notify_status()}
@@ -564,7 +608,7 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <div class=row><span>Token</span><span class=pill id=tok>--</span></div>
 <div class=row><span>Expires in</span><span id=texp>--</span></div>
 <div class=row><span>Last refresh</span><span id=tref>--</span></div>
-<div class=row><span class=muted>claude bin</span><span class=muted id=cbin></span></div>
+<div class=row><span class=muted>credentials</span><span class=muted id=cred></span></div>
 <div class=row><span class=muted id=terr></span><button style="width:auto" class=ghost onclick=refresh()>Refresh now</button></div></div>
 
 <div class=card><h2>Live data</h2>
@@ -584,10 +628,10 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <label style="margin-top:8px">Weather refresh (s)</label><input id=WEATHER_EVERY></div>
 
 <div class=card><h2>Claude config</h2>
-<label>Credentials path (token read from here; never stored/shown)</label><input id=CLAUDE_CREDENTIALS>
-<label>Claude binary (blank = auto-detect)</label><input id=CLAUDE_BIN>
-<div class=grid3><div><label>Ping model</label><input id=PING_MODEL></div><div><label>Refresh margin (min)</label><input id=REFRESH_MARGIN_MIN></div><div><label>Usage poll (s)</label><input id=USAGE_EVERY></div></div>
-<label>Port</label><input id=PORT></div>
+<label>Credentials path (blank = auto: collector's own login, else Claude Code's)</label><input id=CLAUDE_CREDENTIALS placeholder=auto>
+<div class=grid><div><label>Refresh margin (min)</label><input id=REFRESH_MARGIN_MIN></div><div><label>Usage poll (s)</label><input id=USAGE_EVERY></div></div>
+<label>Port</label><input id=PORT>
+<div class=muted style="margin-top:8px">No Claude Code on this box? Run <code>python claude_usage_server.py --login</code> once; the keeper then renews the token itself, forever.</div></div>
 
 <div class=card><h2>Reset notifications</h2>
 <div class=muted>Get pinged when your Claude usage window rolls over to a fresh quota (the reset Anthropic only posts on X).</div>
@@ -612,7 +656,7 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <button onclick=saveCfg()>Save config &amp; restart</button>
 
 <div class=card style=margin-top:14px><h2>Install as a service</h2>
-<div class=muted>One-time, on this host (needs Claude Code installed + logged in):</div>
+<div class=muted>One-time, on this host (log in first: <code>--login</code>, or a co-located Claude Code login):</div>
 <p><code>sudo bash install.sh</code></p>
 <div class=muted>Installs the systemd unit (auto-start + auto-restart). The token keeper then keeps Claude auth alive automatically.</div></div>
 
@@ -627,7 +671,7 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  up.textContent=fmtUp(s.service.uptime_s);
  const t=s.token;pill(tok,t.status=='valid'?'ok':(t.status=='expired'?'warn':'bad'),t.status+' ('+t.plan+')');
  texp.textContent=t.refreshing?'refreshing…':(t.expires_in_s>0?fmtUp(t.expires_in_s):'--');
- tref.textContent=fmtAgo(t.last_refresh_s);cbin.textContent=t.claude_bin;terr.textContent=t.refresh_err?('⚠ '+t.refresh_err):'';
+ tref.textContent=fmtAgo(t.last_refresh_s);cred.textContent=t.cred;terr.textContent=t.refresh_err?('⚠ '+t.refresh_err):'';
  const u=s.usage;sess.textContent=u.ok?u.s+'%':'--';sessr.textContent=u.sr?('resets '+u.sr):'idle';
  week.textContent=u.ok?u.w+'%':'--';weekr.textContent=u.wr?('resets '+u.wr):'';
  if(u.f>=0){fablerow.style.display='';fablelbl.textContent=(u.fl||'Fable')+' (7d)';fable.textContent=u.ok?u.f+'%':'--';}else fablerow.style.display='none';
@@ -651,7 +695,7 @@ citySearch.oninput=function(){clearTimeout(geoT);const q=this.value.trim();if(q.
   rs.forEach(h=>{const b=document.createElement('button');b.className='ghost';b.style.marginBottom='4px';b.textContent=h.label;b.onclick=()=>pickCity(h);geoResults.appendChild(b);});});},350);};
 function pickCity(h){geoResults.innerHTML='';citySearch.value='';pill(svc,'warn','applying…');
  fetch('/api/config?CITY='+encodeURIComponent(h.city)+'&LAT='+h.lat+'&LON='+h.lon+'&TZ='+encodeURIComponent(h.tz),{method:'POST'}).then(()=>setTimeout(load,3500));}
-function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','CLAUDE_CREDENTIALS','CLAUDE_BIN','PING_MODEL','REFRESH_MARGIN_MIN','USAGE_EVERY','PORT',
+function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','CLAUDE_CREDENTIALS','REFRESH_MARGIN_MIN','USAGE_EVERY','PORT',
   'SMTP_HOST','SMTP_PORT','SMTP_SECURITY','SMTP_FROM','SMTP_USER','NOTIFY_EMAIL_TO'];
  const parts=ks.map(k=>k+'='+encodeURIComponent(document.getElementById(k).value));
  ['NOTIFY_SESSION_RESET','NOTIFY_SESSION_MAXED','NOTIFY_WEEK_RESET','NOTIFY_EMAIL'].forEach(k=>parts.push(k+'='+(document.getElementById(k).checked?'true':'false')));
@@ -702,7 +746,37 @@ class H(BaseHTTPRequestHandler):
         else: self._send(404, "text/plain", "not found")
 
 
+def oauth_login():
+    """One-time interactive PKCE login: mints the collector's OWN credentials (no Claude Code
+    needed on this box). Open the printed URL on ANY device, log in, paste the code back here.
+    The running service picks the new store up on its next poll; no restart needed."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(32)
+    url = OAUTH_AUTHORIZE_URL + "?" + urllib.parse.urlencode({
+        "code": "true", "client_id": OAUTH_CLIENT_ID, "response_type": "code",
+        "redirect_uri": OAUTH_REDIRECT, "scope": OAUTH_SCOPES,
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": state})
+    print("\nOpen this URL in a browser (any device), log in to Claude, and copy the code:\n\n%s\n" % url)
+    code = input("Paste the code here: ").strip()
+    if "#" in code: code, state = code.split("#", 1)
+    try:
+        resp = _oauth_post({"grant_type": "authorization_code", "code": code, "state": state,
+                            "client_id": OAUTH_CLIENT_ID, "redirect_uri": OAUTH_REDIRECT,
+                            "code_verifier": verifier})
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode()[:300]
+        except Exception: pass
+        print("Login failed: http %d %s" % (e.code, body)); raise SystemExit(1)
+    _write_creds(resp, CRED_OWN)
+    print("Logged in. Credentials saved to %s (0600)." % CRED_OWN)
+    print("The collector will use this store from its next poll and keep it fresh forever.")
+
 if __name__ == "__main__":
+    import sys
+    if "--login" in sys.argv:
+        oauth_login(); raise SystemExit(0)
     threading.Thread(target=keeper, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     print("ClaudeTV collector + terminal on http://0.0.0.0:%d  (device -> /usage, terminal -> /)" % PORT)

@@ -20,9 +20,11 @@ that you reflash **over WiFi — no soldering, fully reversible.**
 ## What you need
 
 - A **GeekMagic SmallTV‑Ultra** (the **ESP8266** model — [~$15 on AliExpress](https://www.aliexpress.com/item/1005007937948865.html)).
-- An **always‑on Linux box** on your LAN (a NAS VM, a Pi, an old laptop) that has **Claude Code
-  installed and logged in**. The device can't hold your Claude credentials, so this box reads your
-  usage and feeds it to the display over your network — and keeps the auth token fresh for you.
+- An **always‑on Linux box** on your LAN (a NAS VM, a Pi, an old laptop). The device can't hold
+  your Claude credentials, so this box reads your usage and feeds it to the display over your
+  network, keeping the auth token fresh for you. **Claude Code is not required on this box**:
+  log in once with `python claude_usage_server.py --login` (or reuse an existing Claude Code
+  login if the box has one).
 
 ---
 
@@ -30,10 +32,17 @@ that you reflash **over WiFi — no soldering, fully reversible.**
 
 ### 1 · Set up the host (one command)
 
-On the always‑on box (with Claude Code logged in):
+On the always‑on box:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/latticelabs-au/ClaudeTV/main/host/install.sh | bash
+```
+
+If the box doesn't have a logged‑in Claude Code install, authenticate the collector once
+(open the printed URL on any device, paste the code back):
+
+```bash
+python ~/.claudetv/claude_usage_server.py --login
 ```
 
 This installs the **collector + master terminal** as a systemd service (auto‑start, auto‑restart).
@@ -60,10 +69,10 @@ That's it. Two commands and a WiFi prompt.
 ## How it works
 
 ```
- Claude Code (on the always-on host)             ESP8266 clock
-        │  keeps the OAuth token fresh                  │
+ always-on host (collector, Python stdlib)       ESP8266 clock
+        │  refreshes its own OAuth token                │
         ▼                                               ▼
-  ~/.claude/.credentials.json                    ┌──────────────┐
+  credentials file (own store or Claude Code's)  ┌──────────────┐
         │                                         │  ClaudeTV fw │
    collector ─► api.anthropic.com/api/oauth/usage │   /usage  ◄──┼── LAN
    (Python)  ─► open-meteo.com (weather, no key)  └──────────────┘
@@ -77,9 +86,11 @@ That's it. Two commands and a WiFi prompt.
   generically from `limits[]`, so it follows whatever model Anthropic scopes, Fable today) — plus
   keyless weather from open‑meteo, then serves a small JSON. It **always returns the last‑good
   value** and backs off on rate limits, so the screen never blanks.
-- **Token keeper** — the Claude token is short‑lived (~8 h). The collector runs a tiny
-  `claude -p "ping" --model haiku` before it expires, which makes **Claude Code refresh its own
-  token**. Self‑sustaining; the master terminal shows token status and a manual *Refresh now*.
+- **Token keeper**: the Claude access token is short‑lived (~8 h), but its refresh token's
+  ~28‑day validity window **rolls forward on every refresh**. The collector speaks the OAuth
+  refresh grant natively (same public‑client endpoint Claude Code uses) and rotates the pair
+  itself every few hours, so **one login lasts indefinitely** with no Claude Code install
+  needed. The master terminal shows token status and a manual *Refresh now*.
 - **Firmware** (`firmware/claudetv/`) fetches that JSON over your LAN and draws it. Rendering uses
   TFT_eSPI with **one held‑open SPI transaction** (CS stays low, like the stock firmware) so there's
   **no per‑redraw coil/cap tick** — it's silent.
@@ -88,20 +99,34 @@ Your Claude token is **never logged, shown, or sent anywhere except `api.anthrop
 
 ---
 
-## Authentication — one login, self-maintaining
+## Authentication: one login, lasts forever
 
-The host authenticates with your **Claude subscription login**, not an API key. Run `claude` once on
-the box and `/login` (interactive OAuth); the collector reads that OAuth token from
-`~/.claude/.credentials.json`, and the token keeper refreshes it automatically every few hours — so
-it runs unattended. You only re-login if the token is **genuinely rejected** (a real 401/403, shown
-as **LOGIN EXPIRED** on the device), not for routine operation.
+The host authenticates with your **Claude subscription login**, not an API key, and after that one
+login it maintains itself indefinitely. The OAuth access token lives ~8 hours, but the refresh
+token that comes with it carries a **~28‑day validity window that is re‑granted on every refresh**.
+The collector refreshes natively every few hours (a plain HTTPS call to Anthropic's public‑client
+token endpoint, the same one Claude Code uses), so the window keeps rolling and the login never
+ages out. No cron re‑logins, no weekly ritual.
 
-Two things that look like they should work but **don't** — save yourself the detour:
+Two ways to do the one login:
 
-- **API keys (`sk-ant-api…`)** — the `api/oauth/usage` endpoint reports your *subscription* limits
+- **Standalone (recommended, no Claude Code needed)**: `python claude_usage_server.py --login`
+  prints a URL; open it on any device, sign in to Claude, paste the code back. Credentials land in
+  the collector's own store (`credentials.json` beside the script, chmod 600) and are rotated
+  atomically from then on.
+- **Co‑located Claude Code**: if the box already runs Claude Code, just `/login` there once; the
+  collector reads and maintains `~/.claude/.credentials.json`, writing rotations back in Claude
+  Code's own format so both stay happy.
+
+You only re‑login if the credential is **genuinely revoked** (a real 401/403 from the usage
+endpoint, shown as **LOGIN EXPIRED** on the device), not for routine operation.
+
+Two things that look like they should work but **don't** (save yourself the detour):
+
+- **API keys (`sk-ant-api…`)**: the `api/oauth/usage` endpoint reports your *subscription* limits
   (5h / 7d / model-scoped), which API-key accounts don't have. Wrong credential entirely.
-- **`claude setup-token`** — that long-lived token is scoped for Claude Code *inference* and is
-  rejected (**403**) by the usage endpoint. Use the interactive `/login`.
+- **`claude setup-token`**: that long-lived token is scoped for Claude Code *inference* and is
+  rejected (**403**) by the usage endpoint. Use a subscription login as above.
 
 ---
 

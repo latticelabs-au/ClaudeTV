@@ -4,8 +4,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/latticelabs-au/ClaudeTV/main/host/install.sh | bash
 #
-# Run on any always-on Linux box with Claude Code installed AND logged in
-# (the collector reads that box's Claude token; Claude Code keeps it fresh).
+# Run on any always-on Linux box. Claude Code is NOT required: the collector refreshes its
+# own OAuth token. Log in once afterwards with `python3 ~/.claudetv/claude_usage_server.py --login`
+# (skippable if the box already has a logged-in Claude Code install).
 set -euo pipefail
 
 REPO_RAW="${CLAUDETV_RAW:-https://raw.githubusercontent.com/latticelabs-au/ClaudeTV/main/host}"
@@ -48,12 +49,12 @@ have systemctl || die "systemd not found. Run the collector manually: python3 $D
 PY="$(command -v python3)"
 c "✓ python3, curl, systemd present" ok
 
-# --- Claude Code presence (warn only) ---
-if have claude || [ -x "$HOME/.local/bin/claude" ]; then
-  c "✓ Claude Code found" ok
+# --- credentials presence (warn only; Claude Code itself is NOT required) ---
+if [ -f "$DEST/credentials.json" ] || [ -f "$HOME/.claude/.credentials.json" ]; then
+  c "✓ Claude credentials found (the keeper will keep them fresh)" ok
 else
-  c "⚠ Claude Code not on PATH — install it and run 'claude' once to log in," warn
-  c "  or the usage token will expire and the display will stop updating." warn
+  c "⚠ No Claude credentials yet. After install, log in once with:" warn
+  c "    python3 $DEST/claude_usage_server.py --login" warn
 fi
 
 # --- idempotent: stop any existing instance before swapping files ---
