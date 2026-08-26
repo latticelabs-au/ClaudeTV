@@ -20,7 +20,7 @@ The token is NEVER logged, shown, or sent anywhere but Anthropic.
 
 Config is read from environment / a .env beside this file and is editable from the terminal.
 """
-import base64, hashlib, json, os, secrets, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
+import base64, hashlib, json, os, secrets, shutil, subprocess, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -36,6 +36,8 @@ START_TS = time.time()
 
 EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", "DEVICE_URL",
             "CLAUDE_CREDENTIALS", "REFRESH_MARGIN_MIN",
+            # --- accounts: cswap backend (multi-account) or the native single-account keeper ---
+            "CSWAP_BIN", "CSWAP_ACCOUNTS", "ACCOUNT_LABEL",
             # --- reset notifications (non-secret; secrets live in SECRET_KEYS below) ---
             "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_AUTH",
             "NOTIFY_EMAIL",
@@ -45,9 +47,12 @@ EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", 
 SECRET_KEYS = ["NOTIFY_DISCORD_WEBHOOK", "NOTIFY_SLACK_WEBHOOK", "SMTP_PASS"]
 SECRET_MASK = "********"   # what the terminal shows for a set secret; submitting it = "unchanged"
 DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Australia/Melbourne",
-            "USAGE_EVERY": "150", "WEATHER_EVERY": "900", "PORT": "8088",
+            # Each `cswap list --json` call refreshes cswap's stalest account, so with N accounts
+            # a given account lands every ~N polls: 90s keeps two accounts under ~3 min stale.
+            "USAGE_EVERY": "90", "WEATHER_EVERY": "900", "PORT": "8088",
             "DEVICE_URL": "http://claudetv.local",
             "CLAUDE_CREDENTIALS": "", "REFRESH_MARGIN_MIN": "30",
+            "CSWAP_BIN": "", "CSWAP_ACCOUNTS": "", "ACCOUNT_LABEL": "CLAUDE",
             "NOTIFY_SESSION_RESET": "false", "NOTIFY_SESSION_MAXED": "false",
             "NOTIFY_WEEK_RESET": "false", "NOTIFY_AUTH": "true", "NOTIFY_EMAIL": "false",
             "SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls", "SMTP_FROM": "",
@@ -109,10 +114,15 @@ def wx_url(): return ("https://api.open-meteo.com/v1/forecast?latitude=%s&longit
     ) % (CONFIG["LAT"], CONFIG["LON"])
 
 _lock = threading.Lock()
-_usage = None; _usage_ts = 0; _usage_err = "starting"; _wx = None; _wx_err = ""
+_accounts = []        # ordered account records; see cswap_accounts_from_json for the shape
+_usage_ts = 0; _usage_err = "starting"; _wx = None; _wx_err = ""
+_source = ""          # "cswap" (multi-account) or "native" (single-account OAuth keeper)
+_source_err = ""      # why cswap was not used, surfaced in the terminal
 _last_refresh = 0; _refresh_err = ""; _refreshing = False; _auth_dead = False
 _cred_used = ""       # store that served the last successful poll (standby detection + display)
-_dead_alerted = False  # one auth-dead alert per outage episode
+_alerted = {}         # per-account: one auth-dead alert per outage episode
+_migrated = False     # legacy single-account notify state re-homed onto the primary account
+_force_poll = False   # dashboards can demand an immediate re-read instead of waiting for the timer
 
 # ---------- token keeper ----------
 def _creds(path=None):
@@ -209,6 +219,13 @@ def refresh_token(reason="", path=None):
 def keeper():
     while True:
         try:
+            # cswap owns credential storage and rotation for its accounts. Refresh tokens ROTATE:
+            # a second keeper refreshing the same family invalidates cswap's copy and gets the
+            # account quarantined, so stand fully down in cswap mode and touch no credential file.
+            if _source == "cswap":
+                time.sleep(300); continue
+            if not _source and cswap_bin():     # source undecided at startup and cswap is present
+                time.sleep(5); continue         # -> wait for the first poll to settle it
             margin = int(CONFIG["REFRESH_MARGIN_MIN"]) * 60 * 1000
             for path in cred_stores():                  # keep EVERY family's rolling window fresh
                 if not os.path.exists(path): continue
@@ -304,6 +321,137 @@ def fetch_usage():
     out["f"], out["fl"] = _scoped_weekly(data)
     return out, {"session": fh.get("resets_at"), "week": sw.get("resets_at")}
 
+# ---------- accounts: cswap backend (multi-account) + native single-account fallback ----------
+# cswap (github.com/realiti4/claude-swap) already owns multi-account credential storage, token
+# keeping and per-account usage polling, and publishes all of it as `cswap list --json`. When it
+# is installed we read accounts from it and this collector does no OAuth of its own; when it is
+# absent everything above (keeper, refresh, store failover, --login) still runs and serves a
+# single account, so an existing install keeps working untouched after an upgrade.
+CSWAP_SCHEMA = 1
+LABEL_MAX = 8                      # "PERSONAL" — the widest label the device header fits
+
+def cswap_bin():
+    """Configured path, else a venv beside this script, else the first `cswap` on PATH."""
+    explicit = (CONFIG.get("CSWAP_BIN") or "").strip()
+    if explicit: return explicit if os.path.exists(explicit) else ""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "venv", "bin", "cswap"),
+                 os.path.join(here, "venv", "Scripts", "cswap.exe")):
+        if os.path.exists(cand): return cand
+    return shutil.which("cswap") or ""
+
+def pick_source(cswap_ok):
+    """Backend selection, in one place: cswap when it answers with accounts, else native."""
+    return "cswap" if cswap_ok else "native"
+
+_cswap_ver = {"bin": "", "ver": ""}
+def cswap_version():
+    """`cswap --version`, cached per binary path so the dashboards can show it for free."""
+    exe = cswap_bin()
+    if not exe: return ""
+    if _cswap_ver["bin"] != exe:
+        v = ""
+        try:
+            p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=15)
+            v = (p.stdout or p.stderr or "").strip().splitlines()[0][:40]
+        except Exception: pass
+        _cswap_ver.update({"bin": exe, "ver": v})
+    return _cswap_ver["ver"]
+
+def _label(alias, email, number):
+    raw = (alias or (email or "").split("@")[0] or "acct%s" % number)
+    return raw.strip().upper()[:LABEL_MAX]
+
+def _pct(d):
+    v = (d or {}).get("pct")
+    return round(float(v)) if v is not None else None
+
+def cswap_accounts_from_json(doc, only=""):
+    """Map a `cswap list --json` document into ordered account records.
+
+    Record: {key, label, email, active, u:{s,w,sr,wr,f,fl}, resets:{session,week}, auth, age, err}
+    `u` deliberately keeps the SHAPE the single-account build produced, so the notifier, the
+    reset formatter and the device payload all keep working on it unchanged. Reset strings are
+    re-rendered from resetsAt with THIS project's formatters (not cswap's `clock` field) so the
+    device card geometry, which is sized off those exact strings, still fits.
+    `only` is a comma list of aliases/emails/slots: it both filters and orders the result."""
+    ver = doc.get("schemaVersion")
+    if ver != CSWAP_SCHEMA:
+        raise ValueError("unsupported cswap schemaVersion %r (expected %d)" % (ver, CSWAP_SCHEMA))
+    recs, match = [], []
+    for a in doc.get("accounts") or []:
+        usage = a.get("usage") or {}
+        fh, sd = usage.get("fiveHour") or {}, usage.get("sevenDay") or {}
+        scoped = next((x for x in (usage.get("scoped") or []) if _pct(x) is not None), None)
+        u = {"s": _pct(fh) or 0, "w": _pct(sd) or 0, "sr": "", "wr": "",
+             "f": _pct(scoped) if scoped else -1,
+             "fl": (scoped.get("name") or "").strip().upper()[:7] if scoped else ""}
+        if fh.get("resetsAt"): u["sr"] = _clock(_parse(fh["resetsAt"]))
+        if sd.get("resetsAt"):
+            d = _parse(sd["resetsAt"]); u["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
+        status = (a.get("usageStatus") or "ok").strip().lower()
+        email, num = a.get("email") or "", a.get("number", "?")
+        recs.append({"key": "%s:%s" % (num, email), "label": _label(a.get("alias"), email, num),
+                     "email": email, "active": bool(a.get("active")), "u": u,
+                     "resets": {"session": fh.get("resetsAt"), "week": sd.get("resetsAt")},
+                     # cswap reports a quarantined / expired account here; anything but ok means
+                     # that account needs a re-login, which the device renders as LOGIN EXPIRED.
+                     "auth": "ok" if status == "ok" else "dead",
+                     "age": int(a.get("usageAgeSeconds") or 0),
+                     "err": "" if status == "ok" else status})
+        match.append({str(num), (a.get("alias") or "").lower(), email.lower(),
+                      recs[-1]["label"].lower()} - {""})
+    want = [w.strip().lower() for w in (only or "").split(",") if w.strip()]
+    if not want: return recs
+    picked = []
+    for w in want:
+        for rec, keys in zip(recs, match):
+            if w in keys and rec not in picked:
+                picked.append(rec); break
+    return picked
+
+def cswap_accounts():
+    """Read accounts from cswap. Each call also nudges cswap to refresh its stalest account, so
+    polling this on the usage timer is what keeps every account's numbers current."""
+    exe = cswap_bin()
+    if not exe: raise RuntimeError("cswap not found")
+    p = subprocess.run([exe, "list", "--json"], capture_output=True, text=True, timeout=45)
+    if p.returncode != 0:
+        raise RuntimeError("cswap list exited %d: %s" % (p.returncode, (p.stderr or "").strip()[:120]))
+    return cswap_accounts_from_json(json.loads(p.stdout), CONFIG.get("CSWAP_ACCOUNTS", ""))
+
+def native_accounts():
+    """Single-account fallback: the OAuth keeper above, shaped as one account record. auth is
+    'ok' because the fetch just succeeded; the poller marks records dead on a 401/403."""
+    u, resets = fetch_usage()
+    return [{"key": "native", "label": _label(CONFIG.get("ACCOUNT_LABEL"), "", 1), "email": "",
+             "active": True, "u": u, "resets": resets, "auth": "ok", "age": 0, "err": ""}]
+
+def usage_wire(accounts, wx, primary=""):
+    """Build the device payload.
+
+    The flat keys mirror ONE account (the primary) byte-for-byte as the single-account build
+    emitted them, so a v4.7 device keeps working across this upgrade with no reflash; `n` and
+    `acc[]` carry the rest for multi-account firmware. `primary` (the device's ?acct=) also
+    moves that account to the head of acc[], so a second device can pin a different account."""
+    accts = list(accounts)
+    if primary:
+        p = primary.strip().lower()
+        for i, rec in enumerate(accts):
+            if p in (rec["label"].lower(), (rec["email"] or "").lower()):
+                accts.insert(0, accts.pop(i)); break
+    lead = accts[0] if accts else None
+    if not accts:                                        auth = "pending"
+    elif all(a["auth"] == "dead" for a in accts):        auth = "dead"
+    elif len(accts) == 1:                                auth = accts[0]["auth"]
+    else:                                                auth = "ok"
+    st = {"ok": 1 if lead else 0, "age": lead["age"] if lead else -1,
+          "err": lead["err"] if lead else "no accounts", "auth": auth, "n": len(accts)}
+    st.update(lead["u"] if lead else {"s": 0, "w": 0, "f": -1, "fl": "", "sr": "", "wr": ""})
+    st["acc"] = [{"l": a["label"], "auth": a["auth"], **a["u"]} for a in accts]
+    if wx: st.update(wx)
+    return st
+
 def geocode(q):
     url = "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=6&language=en&format=json" % urllib.parse.quote(q)
     with urllib.request.urlopen(url, timeout=8) as r: j = json.loads(r.read().decode())
@@ -358,7 +506,8 @@ SESSION_MAXED_PCT = 95
 def _load_notify_state():
     global _notify_state
     if _notify_state is None:
-        try: _notify_state = json.load(open(NOTIFY_STATE_PATH, encoding="utf-8"))
+        try:
+            with open(NOTIFY_STATE_PATH, encoding="utf-8") as f: _notify_state = json.load(f)
         except Exception: _notify_state = {}
     return _notify_state
 
@@ -372,21 +521,36 @@ def _load_reset_log():
     if _reset_log is None:
         _reset_log = []
         try:
-            for line in open(RESET_LOG_PATH, encoding="utf-8"):
-                line = line.strip()
-                if line: _reset_log.append(json.loads(line))
+            with open(RESET_LOG_PATH, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line: _reset_log.append(json.loads(line))
             _reset_log = _reset_log[-30:]
         except Exception: _reset_log = []
     return _reset_log
 
-def _log_reset(window, cls, detail):
+def migrate_notify_state(primary):
+    """The single-account build stored {'session':…, 'week':…} at the top level. Re-home it under
+    the primary account key so its history and reset dedup survive the upgrade, instead of the
+    account baselining as brand new. Idempotent."""
+    st = _load_notify_state()
+    legacy = {k: st.pop(k) for k in ("session", "week") if isinstance(st.get(k), dict)}
+    if legacy:
+        st.setdefault(primary, {}).update(legacy)
+        _save_notify_state()
+        print("[notify] migrated single-account reset state onto '%s'" % primary)
+    return bool(legacy)
+
+def _log_reset(window, cls, detail, acct=""):
     """Append-only record of every reset — expected rollovers AND Anthropic 'gifts'."""
-    entry = {"at": _now_utc().isoformat(timespec="seconds"), "window": window, "class": cls, "detail": detail}
+    entry = {"at": _now_utc().isoformat(timespec="seconds"), "acct": acct,
+             "window": window, "class": cls, "detail": detail}
     log = _load_reset_log(); log.append(entry); del log[:-30]
     try:
         with open(RESET_LOG_PATH, "a", encoding="utf-8") as f: f.write(json.dumps(entry) + "\n")
     except Exception as e: print("[notify] reset-log write failed: %s" % e)
-    print("[%s] RESET %s (%s): %s" % (time.strftime("%H:%M:%S"), window, cls, detail))
+    print("[%s] RESET %s%s (%s): %s" % (time.strftime("%H:%M:%S"), (acct + " ") if acct else "",
+                                        window, cls, detail))
 
 def _reset_detail(kind, prev, u):
     """Human before->after string for the log, e.g. 'W 79%->2%, FABLE 100%->3%'."""
@@ -502,12 +666,18 @@ def _should_notify(kind, prev):
                 or (_was_maxed(prev) and _truthy(CONFIG.get("NOTIFY_SESSION_MAXED"))))
     return _truthy(CONFIG.get("NOTIFY_WEEK_RESET"))
 
-def notify_check(u, resets):
+def notify_check(u, resets, acct=""):
     """Detect + log usage-window resets (see the section header), then notify per the toggles.
     Per window: session=s / resets_at.five_hour; week=(w OR f) / resets_at.seven_day. Baselines
-    silently on first sight; fires once per reset. Never breaks the poller."""
+    silently on first sight; fires once per reset. Never breaks the poller.
+
+    State is namespaced per account. That isolation is load-bearing: with one shared namespace,
+    two accounts polled in turn read as one account whose usage swings wildly, and every swap
+    logs a phantom reset (the single-account build did exactly this when the credential file
+    behind it changed account). A new account key simply baselines and stays quiet."""
     try:
-        st = _load_notify_state(); changed = False; now = _now_utc()
+        root = _load_notify_state()
+        st = root.setdefault(acct, {}); changed = False; now = _now_utc()
         for kind, keys in (("session", ("s",)), ("week", ("w", "f"))):
             ra_iso = resets.get(kind)
             prev = st.get(kind) if isinstance(st.get(kind), dict) else {}   # migrate old formats
@@ -533,9 +703,10 @@ def notify_check(u, resets):
                 cur["fired_for"] = ended
             if cur != prev: st[kind] = cur; changed = True
             if reset:
-                _log_reset(kind, cls, _reset_detail(kind, prev, u))
+                _log_reset(kind, cls, _reset_detail(kind, prev, u), acct)
                 if _should_notify(kind, prev) and _channels():
                     title, body = _reset_message(kind, u, cls, kind == "session" and _was_maxed(prev))
+                    if acct: title = "[%s] %s" % (acct, title)
                     threading.Thread(target=_dispatch, args=(title, body, _channels(), kind + "_reset"),
                                      daemon=True).start()
         if changed: _save_notify_state()
@@ -543,7 +714,7 @@ def notify_check(u, resets):
         print("[notify] check error: %s" % e)
 
 def notify_test(channel):
-    with _lock: u = dict(_usage) if _usage else {}
+    with _lock: u = dict(_accounts[0]["u"]) if _accounts else {}
     if u:                                              # preview the REAL week-reset alert
         title, body = _reset_message("week", u)
         title = "[ClaudeTV test] " + title
@@ -568,36 +739,74 @@ def notify_status():
             "discord_set": bool(CONFIG.get("NOTIFY_DISCORD_WEBHOOK")),
             "slack_set": bool(CONFIG.get("NOTIFY_SLACK_WEBHOOK")),
             "smtp_pass_set": bool(CONFIG.get("SMTP_PASS")),
-            "tracking": {k: v for k, v in st.items() if isinstance(v, dict)},
+            # nested per account: {acct: {session: {...}, week: {...}}}
+            "tracking": {a: v for a, v in st.items() if isinstance(v, dict)},
             "recent_resets": _load_reset_log()[-10:], "last_sent": _notify_last}
 
+def fetch_accounts():
+    """Read every account from the active backend, preferring cswap and falling back to the
+    native keeper. Re-checks for cswap on every poll, so installing it (or removing it) takes
+    effect without a restart."""
+    global _source, _source_err
+    if cswap_bin():
+        try:
+            accts = cswap_accounts()
+            if accts:
+                if _source != "cswap": print("[%s] accounts: cswap (%d)" % (time.strftime("%H:%M:%S"), len(accts)))
+                _source, _source_err = pick_source(True), ""
+                return accts
+            _source_err = "cswap has no accounts (run: cswap add)"
+        except Exception as e:
+            _source_err = str(e)[:120]
+            print("[%s] cswap unusable, falling back to the native keeper: %s"
+                  % (time.strftime("%H:%M:%S"), _source_err))
+    else:
+        _source_err = "cswap not installed"
+    _source = pick_source(False)
+    return native_accounts()
+
+def _auth_transitions(accts):
+    """Edge-triggered per-account dead/recovered alerts: one per account per outage episode."""
+    for rec in accts:
+        dead, was = rec["auth"] == "dead", _alerted.get(rec["key"], False)
+        if dead and not was:
+            _alerted[rec["key"]] = True
+            _auth_alert("dead", "Anthropic rejected the Claude login for %s%s. That account shows "
+                        "LOGIN EXPIRED on the display until you log in again (cswap: log in with "
+                        "that account and re-run `cswap add`; native: "
+                        "python3 claude_usage_server.py --login)."
+                        % (rec["label"], (" (%s)" % rec["email"]) if rec["email"] else ""))
+        elif not dead and was:
+            _alerted[rec["key"]] = False
+            _auth_alert("recovered", "%s is accepted again; the display is back to live data."
+                        % rec["label"])
+
 def poller():
-    global _usage, _usage_ts, _usage_err, _wx, _wx_err, _auth_dead, _dead_alerted
+    global _accounts, _usage_ts, _usage_err, _wx, _wx_err, _auth_dead, _migrated, _force_poll
     next_u = 0.0; backoff = int(CONFIG["USAGE_EVERY"]); next_w = 0.0
     while True:
         now = time.time()
-        if now >= next_u:
+        if now >= next_u or _force_poll:
+            _force_poll = False
             try:
-                u, resets = fetch_usage()
+                accts = fetch_accounts()
                 with _lock:
-                    was_dead = _auth_dead
-                    _usage = u; _usage_ts = int(now); _usage_err = ""; _auth_dead = False
-                if was_dead and _dead_alerted:
-                    _auth_alert("recovered", "The usage endpoint is accepting the Claude login "
-                                "again. The display is back to live data.")
-                _dead_alerted = False
+                    _accounts = accts; _usage_ts = int(now); _usage_err = ""; _auth_dead = False
+                _auth_transitions(accts)
+                if not _migrated and accts:             # first poll: re-home pre-multi-account state
+                    _migrated = True
+                    migrate_notify_state(accts[0]["label"].lower())
                 backoff = int(CONFIG["USAGE_EVERY"]); next_u = now + backoff
-                notify_check(u, resets)                 # detect/log/notify resets (never raises)
+                for rec in accts:                       # detect/log/notify resets (never raises)
+                    notify_check(rec["u"], rec["resets"], acct=rec["label"].lower())
             except urllib.error.HTTPError as e:
                 with _lock: _usage_err = "http %d" % e.code
                 if e.code in (401, 403):                 # EVERY credential store rejected = dead
-                    with _lock: _auth_dead = True         # (only 401/403 means dead; 429 is rate-limit)
-                    if not _dead_alerted:
-                        _dead_alerted = True
-                        _auth_alert("dead", "Anthropic rejected every Claude login on the host "
-                                    "(http %d). The display shows LOGIN EXPIRED until you log in "
-                                    "again: python3 claude_usage_server.py --login (or claude "
-                                    "/login if Claude Code is on the box)." % e.code)
+                    with _lock:
+                        _auth_dead = True                 # (only 401/403 means dead; 429 is rate-limit)
+                        for rec in _accounts: rec["auth"] = "dead"   # keep the device honest
+                    _auth_transitions(_accounts or [{"key": "native", "label": "CLAUDE",
+                                                     "email": "", "auth": "dead"}])
                     refresh_token("auth-fail")            # best-effort recovery (only if a refresh token exists)
                     next_u = now + 300
                 else:
@@ -616,18 +825,25 @@ def poller():
                 with _lock: _wx_err = str(e)[:50]
         time.sleep(2)
 
-def device_json():
-    with _lock: u, ts, err, wx = _usage, _usage_ts, _usage_err, _wx
-    st = {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err,
-          "auth": auth_state()}
-    st.update(u or {"s": 0, "w": 0, "f": -1, "fl": "", "sr": "", "wr": ""})
-    if wx: st.update(wx)
+def device_json(primary=""):
+    with _lock: accts, ts, err, wx = list(_accounts), _usage_ts, _usage_err, _wx
+    st = usage_wire(accts, wx, primary)
+    # collector-side staleness (when we last polled) beats a per-account cache age here: it is
+    # what the device's "stale Nm" readout has always meant.
+    st["age"] = (int(time.time()) - ts) if ts else -1
+    if err: st["err"] = err
     return st
 
 def full_state():
     tok, sub, exp_in = token_status()
-    with _lock: u, ts, err, wx, wxe, lr, re_, refg = _usage, _usage_ts, _usage_err, _wx, _wx_err, _last_refresh, _refresh_err, _refreshing
+    with _lock: accts, ts, err, wx, wxe, lr, re_, refg = list(_accounts), _usage_ts, _usage_err, _wx, _wx_err, _last_refresh, _refresh_err, _refreshing
+    u = accts[0]["u"] if accts else None
     return {"service": {"uptime_s": int(time.time() - START_TS), "port": PORT},
+            "accounts": {"source": _source, "source_err": _source_err, "cswap": cswap_bin(),
+                         "cswap_ver": cswap_version(), "filter": CONFIG.get("CSWAP_ACCOUNTS", ""),
+                         "list": [{"key": a["key"], "label": a["label"], "email": a["email"],
+                                   "active": a["active"], "auth": a["auth"], "age": a["age"],
+                                   "err": a["err"], **a["u"]} for a in accts]},
             "token": {"status": tok, "plan": sub, "expires_in_s": exp_in, "auth": auth_state(),
                       "last_refresh_s": (int(time.time()) - lr) if lr else -1,
                       "refresh_err": re_, "refreshing": refg, "cred": _cred_used or cred_path(),
@@ -641,7 +857,7 @@ def restart_later():
     def go(): time.sleep(0.5); os._exit(0)
     threading.Thread(target=go, daemon=True).start()
 
-TERMINAL = """<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
+TERMINAL = """<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
 <title>ClaudeTV Terminal</title><style>
 :root{--bg:#0a0d13;--panel:#141a26;--line:#222a39;--coral:#ff7a55;--cyan:#3fd2dd;--gray:#a4b0c2}
 *{box-sizing:border-box}body{font-family:ui-monospace,Menlo,monospace;background:var(--bg);color:#e6e9ef;margin:0;padding:18px;max-width:660px;margin:auto}
@@ -670,55 +886,68 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <div class=card><h2>Service</h2>
 <div class=row><span>Status</span><span class=pill ok id=svc>running</span></div>
 <div class=row><span>Uptime</span><span id=up>--</span></div>
-<label style="margin-top:6px">ClaudeTV device URL</label><input id=DEVICE_URL>
+<label style="margin-top:6px" for=DEVICE_URL>ClaudeTV device URL</label><input id=DEVICE_URL>
 <button style="background:#39c3cd;color:#06222a;font-weight:700;margin-top:8px" onclick="window.open(devUrl||'http://claudetv.local','_blank')">Open ClaudeTV device &#8599;</button>
 <div class=grid style=margin-top:8px><button class=ghost onclick=restart()>Restart service</button><button class=ghost onclick=load()>Refresh</button></div></div>
 
-<div class=card><h2>Claude token keeper</h2>
+<div class=card id=tokcard><h2>Claude token keeper</h2>
 <div class=row><span>Token</span><span class=pill id=tok>--</span></div>
 <div class=row><span>Expires in</span><span id=texp>--</span></div>
 <div class=row><span>Last refresh</span><span id=tref>--</span></div>
 <div class=row><span class=muted>credentials</span><span class=muted id=cred></span></div>
 <div class=row><span class=muted id=terr></span><button style="width:auto" class=ghost onclick=refresh()>Refresh now</button></div></div>
 
-<div class=card><h2>Live data</h2>
-<div class=row><span>Session (5h)</span><span class=big id=sess>--</span></div>
-<div class=row><span class=muted id=sessr></span><span class=muted id=uerr></span></div>
-<div class=row><span>Week (7d)</span><span class=big id=week>--</span></div>
-<div class=row id=fablerow style="display:none"><span id=fablelbl>Fable (7d)</span><span class=big id=fable>--</span></div>
-<div class=row><span class=muted id=weekr></span><span class=muted id=age></span></div>
+<div class=card><h2>Accounts</h2>
+<div class=row><span>Source</span><span class=pill id=src>--</span></div>
+<div class=muted id=srcerr></div>
+<div id=accts style="margin-top:6px"></div>
+<div id=cswapadd class=muted style="display:none;margin-top:8px"></div>
+<div class=grid style=margin-top:8px><button class=ghost onclick=poll()>Re-read accounts</button>
+<button class=ghost onclick="document.getElementById('acchelp').style.display=''">How to add an account</button></div>
+<div id=acchelp class=muted style="display:none;margin-top:8px;line-height:1.6">
+Accounts come from <b>claude-swap</b>. Install it on this host:<br>
+<code>pipx install claude-swap</code> &nbsp;or&nbsp; <code>uv tool install claude-swap</code><br><br>
+Then, <b>for each account</b>: log in to Claude Code on this box as that account and run<br>
+<code>cswap add --alias &lt;name&gt;</code><br>
+The alias becomes the label on the display (first 8 characters).<br><br>
+<b>Log in separately on every machine.</b> Refresh tokens rotate, so if two machines hold the
+same login the first to refresh invalidates the other and that account gets quarantined.
+</div>
+<label style="margin-top:10px" for=CSWAP_ACCOUNTS>Show only these accounts (blank = all; comma list of alias/email, sets order)</label>
+<input id=CSWAP_ACCOUNTS placeholder="e.g. work,personal">
+<div class=row><span class=muted id=uerr></span><span class=muted id=age></span></div>
 <div class=row><span id=wx class=muted></span></div></div>
 
 <div class=card><h2>Weather &amp; timezone</h2>
-<label>Search a city (sets location + timezone automatically)</label>
+<label for=citySearch>Search a city (sets location + timezone automatically)</label>
 <input id=citySearch placeholder="e.g. Melbourne" autocomplete=off>
 <div id=geoResults style="margin-top:6px"></div>
 <div class=muted style="margin-top:8px">Current: <b id=CITY_disp>--</b> <span id=geoMeta></span></div>
 <input type=hidden id=CITY><input type=hidden id=LAT><input type=hidden id=LON><input type=hidden id=TZ>
-<label style="margin-top:8px">Weather refresh (s)</label><input id=WEATHER_EVERY></div>
+<label style="margin-top:8px" for=WEATHER_EVERY>Weather refresh (s)</label><input id=WEATHER_EVERY></div>
 
 <div class=card><h2>Claude config</h2>
-<label>Credentials path (blank = auto: collector's own login, else Claude Code's)</label><input id=CLAUDE_CREDENTIALS placeholder=auto>
-<div class=grid><div><label>Refresh margin (min)</label><input id=REFRESH_MARGIN_MIN></div><div><label>Usage poll (s)</label><input id=USAGE_EVERY></div></div>
-<label>Port</label><input id=PORT>
+<label for=CLAUDE_CREDENTIALS>Credentials path (blank = auto: collector's own login, else Claude Code's)</label><input id=CLAUDE_CREDENTIALS placeholder=auto>
+<div class=grid><div><label for=REFRESH_MARGIN_MIN>Refresh margin (min)</label><input id=REFRESH_MARGIN_MIN></div><div><label for=USAGE_EVERY>Usage poll (s)</label><input id=USAGE_EVERY></div></div>
+<label for=PORT>Port</label><input id=PORT>
 <div class=muted style="margin-top:8px">No Claude Code on this box? Run <code>python claude_usage_server.py --login</code> once; the keeper then renews the token itself, forever.</div></div>
 
 <div class=card><h2>Reset notifications</h2>
 <div class=muted>Get pinged when your Claude usage window rolls over to a fresh quota (the reset Anthropic only posts on X).</div>
-<div class=row style="margin-top:8px"><span>Session reset (5h) &mdash; every reset</span><input type=checkbox id=NOTIFY_SESSION_RESET></div>
-<div class=row><span class=muted>&nbsp;&nbsp;&#8627; only when the session maxed out (hit its cap)</span><input type=checkbox id=NOTIFY_SESSION_MAXED></div>
-<div class=row><span>Week reset (7d)</span><input type=checkbox id=NOTIFY_WEEK_RESET></div>
-<div class=row><span>Auth outage / failover alerts</span><input type=checkbox id=NOTIFY_AUTH></div>
+<div class=row style="margin-top:8px"><label for=NOTIFY_SESSION_RESET style="display:inline">Session reset (5h) &mdash; every reset</label><input type=checkbox id=NOTIFY_SESSION_RESET></div>
+<div class=row><label class=muted for=NOTIFY_SESSION_MAXED style="display:inline">&nbsp;&nbsp;&#8627; only when the session maxed out (hit its cap)</label><input type=checkbox id=NOTIFY_SESSION_MAXED></div>
+<div class=row><label for=NOTIFY_WEEK_RESET style="display:inline">Week reset (7d)</label><input type=checkbox id=NOTIFY_WEEK_RESET></div>
+<div class=row><label for=NOTIFY_AUTH style="display:inline">Auth outage / failover alerts</label><input type=checkbox id=NOTIFY_AUTH></div>
 <div class=muted id=nstat></div>
-<label style="margin-top:10px">Discord webhook URL</label>
+<label style="margin-top:10px" for=NOTIFY_DISCORD_WEBHOOK>Discord webhook URL</label>
 <div style="display:flex;gap:8px"><input id=NOTIFY_DISCORD_WEBHOOK placeholder="https://discord.com/api/webhooks/…" style="flex:1"><button class=ghost style="width:auto" onclick="ntest('discord')">Test</button></div>
-<label style="margin-top:8px">Slack webhook URL</label>
+<label style="margin-top:8px" for=NOTIFY_SLACK_WEBHOOK>Slack webhook URL</label>
 <div style="display:flex;gap:8px"><input id=NOTIFY_SLACK_WEBHOOK placeholder="https://hooks.slack.com/services/…" style="flex:1"><button class=ghost style="width:auto" onclick="ntest('slack')">Test</button></div>
-<div class=row style="margin-top:12px"><span>Email alerts (SMTP)</span><input type=checkbox id=NOTIFY_EMAIL></div>
-<div class=grid><div><label>SMTP host</label><input id=SMTP_HOST placeholder=smtp.gmail.com></div><div><label>Port</label><input id=SMTP_PORT></div></div>
-<div class=grid><div><label>Security</label><input id=SMTP_SECURITY placeholder="starttls · ssl · none"></div><div><label>From address</label><input id=SMTP_FROM placeholder=you@example.com></div></div>
-<div class=grid><div><label>SMTP user</label><input id=SMTP_USER></div><div><label>SMTP password</label><input id=SMTP_PASS type=password></div></div>
-<label>Send alerts to</label>
+<div class=row style="margin-top:12px"><label for=NOTIFY_EMAIL style="display:inline">Email alerts (SMTP)</label><input type=checkbox id=NOTIFY_EMAIL></div>
+<div class=grid><div><label for=SMTP_HOST>SMTP host</label><input id=SMTP_HOST placeholder=smtp.gmail.com></div><div><label for=SMTP_PORT>Port</label><input id=SMTP_PORT></div></div>
+<div class=grid><div><label for=SMTP_SECURITY>Security</label><input id=SMTP_SECURITY placeholder="starttls · ssl · none"></div><div><label for=SMTP_FROM>From address</label><input id=SMTP_FROM placeholder=you@example.com></div></div>
+<div class=grid><div><label for=SMTP_USER>SMTP user</label><input id=SMTP_USER></div><div><label for=SMTP_PASS>SMTP password</label><input id=SMTP_PASS type=password></div></div>
+<label for=NOTIFY_EMAIL_TO>Send alerts to</label>
 <div style="display:flex;gap:8px"><input id=NOTIFY_EMAIL_TO placeholder=you@example.com style="flex:1"><button class=ghost style="width:auto" onclick="ntest('email')">Test</button></div>
 <div class=muted style="margin-top:8px">Secrets are write-only: once saved a webhook/password shows as <code>********</code> (never sent back) — leave it to keep, paste a new value to replace. Test uses the last <b>saved</b> config.</div>
 <div class=row><span class=muted id=nres></span></div>
@@ -740,14 +969,29 @@ function fmtAgo(s){if(s<0)return 'never';if(s<60)return s+'s ago';let m=Math.flo
 function pill(el,cls,txt){el.className='pill '+cls;el.textContent=txt}
 function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  up.textContent=fmtUp(s.service.uptime_s);
+ // cswap owns credentials and token keeping in cswap mode, so the native keeper card is moot
+ tokcard.style.display=(s.accounts&&s.accounts.source=='cswap')?'none':'';
  const t=s.token;pill(tok,t.status=='valid'?'ok':(t.status=='expired'?'warn':'bad'),t.status+' ('+t.plan+')');
  texp.textContent=t.refreshing?'refreshing…':(t.expires_in_s>0?fmtUp(t.expires_in_s):'--');
  tref.textContent=fmtAgo(t.last_refresh_s);cred.textContent=t.cred+(t.stores>1?' (+standby)':'');
  terr.textContent=(t.standby?'⚠ running on STANDBY login · ':'')+(t.refresh_err?('⚠ '+t.refresh_err):'');
- const u=s.usage;sess.textContent=u.ok?u.s+'%':'--';sessr.textContent=u.sr?('resets '+u.sr):'idle';
- week.textContent=u.ok?u.w+'%':'--';weekr.textContent=u.wr?('resets '+u.wr):'';
- if(u.f>=0){fablerow.style.display='';fablelbl.textContent=(u.fl||'Fable')+' (7d)';fable.textContent=u.ok?u.f+'%':'--';}else fablerow.style.display='none';
- uerr.textContent=u.err?('⚠ '+u.err):'';age.textContent=u.age>=0?('updated '+u.age+'s ago'):'';
+ const u=s.usage,A=s.accounts||{source:'',list:[]},cs=A.source=='cswap';
+ pill(src,cs?'ok':'warn',cs?('cswap · '+A.list.length+(A.list.length==1?' account':' accounts')):'native · single account');
+ srcerr.textContent=cs?((A.cswap_ver||'cswap')+' · '+A.cswap):(A.source_err?('⚠ '+A.source_err):'');
+ // no cswap on this box -> tell them exactly how to get multi-account, inline
+ cswapadd.style.display=cs?'none':'';
+ cswapadd.innerHTML=cs?'':'Want more than one account? Install <b>claude-swap</b> on this host, then add each login.';
+ accts.innerHTML=(A.list||[]).map(a=>{const dead=a.auth=='dead';
+   const f=a.f>=0?(' · '+(a.fl||'F')+' <b>'+a.f+'%</b>'):'';
+   return '<div style="border-top:1px solid var(--line);padding:8px 0">'
+    +'<div class=row style=margin:0><span><b>'+a.label+'</b>'+(a.active?' <span class=muted>· active</span>':'')
+      +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?'LOGIN EXPIRED':'ok')+'</span></div>'
+    +'<div class=row style="margin:2px 0"><span class=muted>'+(a.email||'')+'</span>'
+      +'<span>S <b>'+a.s+'%</b> · W <b>'+a.w+'%</b>'+f+'</span></div>'
+    +'<div class=row style=margin:0><span class=muted>'+(a.sr?('resets '+a.sr):'idle')+(a.wr?(' · '+a.wr):'')
+      +'</span><span class=muted>'+(a.err||(a.age?a.age+'s':''))+'</span></div></div>';}).join('')
+   ||'<div class=muted>no accounts — run <code>cswap add</code>, or log in with --login</div>';
+ uerr.textContent=u.err?('⚠ '+u.err):'';age.textContent=u.age>=0?('polled '+u.age+'s ago'):'';
  const w=s.weather;wx.textContent=w.city?(w.city+' '+w.wt+'°C '+w.wc+' · feels '+w.wfl+'° · '+w.wlo+'/'+w.whi+'° · rain '+w.wrain+'%'):'weather --';
  for(const k in s.config){const el=document.getElementById(k);if(el&&document.activeElement!==el){
    if(el.type=='checkbox')el.checked=(s.config[k]=='true');else el.value=s.config[k];}}
@@ -757,7 +1001,7 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
    if(n[k]&&document.activeElement!==el&&!el.value)el.value='********';});
  nstat.textContent='Channels: '+((n.channels||[]).join(', ')||'none configured');
  const ls=n.last_sent||{};if(ls.event)nres.textContent='last: '+ls.event+' — '+Object.entries(ls.results||{}).map(([k,v])=>k+' '+v).join(', ');
- const rr=n.recent_resets||[];nlog.innerHTML=rr.length?('<b>Recent resets</b><br>'+rr.slice().reverse().map(e=>e.at.slice(0,16).replace('T',' ')+' · '+e.window+' · '+(e.class=='gift'?'🎁 gift':'scheduled')+(e.detail?(' · '+e.detail):'')).join('<br>')):'';
+ const rr=n.recent_resets||[];nlog.innerHTML=rr.length?('<b>Recent resets</b><br>'+rr.slice().reverse().map(e=>e.at.slice(0,16).replace('T',' ')+(e.acct?(' · '+e.acct):'')+' · '+e.window+' · '+(e.class=='gift'?'🎁 gift':'scheduled')+(e.detail?(' · '+e.detail):'')).join('<br>')):'';
  CITY_disp.textContent=s.config.CITY||'--';geoMeta.textContent=s.config.LAT?('· '+s.config.TZ):'';
  devUrl=s.config.DEVICE_URL||'';
 }).catch(()=>{pill(svc,'bad','unreachable')})}
@@ -777,6 +1021,7 @@ function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL
 function ntest(ch){nres.textContent='testing '+ch+'…';
  fetch('/api/notify-test?channel='+ch,{method:'POST'}).then(r=>r.json()).then(d=>{
   nres.textContent=Object.entries(d.results||{}).map(([k,v])=>k+': '+v).join(' · ')||'no channel configured';}).catch(()=>{nres.textContent='test failed'});}
+function poll(){pill(svc,'warn','re-reading…');fetch('/api/service?action=poll',{method:'POST'}).then(()=>setTimeout(()=>{pill(svc,'ok','running');load()},1500))}
 function restart(){if(!confirm('Restart collector?'))return;fetch('/api/service?action=restart',{method:'POST'}).then(()=>{pill(svc,'warn','restarting');setTimeout(load,3500)})}
 function refresh(){pill(tok,'warn','refreshing');fetch('/api/service?action=refresh',{method:'POST'}).then(()=>setTimeout(load,8000))}
 load();setInterval(load,3000);
@@ -797,8 +1042,10 @@ class H(BaseHTTPRequestHandler):
             q.update(urllib.parse.parse_qs(b))
         return u.path, {k: v[0] for k, v in q.items()}
     def do_GET(self):
-        path, _ = self._q()
-        if path.startswith("/usage"): self._send(200, "application/json", json.dumps(device_json(), separators=(",", ":")))
+        path, q = self._q()
+        # /usage?acct=<label|email> pins which account fills the flat keys, so a second device
+        # can show a different account off the same collector.
+        if path.startswith("/usage"): self._send(200, "application/json", json.dumps(device_json(q.get("acct", "")), separators=(",", ":")))
         elif path == "/api/state": self._send(200, "application/json", json.dumps(full_state()))
         elif path == "/api/geocode":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("q", [""])[0]
@@ -811,6 +1058,9 @@ class H(BaseHTTPRequestHandler):
             save_config(q); self._send(200, "application/json", '{"ok":1}'); restart_later()
         elif path == "/api/service" and q.get("action") == "restart":
             self._send(200, "application/json", '{"ok":1}'); restart_later()
+        elif path == "/api/service" and q.get("action") == "poll":
+            globals()["_force_poll"] = True          # re-read accounts now (dashboard button)
+            self._send(200, "application/json", '{"ok":1}')
         elif path == "/api/service" and q.get("action") == "refresh":
             self._send(200, "application/json", '{"ok":1}'); threading.Thread(target=lambda: refresh_token("manual"), daemon=True).start()
         elif path == "/api/notify-test":

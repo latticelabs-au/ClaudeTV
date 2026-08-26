@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  collector:
+    name: Collector tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The collector is deliberately stdlib-only, so there is nothing to install.
+      - name: Unit tests
+        working-directory: host
+        run: python -m unittest discover -p 'test_*.py' -v
+      - name: Byte-compile
+        run: python -m compileall -q host/claude_usage_server.py
+      - name: Installer syntax
+        run: bash -n host/install.sh
+
+  firmware:
+    name: Firmware build (ESP8266)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Arduino cores and libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-esp8266-3.1.2-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Install ESP8266 core and libraries
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://arduino.esp8266.com/stable/package_esp8266com_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp8266:esp8266@3.1.2
+          arduino-cli lib install "TFT_eSPI@2.5.43" "ArduinoJson@7.4.3" "WiFiManager@2.0.17"
+
+      - name: Apply the project's TFT_eSPI pin/panel setup
+        run: cp firmware/User_Setup.h "$HOME/Arduino/libraries/TFT_eSPI/User_Setup.h"
+
+      - name: Provide a secret-free config.h
+        # config.h is gitignored (it holds WiFi credentials on a personal build). An empty SSID
+        # is exactly what the generic release image ships: the device opens its setup portal.
+        run: cp firmware/claudetv/config.h.example firmware/claudetv/config.h
+
+      - name: Compile
+        run: |
+          arduino-cli compile --fqbn esp8266:esp8266:generic:eesz=4M1M \
+            --warnings default --output-dir build firmware/claudetv
+
+      - name: Upload firmware image
+        uses: actions/upload-artifact@v4
+        with:
+          name: claudetv-generic-bin
+          path: build/claudetv.ino.bin

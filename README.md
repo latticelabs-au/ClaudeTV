@@ -10,6 +10,9 @@ week %, **and your model‑scoped weekly limit (e.g. Fable)** from Claude Code's
 reset times, plus a weather turntable and a clock. Optional **email / Discord / Slack alerts**
 when a usage window resets.
 
+Got **more than one Claude account**? The display cycles through all of them, each with its own
+card and label — see [Multiple accounts](#multiple-accounts).
+
 It runs on a **$15 WiFi clock** ([GeekMagic SmallTV‑Ultra on AliExpress](https://www.aliexpress.com/item/1005007937948865.html))
 that you reflash **over WiFi — no soldering, fully reversible.**
 
@@ -74,28 +77,39 @@ That's it. Two commands and a WiFi prompt.
 ## How it works
 
 ```
- always-on host (collector, Python stdlib)       ESP8266 clock
-        │  refreshes its own OAuth token                │
-        ▼                                               ▼
-  credentials file (own store or Claude Code's)  ┌──────────────┐
-        │                                         │  ClaudeTV fw │
-   collector ─► api.anthropic.com/api/oauth/usage │   /usage  ◄──┼── LAN
-   (Python)  ─► open-meteo.com (weather, no key)  └──────────────┘
-        │
-   http://<host>:8088/usage   ← the device polls this
-   http://<host>:8088/        ← master terminal (status, config, token keeper)
+ always-on host (collector, Python stdlib)             ESP8266 clock
+                                                              │
+   ┌─ MULTI-ACCOUNT ─────────────────────────┐                ▼
+   │  cswap list --json  (claude-swap owns   │        ┌──────────────┐
+   │  credentials + token keeping + polling) │        │  ClaudeTV fw │
+   └─────────────────────────────────────────┘        │   /usage  ◄──┼── LAN
+   ┌─ SINGLE ACCOUNT (fallback, no deps) ────┐        └──────────────┘
+   │  credentials file ─► own OAuth keeper   │           cycles acc[]
+   │  ─► api.anthropic.com/api/oauth/usage   │
+   └─────────────────────────────────────────┘
+        │  + open-meteo.com (weather, no key)
+        ▼
+   http://<host>:8088/usage   ← the device polls this  (?acct=<label> pins one)
+   http://<host>:8088/        ← master terminal (accounts, status, config)
 ```
 
-- **Collector** (`host/claude_usage_server.py`) polls Anthropic's `/api/oauth/usage` (the same
-  endpoint Claude Code's `/usage` uses) — session, week, and the model‑scoped weekly limit (read
-  generically from `limits[]`, so it follows whatever model Anthropic scopes, Fable today) — plus
-  keyless weather from open‑meteo, then serves a small JSON. It **always returns the last‑good
-  value** and backs off on rate limits, so the screen never blanks.
-- **Token keeper**: the Claude access token is short‑lived (~8 h), but its refresh token's
-  ~28‑day validity window **rolls forward on every refresh**. The collector speaks the OAuth
-  refresh grant natively (same public‑client endpoint Claude Code uses) and rotates the pair
-  itself every few hours, so **one login lasts indefinitely** with no Claude Code install
-  needed. The master terminal shows token status and a manual *Refresh now*.
+- **Collector** (`host/claude_usage_server.py`) serves session, week, and the model‑scoped weekly
+  limit (read generically from `limits[]`, so it follows whatever model Anthropic scopes, Fable
+  today) for **every account**, plus keyless weather from open‑meteo, as one small JSON. It
+  **always returns the last‑good value** and backs off on rate limits, so the screen never blanks.
+- **Two account backends**, chosen automatically: `cswap` when it's installed with accounts
+  (multi‑account, and it owns credentials and token keeping), otherwise the built‑in
+  single‑account OAuth keeper below. Nothing to configure either way.
+- **Wire format is backwards compatible**: the flat `s`/`w`/`f` keys still carry the first
+  account exactly as before, and `acc[]` carries the rest — so a v4.7 device keeps working
+  against a multi‑account collector without reflashing.
+- **Token keeper** (single‑account mode): the Claude access token is short‑lived (~8 h), but its
+  refresh token's ~28‑day validity window **rolls forward on every refresh**. The collector speaks
+  the OAuth refresh grant natively (same public‑client endpoint Claude Code uses) and rotates the
+  pair itself every few hours, so **one login lasts indefinitely** with no Claude Code install
+  needed. The master terminal shows token status and a manual *Refresh now*. In cswap mode this
+  keeper **stands fully down** — cswap does the rotating, and two keepers on one token family
+  would invalidate each other.
 - **Firmware** (`firmware/claudetv/`) fetches that JSON over your LAN and draws it. Rendering uses
   TFT_eSPI with **one held‑open SPI transaction** (CS stays low, like the stock firmware) so there's
   **no per‑redraw coil/cap tick** — it's silent.
@@ -140,6 +154,82 @@ Two things that look like they should work but **don't** (save yourself the deto
   (5h / 7d / model-scoped), which API-key accounts don't have. Wrong credential entirely.
 - **`claude setup-token`**: that long-lived token is scoped for Claude Code *inference* and is
   rejected (**403**) by the usage endpoint. Use a subscription login as above.
+
+---
+
+## Multiple accounts
+
+Two accounts, five, a dozen — ClaudeTV shows them all. It reads them from
+[**claude-swap**](https://github.com/realiti4/claude-swap) (`cswap`), which already owns
+multi‑account credential storage, token keeping and per‑account usage polling. The device shows
+**one account at a time and cycles**, so every account keeps the full three‑number card; the
+header carries the account label plus page dots (or a compact `3/8` counter once there are more
+than six).
+
+### 1 · Install cswap on the collector host
+
+Any one of these, on the same always‑on box that runs the collector:
+
+```bash
+pipx install claude-swap          # recommended
+uv tool install claude-swap       # if you use uv
+pip install --user claude-swap    # last resort
+```
+
+Or let ClaudeTV's own installer put it in a venv beside the collector, no system Python touched:
+
+```bash
+CLAUDETV_CSWAP=1 curl -fsSL https://raw.githubusercontent.com/latticelabs-au/ClaudeTV/main/host/install.sh | bash
+```
+
+### 2 · Add each account
+
+**For every account**, log in to Claude Code *on that host* as that account, then register it:
+
+```bash
+cswap add --alias work            # the alias becomes the display label (first 8 chars)
+cswap add --alias personal
+cswap add --alias client-a
+cswap list                        # confirm they're all there
+```
+
+No Claude Code on the box? Mint a login with ClaudeTV's own flow first
+(`python3 ~/.claudetv/claude_usage_server.py --login`, which writes
+`~/.claude/.credentials.json`), then `cswap add`.
+
+### 3 · That's it
+
+The collector picks cswap up on its next poll — no restart, nothing to configure. Hit **Re‑read
+accounts** in the master terminal if you want it immediately.
+
+> ⚠️ **Log in separately on every machine.** Refresh tokens rotate, so if two machines hold the
+> *same* login (via `cswap export`/`import`, or a copied credential file) the first one to refresh
+> invalidates the other's copy and that account gets quarantined. Anthropic allows concurrent
+> logins — do one per box rather than copying credentials between them.
+
+### Managing it from the dashboards
+
+- **Master terminal** (`http://<host>:8088/`) — the **Accounts** card shows the backend and cswap
+  version, every account's S/W/scoped numbers, reset times, per‑account age and auth state, an
+  inline *How to add an account* guide, a **Re‑read accounts** button, and the account filter.
+- **Device panel** (`http://claudetv.local/`) — lists every account with the one currently on
+  screen marked, sets **seconds per account**, and has **Show next account now**.
+
+### Details
+
+- **Nothing to configure**: if `cswap` is on PATH (or in `./venv/bin`) and has accounts, the
+  collector uses it; otherwise it falls back to the single‑account OAuth keeper below.
+- **Pick and order which accounts reach the display** with `CLAUDETV_CSWAP_ACCOUNTS=work,personal`
+  (matches alias, email or slot number) — handy when cswap manages more accounts than you want on
+  a 240×240 screen. Blank means all of them.
+- **cswap owns the credentials** in this mode and ClaudeTV's own token keeper **stands fully
+  down**, so the two never rotate the same token family against each other.
+- **Per‑account everything**: a dead login takes over only *its* card (`LOGIN EXPIRED`) while the
+  others keep showing, alerts are prefixed with the account label, and reset detection is keyed
+  per account — so switching accounts can never be mistaken for a usage reset.
+- **One device per account instead of cycling?** Point it at `/usage?acct=<label>` — that serves a
+  single account, and the header reverts to the classic title.
+- The firmware cycles up to **8** accounts (`MAXACC`); the collector itself has no limit.
 
 ---
 
