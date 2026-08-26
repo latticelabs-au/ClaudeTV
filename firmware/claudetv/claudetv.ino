@@ -23,7 +23,12 @@
 #include "panel.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "4.7"
+#define FW_VER  "5.0"
+// However many accounts cswap manages, the cycle shows up to this many. Raise freely: the cost
+// is 4 Strings + 4 ints of heap each, and the header switches from page dots to an "i/N"
+// counter past DOTS_MAX so the indicator never grows into the label.
+#define MAXACC   8
+#define DOTS_MAX 6
 #define TZ_STR  "AEST-10AEDT,M10.1.0,M4.1.0/3"
 #define TFT_BL  5
 #define WX_CYCLE_MS 4000
@@ -33,14 +38,24 @@ ESP8266WebServer        server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 uint16_t C_BG, C_PANEL, C_LINE, C_CORAL, C_CYAN, C_WHITE, C_GRAY, C_DIM, C_GREEN, C_AMBER, C_RED, C_SKY;
-unsigned long lastFetch=0, lastClock=0, lastWx=0;
+unsigned long lastFetch=0, lastClock=0, lastWx=0, lastAcc=0;
 int connOK=-1, wxIdx=0; bool haveData=false, nightActive=false;
-int authState=0, dataAge=-1, pAuth=-1;   // authState: 0 ok, 1 pending, 2 dead (needs re-login on host)
-struct { int s=0, w=0, f=-1, wt=-999, wfl=-999, whi=-999, wlo=-999, wrain=-999, whum=-999; String sr, wr, fl, wc, city; } U;
-int pS=-99, pW=-99, pF=-99, pConn=-1; String pSR="\x01", pWR="\x01", pFL="\x01", pDate="\x01";
+int dataAge=-1, pAuth=-1;
+// One account's usage. The card renders ONE account at a time and the display cycles through
+// them (the same turntable the weather metrics use), so every account keeps the full three
+// Bold18 heroes instead of six numbers fighting over one 79px card.
+struct Acct { int s=0, w=0, f=-1, auth=0; String sr, wr, fl, label; };   // auth: 0 ok, 1 pending, 2 dead
+Acct AC[MAXACC]; int nAcc=1, accIdx=0;
+struct { int wt=-999, wfl=-999, whi=-999, wlo=-999, wrain=-999, whum=-999; String wc, city; } U;
+int pS=-99, pW=-99, pF=-99, pConn=-1, pAcc=-1, pNAcc=-1; String pSR="\x01", pWR="\x01", pFL="\x01", pLBL="\x01", pDate="\x01";
+Acct& A(){ return AC[(accIdx < nAcc && accIdx < MAXACC) ? accIdx : 0]; }   // the account on screen
 
-struct Settings { uint8_t magic, bri, nEn, nStart, nEnd, nBri, rot; uint16_t refresh; char usageUrl[100]; } S;
+// accCycle was appended AFTER usageUrl, so a 4.7 EEPROM image reads a stale byte there. MAGIC is
+// deliberately NOT bumped (that would wipe the saved collector URL on generic builds); instead the
+// value is range-checked on load, which re-defaults both a legacy byte and a corrupt one.
+struct Settings { uint8_t magic, bri, nEn, nStart, nEnd, nBri, rot; uint16_t refresh; char usageUrl[100]; uint8_t accCycle; } S;
 const uint8_t MAGIC = 0xC5;
+const uint8_t ACC_CYCLE_MIN = 3, ACC_CYCLE_MAX = 60, ACC_CYCLE_DEF = 5;
 
 // geometry (1:1 with emulator)
 const int UCX=8, UCY=33, UCW=224, UCH=79, LCX=64, RCX=176;
@@ -55,7 +70,7 @@ const int WCX=8, WCY=118, WCW=224, WCH=54;
 const int TIME_Y=196, DATE_Y=222;
 
 void saveSettings(){ EEPROM.put(0,S); EEPROM.commit(); }
-void defaults(){ memset(&S,0,sizeof S); S.magic=MAGIC; S.bri=60; S.nEn=1; S.nStart=21; S.nEnd=7; S.nBri=30; S.rot=0; S.refresh=20; strncpy(S.usageUrl,USAGE_URL,sizeof(S.usageUrl)-1); }
+void defaults(){ memset(&S,0,sizeof S); S.magic=MAGIC; S.bri=60; S.nEn=1; S.nStart=21; S.nEnd=7; S.nBri=30; S.rot=0; S.refresh=20; S.accCycle=ACC_CYCLE_DEF; strncpy(S.usageUrl,USAGE_URL,sizeof(S.usageUrl)-1); }
 uint16_t lvl(int p){ if(p<0)return C_GRAY; if(p>=85)return C_RED; if(p>=50)return C_AMBER; return C_GREEN; }
 void applyBacklight(){ int b=nightActive?S.nBri:S.bri; b=constrain(b,0,100); analogWrite(TFT_BL,(100-b)*255/100); }
 bool isNight(int hr){ if(!S.nEn||S.nStart==S.nEnd)return false; return S.nStart<S.nEnd?(hr>=S.nStart&&hr<S.nEnd):(hr>=S.nStart||hr<S.nEnd); }
@@ -79,30 +94,31 @@ void drawMetric(int cx,const char* label,int pct,const GFXfont* f){
   str(b,cx,UCY+43,f,lvl(haveData?pct:-1),MC_DATUM,C_PANEL);
 }
 void drawUsageCard(){
+  Acct& a=A();
   tft.fillRoundRect(UCX,UCY,UCW,UCH,10,C_PANEL);
-  if(U.f>=0){                     // S (5h) | W + F (7d) — one shared reset, three Bold18 heroes
+  if(a.f>=0){                     // S (5h) | W + F (7d) — one shared reset, three Bold18 heroes
     tft.drawFastVLine(FDIV,UCY+14,UCH-28,C_LINE);   // divider = the 5h | 7d window boundary
-    drawMetric(FSCX,"S",U.s,&FreeSansBold18pt7b);
-    str(U.sr.length()?U.sr.c_str():"idle",FSCX,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
-    drawMetric(FWCX,"W",U.w,&FreeSansBold18pt7b);
-    char fLbl[2]={U.fl.length()?U.fl[0]:'F',0};     // first letter of the scoped-model name
-    drawMetric(FFCX,fLbl,U.f,&FreeSansBold18pt7b);
+    drawMetric(FSCX,"S",a.s,&FreeSansBold18pt7b);
+    str(a.sr.length()?a.sr.c_str():"idle",FSCX,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
+    drawMetric(FWCX,"W",a.w,&FreeSansBold18pt7b);
+    char fLbl[2]={a.fl.length()?a.fl[0]:'F',0};     // first letter of the scoped-model name
+    drawMetric(FFCX,fLbl,a.f,&FreeSansBold18pt7b);
     // week + fable share the same 7d window (their resets land ~1s apart) -> ONE reset line
-    if(U.wr.length()) str(U.wr.c_str(),FRSTX,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
+    if(a.wr.length()) str(a.wr.c_str(),FRSTX,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
     return;
   }
   // classic 2-col — account has no model-scoped weekly limit
   tft.drawFastVLine(120,UCY+14,UCH-28,C_LINE);
   // session (left col): reset centered under the column
   str("SESSION",LCX,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
-  char b[8]; if(haveData)snprintf(b,sizeof b,"%d%%",U.s); else strcpy(b,"--");
-  str(b,LCX,UCY+43,&FreeSansBold18pt7b,lvl(haveData?U.s:-1),MC_DATUM,C_PANEL);
-  str(U.sr.length()?U.sr.c_str():"idle",UCX+12,UCY+67,&FreeSansBold9pt7b,C_DIM,ML_DATUM,C_PANEL);
+  char b[8]; if(haveData)snprintf(b,sizeof b,"%d%%",a.s); else strcpy(b,"--");
+  str(b,LCX,UCY+43,&FreeSansBold18pt7b,lvl(haveData?a.s:-1),MC_DATUM,C_PANEL);
+  str(a.sr.length()?a.sr.c_str():"idle",UCX+12,UCY+67,&FreeSansBold9pt7b,C_DIM,ML_DATUM,C_PANEL);
   // week (right col): reset right-aligned so the wide date+time never crosses the card edge
   str("WEEK",RCX,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
-  if(haveData)snprintf(b,sizeof b,"%d%%",U.w); else strcpy(b,"--");
-  str(b,RCX,UCY+43,&FreeSansBold18pt7b,lvl(haveData?U.w:-1),MC_DATUM,C_PANEL);
-  str(U.wr.length()?U.wr.c_str():"--",UCX+UCW-12,UCY+67,&FreeSansBold9pt7b,C_DIM,MR_DATUM,C_PANEL);
+  if(haveData)snprintf(b,sizeof b,"%d%%",a.w); else strcpy(b,"--");
+  str(b,RCX,UCY+43,&FreeSansBold18pt7b,lvl(haveData?a.w:-1),MC_DATUM,C_PANEL);
+  str(a.wr.length()?a.wr.c_str():"--",UCX+UCW-12,UCY+67,&FreeSansBold9pt7b,C_DIM,MR_DATUM,C_PANEL);
 }
 void drawWeatherCard(){
   tft.fillRoundRect(WCX,WCY,WCW,WCH,10,C_PANEL);
@@ -127,7 +143,7 @@ void drawUsageError(){          // dead Claude auth -> takeover the hero card (w
   char ag[16]; fmtAge(dataAge,ag,sizeof ag);
   if(ag[0]) str(ag,120,UCY+66,&FreeSans9pt7b,C_DIM,MC_DATUM,C_PANEL);
 }
-void drawDot(){ uint16_t c=(connOK!=1||authState==2)?C_RED:(authState==1?C_AMBER:C_GREEN); tft.fillCircle(18,DATE_Y,3,c); }
+void drawDot(){ int au=A().auth; uint16_t c=(connOK!=1||au==2)?C_RED:(au==1?C_AMBER:C_GREEN); tft.fillCircle(18,DATE_Y,3,c); }
 void drawClock(){
   time_t now=time(nullptr); char hms[12],dat[18];
   if(now<100000){strcpy(hms,"--:--:--");strcpy(dat,"syncing");}
@@ -139,21 +155,42 @@ void drawClock(){
   tft.fillRect(26,DATE_Y-13,164,26,C_BG);
   str(dat,28,DATE_Y,&FreeSans9pt7b,C_GRAY,ML_DATUM,C_BG);
 }
+// Header: a single account keeps the original "CLAUDE USAGE" title; two or more replace it with
+// the account label (the title is decoration once the card is per-account) plus page dots, so you
+// always know which account the numbers belong to. "PERSONAL"@Bold12 = 132px from x=26 -> 158,
+// clear of the dots, which are right-aligned to end at x=232.
 void header(){
+  // Clear the ENTIRE band above the usage card (rows 0..UCY-1). The label changes width AND
+  // Bold12 glyphs at TL_DATUM y=9 reach ~y=32, so a tight clear leaves the previous label's
+  // bottom rows stranded in the 26..32 gap that neither the header nor the card repaints.
+  tft.fillRect(0,0,240,UCY,C_BG);
   tft.fillRoundRect(12,12,9,9,2,C_CORAL);
-  str("CLAUDE USAGE",26,9,&FreeSansBold12pt7b,C_WHITE,TL_DATUM,C_BG);
+  if(nAcc<2){ str("CLAUDE USAGE",26,9,&FreeSansBold12pt7b,C_WHITE,TL_DATUM,C_BG); return; }
+  String lb=A().label; if(!lb.length()) lb="ACCOUNT";
+  str(lb.c_str(),26,9,&FreeSansBold12pt7b,C_CORAL,TL_DATUM,C_BG);
+  if(nAcc<=DOTS_MAX){                              // page dots, right-aligned to end at x=232
+    for(int i=0;i<nAcc;i++)
+      tft.fillCircle(232-(nAcc-1-i)*10,17,3,(i==accIdx)?C_WHITE:C_LINE);
+  }else{                                           // too many to dot -> compact "3/8" counter
+    char c[8]; snprintf(c,sizeof c,"%d/%d",accIdx+1,nAcc);
+    str(c,235,17,&FreeSansBold9pt7b,C_GRAY,MR_DATUM,C_BG);
+  }
 }
 void render(bool force){
-  bool cardChg=force||authState!=pAuth||U.s!=pS||U.w!=pW||U.f!=pF||U.sr!=pSR||U.wr!=pWR||U.fl!=pFL;
-  bool dotChg =force||connOK!=pConn||authState!=pAuth;
-  if(cardChg){ if(authState==2)drawUsageError(); else drawUsageCard(); pS=U.s;pW=U.w;pF=U.f;pSR=U.sr;pWR=U.wr;pFL=U.fl; }
+  Acct& a=A();
+  bool cardChg=force||a.auth!=pAuth||accIdx!=pAcc||a.s!=pS||a.w!=pW||a.f!=pF||a.sr!=pSR||a.wr!=pWR||a.fl!=pFL;
+  // nAcc matters on its own: dropping to one account must repaint the title and clear the dots
+  bool hdrChg =force||accIdx!=pAcc||nAcc!=pNAcc||a.label!=pLBL;
+  bool dotChg =force||connOK!=pConn||a.auth!=pAuth;
+  if(hdrChg){ header(); pLBL=a.label; pNAcc=nAcc; }
+  if(cardChg){ if(a.auth==2)drawUsageError(); else drawUsageCard(); pS=a.s;pW=a.w;pF=a.f;pSR=a.sr;pWR=a.wr;pFL=a.fl; }
   if(dotChg){ drawDot(); pConn=connOK; }
-  pAuth=authState;
+  pAuth=a.auth; pAcc=accIdx;
 }
 void fullRedraw(){
-  tft.fillScreen(C_BG); header(); drawLogo();
-  pS=pW=pF=-99; pConn=-1; pAuth=-1; pSR=pWR=pFL=pDate="\x01";
-  render(true); drawWeatherCard(); drawClock();
+  tft.fillScreen(C_BG); drawLogo();
+  pS=pW=pF=-99; pConn=-1; pAuth=-1; pAcc=-1; pNAcc=-1; pSR=pWR=pFL=pLBL=pDate="\x01";
+  render(true); drawWeatherCard(); drawClock();   // render(true) paints the header
 }
 
 void splash(){
@@ -171,11 +208,36 @@ void fetchUsage(){
     if(deserializeJson(doc,http.getString())==DeserializationError::Ok){
       connOK=1;
       const char* a=doc["auth"]|"ok";
-      authState=(!strcmp(a,"dead"))?2:(!strcmp(a,"pending"))?1:0;
+      int topAuth=(!strcmp(a,"dead"))?2:(!strcmp(a,"pending"))?1:0;
       dataAge=doc["age"]|-1;
-      if((doc["ok"]|0)==1){haveData=true; U.s=doc["s"]|0; U.w=doc["w"]|0; U.sr=String((const char*)(doc["sr"]|"")); U.wr=String((const char*)(doc["wr"]|""));
-        U.f=doc["f"]|-1; U.fl=String((const char*)(doc["fl"]|""));}   // model-scoped weekly (e.g. Fable); -1 = account has none
-      else if(authState==2){haveData=false;}   // dead session -> stop showing phantom stale %
+      if((doc["ok"]|0)==1){
+        haveData=true;
+        // Multi-account collector: acc[] carries every account. An older single-account
+        // collector has no acc[], so fall back to the flat keys as one account — that keeps
+        // this firmware working against both.
+        JsonArray ar=doc["acc"].as<JsonArray>();
+        if(!ar.isNull()&&ar.size()>0){
+          int n=0;
+          for(JsonObject o:ar){
+            if(n>=MAXACC) break;
+            Acct& t=AC[n];
+            t.s=o["s"]|0; t.w=o["w"]|0; t.f=o["f"]|-1;
+            t.sr=String((const char*)(o["sr"]|"")); t.wr=String((const char*)(o["wr"]|""));
+            t.fl=String((const char*)(o["fl"]|"")); t.label=String((const char*)(o["l"]|""));
+            const char* oa=o["auth"]|"ok";
+            t.auth=(!strcmp(oa,"dead"))?2:(!strcmp(oa,"pending"))?1:0;
+            n++;
+          }
+          nAcc=n;
+        } else {
+          Acct& t=AC[0];
+          t.s=doc["s"]|0; t.w=doc["w"]|0; t.sr=String((const char*)(doc["sr"]|"")); t.wr=String((const char*)(doc["wr"]|""));
+          t.f=doc["f"]|-1; t.fl=String((const char*)(doc["fl"]|""));   // model-scoped weekly (e.g. Fable); -1 = none
+          t.label=""; t.auth=topAuth; nAcc=1;
+        }
+        if(accIdx>=nAcc) accIdx=0;
+      }
+      else if(topAuth==2){haveData=false; nAcc=1; accIdx=0; AC[0].auth=2;}   // dead -> no phantom stale %
       if(doc["wt"].is<int>()){ U.wt=doc["wt"]|-999; U.wfl=doc["wfl"]|-999; U.whi=doc["whi"]|-999; U.wlo=doc["wlo"]|-999;
         U.wrain=doc["wrain"]|-999; U.whum=doc["whum"]|-999; U.wc=String((const char*)(doc["wc"]|"")); U.city=String((const char*)(doc["city"]|"")); drawWeatherCard(); }
     } else connOK=0;
@@ -189,9 +251,15 @@ void handleRoot(){ server.send_P(200,"text/html",PANEL); }
 void handleState(){
   time_t now=time(nullptr); char hms[12]="--:--:--"; if(now>=100000){struct tm* t=localtime(&now);strftime(hms,sizeof hms,"%H:%M:%S",t);}
   JsonDocument d;
-  d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["auth"]=authState; d["age"]=dataAge; d["s"]=U.s; d["w"]=U.w; d["f"]=U.f; d["fl"]=U.fl; d["sr"]=U.sr; d["wr"]=U.wr;
+  Acct& a=A();
+  d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["auth"]=a.auth; d["age"]=dataAge;
+  d["s"]=a.s; d["w"]=a.w; d["f"]=a.f; d["fl"]=a.fl; d["sr"]=a.sr; d["wr"]=a.wr;
+  d["nacc"]=nAcc; d["acci"]=accIdx; d["label"]=a.label;
+  JsonArray ar=d["acc"].to<JsonArray>();
+  for(int i=0;i<nAcc&&i<MAXACC;i++){ JsonObject o=ar.add<JsonObject>();
+    o["l"]=AC[i].label; o["s"]=AC[i].s; o["w"]=AC[i].w; o["f"]=AC[i].f; o["auth"]=AC[i].auth; }
   d["city"]=U.city; d["wt"]=U.wt; d["wc"]=U.wc; d["time"]=hms;
-  d["bri"]=S.bri; d["ne"]=S.nEn; d["ns"]=S.nStart; d["nf"]=S.nEnd; d["nb"]=S.nBri; d["rot"]=S.rot; d["refresh"]=S.refresh;
+  d["bri"]=S.bri; d["ne"]=S.nEn; d["ns"]=S.nStart; d["nf"]=S.nEnd; d["nb"]=S.nBri; d["rot"]=S.rot; d["refresh"]=S.refresh; d["acyc"]=S.accCycle;
   d["usage"]=S.usageUrl;
   String tu=S.usageUrl; int i=tu.indexOf("/usage"); d["terminal"] = (i>0) ? tu.substring(0,i)+"/" : tu;
   String out; serializeJson(d,out); server.send(200,"application/json",out);
@@ -204,6 +272,9 @@ void handleSet(){
   if(server.hasArg("ns"))S.nStart=constrain(server.arg("ns").toInt(),0,23);
   if(server.hasArg("nf"))S.nEnd=constrain(server.arg("nf").toInt(),0,23);
   if(server.hasArg("refresh"))S.refresh=constrain(server.arg("refresh").toInt(),5,120);
+  if(server.hasArg("acyc")){S.accCycle=constrain(server.arg("acyc").toInt(),ACC_CYCLE_MIN,ACC_CYCLE_MAX);accIdx=0;redraw=true;}
+  // step the turntable on demand from the panel (and restart the dwell so it doesn't jump again)
+  if(server.hasArg("accnext")&&nAcc>1){accIdx=(accIdx+1)%nAcc;lastAcc=millis();render(false);}
   if(server.hasArg("usage")){ String u=server.arg("usage"); if(u.length()>6){ strncpy(S.usageUrl,u.c_str(),sizeof(S.usageUrl)-1); S.usageUrl[sizeof(S.usageUrl)-1]=0; usageChanged=true; } }
   if(server.hasArg("rot")){S.rot=S.rot?0:2;redraw=true;}
   if(server.hasArg("reboot"))reboot=true;
@@ -218,6 +289,8 @@ void setup(){
   Serial.begin(115200); Serial.println(F("\n[" FW_NAME " v" FW_VER "] boot"));
   EEPROM.begin(256); EEPROM.get(0,S); if(S.magic!=MAGIC) defaults();
   if(S.usageUrl[0]==0){ strncpy(S.usageUrl,USAGE_URL,sizeof(S.usageUrl)-1); }
+  // a pre-5.0 EEPROM image has no accCycle byte -> whatever was at that offset; re-default it
+  if(S.accCycle<ACC_CYCLE_MIN||S.accCycle>ACC_CYCLE_MAX) S.accCycle=ACC_CYCLE_DEF;
   analogWriteRange(255); analogWriteFreq(22000); pinMode(TFT_BL,OUTPUT); applyBacklight();
 
   tft.init(); tft.setRotation(S.rot); tft.startWrite();
@@ -253,5 +326,11 @@ void loop(){
   server.handleClient(); MDNS.update();
   if(millis()-lastClock>=1000){ lastClock=millis(); drawClock(); }
   if(millis()-lastWx>=WX_CYCLE_MS){ lastWx=millis(); wxIdx=(wxIdx+1)%6; drawWeatherCard(); }
+  // account turntable: S.accCycle seconds per account. To show ONE account instead, point the
+  // device at the collector's /usage?acct=<label> — that serves a single account and the header
+  // reverts to the classic title.
+  if(nAcc>1 && millis()-lastAcc>=(unsigned long)S.accCycle*1000){
+    lastAcc=millis(); accIdx=(accIdx+1)%nAcc; render(false);
+  }
   if(millis()-lastFetch>=(unsigned long)S.refresh*1000){ lastFetch=millis(); fetchUsage(); render(false); }
 }

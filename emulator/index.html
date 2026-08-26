@@ -5,9 +5,10 @@ canvas{image-rendering:pixelated;width:480px;height:480px;display:block}
 #ctl{color:#ddd;font-size:13px}textarea{width:320px;height:300px;background:#111;color:#0f0;border:1px solid #444}</style>
 </head><body>
 <div id=wrap><canvas id=c width=240 height=240></canvas></div>
-<div id=ctl><b>live from collector</b> &middot; metric <span id=mi>0</span>
+<div id=ctl><b>live from collector</b> &middot; metric <span id=mi>0</span> &middot; <span id=acclbl>account</span>
 <br><textarea id=d></textarea><br><button onclick=render()>Render</button> <button onclick=step()>Next metric</button>
-<button onclick="data.auth=(data.auth=='dead'?'ok':'dead');document.getElementById('d').value=JSON.stringify(data,null,1);render()">Toggle auth-dead</button></div>
+<button onclick=stepAcct()>Next account</button>
+<button onclick="toggleDead()">Toggle auth-dead</button></div>
 <script>
 const C={bg:'#000000',panel:'#171f2e',line:'#2c374a',coral:'#ff7a55',cyan:'#3fd2dd',white:'#ffffff',
 gray:'#a4b0c2',dim:'#74859b',green:'#54d36e',amber:'#f0ad36',red:'#ff4d68',sky:'#84cdf2'};
@@ -25,8 +26,27 @@ const UCX=8,UCY=28,UCW=224,UCH=84,LCX=64,RCX=176, WCX=8,WCY=118,WCW=224,WCH=54, 
 // week 84.5..153.5; fable 160.5..229.5; reset "Dec 30 12:59pm"=134px -> 90..224. All clear.
 const FDIV=82,FSCX=45,FWCX=119,FFCX=195,FRSTX=157;
 let data={s:7,w:2,sr:"6:30pm",wr:"Jun 15 10am",haveData:true,city:"Melbourne",wc:"Overcast",
- wt:16,wfl:14,whi:16,wlo:13,wrain:100,whum:82,time:"13:48:50",date:"Sat 13 Jun",conn:1,auth:"ok",age:120};
-let mi=0;
+ wt:16,wfl:14,whi:16,wlo:13,wrain:100,whum:82,time:"13:48:50",date:"Sat 13 Jun",conn:1,auth:"ok",age:120,
+ acc:[{l:"WORK",auth:"ok",s:74,w:30,sr:"6:29pm",wr:"Aug 27 10:59am",f:16,fl:"FABLE"},
+      {l:"PERSONAL",auth:"ok",s:1,w:76,sr:"8:49pm",wr:"Aug 31 9:59am",f:51,fl:"FABLE"}]};
+let mi=0,ai=0;
+// The card renders ONE account at a time and the display cycles through them (same turntable
+// the weather metrics use). acc[] is the multi-account payload; the flat keys are the
+// single-account fallback, so an older collector still renders.
+function nacc(){return (data.acc&&data.acc.length)?data.acc.length:1;}
+function A(){
+ const a=(data.acc&&data.acc.length)?data.acc[ai%data.acc.length]:data;
+ return {s:a.s,w:a.w,f:(a.f==null?-1:a.f),fl:a.fl||'',sr:a.sr||'',wr:a.wr||'',
+         auth:a.auth||data.auth||'ok',l:a.l||''};
+}
+function stepAcct(){ai=(ai+1)%nacc();render();}
+function acclbl(){const e=document.getElementById('acclbl');if(e)e.textContent=(A().l||'single')+' ('+(ai%nacc()+1)+'/'+nacc()+')';}
+// auth is per account: one dead login takes over ITS card in the cycle, the others keep showing.
+function toggleDead(){
+ const a=(data.acc&&data.acc.length)?data.acc[ai%data.acc.length]:data;
+ a.auth=(a.auth=='dead')?'ok':'dead';
+ document.getElementById('d').value=JSON.stringify(data,null,1);render();
+}
 document.getElementById('d').value=JSON.stringify(data,null,1);
 const x=document.getElementById('c').getContext('2d');
 const logoImg=new Image(); logoImg.src='labs-icon.svg'; logoImg.onload=render;
@@ -47,20 +67,20 @@ function metrics(d){return [['NOW',d.wt,'°'],['FEELS',d.wfl,'°'],['HIGH',d.whi
 function step(){mi=(mi+1)%6;document.getElementById('mi').textContent=mi;render();}
 function usageCard(){
  rr(UCX,UCY,UCW,UCH,10,C.panel);
- if((data.f==null?-1:data.f)>=0) usageCard3(); else usageCard2();
+ if(A().f>=0) usageCard3(); else usageCard2();
 }
 function vline(px){x.strokeStyle=C.line;x.lineWidth=1;x.beginPath();x.moveTo(px+0.5,UCY+14);x.lineTo(px+0.5,UCY+UCH-14);x.stroke();}
 function usageCard2(){   // classic 2-col — account has no model-scoped weekly limit
- vline(120);
- col(LCX,"SESSION",data.haveData?data.s:-1,data.sr||"idle");
- col(RCX,"WEEK",data.haveData?data.w:-1,data.wr||"--");
+ const a=A(); vline(120);
+ col(LCX,"SESSION",data.haveData?a.s:-1,a.sr||"idle");
+ col(RCX,"WEEK",data.haveData?a.w:-1,a.wr||"--");
 }
 function usageCard3(){   // S (5h) | W + F (7d) sharing ONE reset — three Bold18 heroes
- vline(FDIV);
- col(FSCX,"S",data.haveData?data.s:-1,data.sr||"idle");
- num(FWCX,"W",data.haveData?data.w:-1);
- num(FFCX,(data.fl||"F")[0],data.haveData?data.f:-1);   // first letter of the scoped-model name
- if(data.wr)T(data.wr,FRSTX,UCY+72,F.tiny,C.dim,'center');   // no "resets" prefix — 174px wouldn't fit
+ const a=A(); vline(FDIV);
+ col(FSCX,"S",data.haveData?a.s:-1,a.sr||"idle");
+ num(FWCX,"W",data.haveData?a.w:-1);
+ num(FFCX,(a.fl||"F")[0],data.haveData?a.f:-1);   // first letter of the scoped-model name
+ if(a.wr)T(a.wr,FRSTX,UCY+72,F.tiny,C.dim,'center');   // no "resets" prefix — 174px wouldn't fit
 }
 function pctStr(p){return p<0?"--":(p==100?"100":p+"%");}   // 100 drops the % (width, see geometry note)
 function col(cx,label,pct,reset){
@@ -89,20 +109,38 @@ function weatherCard(){
    x.strokeStyle=C.white;x.lineWidth=1.5;x.beginPath();x.arc(WCX+WCW-16,WCY+29,3,0,7);x.stroke();}
  else T(val+m[2],WCX+WCW-14,WCY+37,F.b12,C.white,'right');
 }
+// Header: one account keeps the original "CLAUDE USAGE" title; two or more replace it with the
+// account label (the title is decoration once the card is per-account) plus page dots, so you
+// always know which account the numbers belong to. "PERSONAL"@Bold12 = 132px from x=26 -> 158,
+// clear of the dots, which are right-aligned to end at 232.
+function header(){
+ rr(12,12,9,9,2,C.coral);
+ const n=nacc(),a=A();
+ if(n<2){T("CLAUDE USAGE",26,18,F.b12,C.white,'left');return;}
+ T(a.l||"ACCOUNT",26,18,F.b12,C.coral,'left');
+ for(let i=0;i<n;i++){const cx=232-(n-1-i)*10;
+  x.fillStyle=(i==ai%n)?C.white:C.line;x.beginPath();x.arc(cx,17,3,0,7);x.fill();}
+}
 function render(){
  try{data=JSON.parse(document.getElementById('d').value);}catch(e){}
  x.fillStyle=C.bg;x.fillRect(0,0,240,240);
- rr(12,12,9,9,2,C.coral);
- T("CLAUDE USAGE",26,18,F.b12,C.white,'left');
- (data.auth=='dead'?errorCard:usageCard)(); weatherCard();
+ header();
+ const auth=A().auth;
+ (auth=='dead'?errorCard:usageCard)(); weatherCard();
  T(data.time,16,TIMEY,F.b18,C.white,'left');
- x.fillStyle=(data.conn!=1||data.auth=='dead')?C.red:(data.auth=='pending'?C.amber:C.green);x.beginPath();x.arc(18,DATEY,3,0,7);x.fill();
+ x.fillStyle=(data.conn!=1||auth=='dead')?C.red:(auth=='pending'?C.amber:C.green);x.beginPath();x.arc(18,DATEY,3,0,7);x.fill();
  T(data.date,28,DATEY,F.s9,C.gray,'left');
  if(logoImg.complete)x.drawImage(logoImg,186,184,48,48);
+ acclbl();
 }
-function pull(){fetch('http://10.0.0.5:8088/usage').then(r=>r.json()).then(s=>{const d=new Date();
+const COLLECTOR=(new URLSearchParams(location.search)).get('c')||'http://10.0.0.5:8088';
+function pull(){fetch(COLLECTOR+'/usage').then(r=>r.json()).then(s=>{const d=new Date();
  data=Object.assign(data,{s:s.s,w:s.w,f:(s.f==null?-1:s.f),fl:s.fl||'',sr:s.sr,wr:s.wr,haveData:!!s.ok,auth:s.auth||'ok',age:s.age,city:s.city,wc:s.wc,wt:s.wt,wfl:s.wfl,whi:s.whi,wlo:s.wlo,wrain:s.wrain,whum:s.whum,
+  // acc[] is the multi-account array; fall back to a single synthetic account off the flat keys
+  acc:(s.acc&&s.acc.length)?s.acc:[{l:'',auth:s.auth||'ok',s:s.s,w:s.w,sr:s.sr,wr:s.wr,f:(s.f==null?-1:s.f),fl:s.fl||''}],
   time:d.toTimeString().slice(0,8),date:d.toLocaleDateString('en-AU',{weekday:'short',day:'2-digit',month:'short'})});
+ if(ai>=nacc())ai=0;
  document.getElementById('d').value=JSON.stringify(data,null,1);render();}).catch(e=>render())}
 pull(); setInterval(()=>{mi=(mi+1)%6;document.getElementById('mi').textContent=mi;pull();},4000);
+setInterval(()=>{if(nacc()>1){ai=(ai+1)%nacc();render();}},5000);   // account turntable
 </script></body></html>
