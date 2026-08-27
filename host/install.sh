@@ -49,35 +49,32 @@ have systemctl || die "systemd not found. Run the collector manually: python3 $D
 PY="$(command -v python3)"
 c "✓ python3, curl, systemd present" ok
 
-# --- accounts backend ---------------------------------------------------------------
-# Multiple accounts are served by claude-swap (cswap), which already owns multi-account
-# credential storage, token keeping and per-account usage polling. Installed into a venv beside
-# the collector unless it is already on PATH or CLAUDETV_CSWAP=0 opts out; without it the
-# collector runs its own single-account OAuth keeper exactly as before.
-if [ "${CLAUDETV_CSWAP:-1}" = "1" ] && ! have cswap && [ ! -x "$DEST/venv/bin/cswap" ]; then
-  c "➤ Installing claude-swap (multi-account backend) into $DEST/venv" info
+# --- accounts backend: claude-swap (REQUIRED) --------------------------------------
+# ClaudeTV reads every Claude account from claude-swap (cswap): one account or twelve, same
+# path. cswap owns credential storage, token upkeep and per-account usage polling, so the
+# collector holds no Claude token and runs no OAuth of its own.
+if ! have cswap && [ ! -x "$DEST/venv/bin/cswap" ]; then
+  c "-> Installing claude-swap (required) into $DEST/venv" info
   "$PY" -m venv "$DEST/venv" 2>/dev/null || { pkg_install python3-venv && "$PY" -m venv "$DEST/venv"; }
-  if ! "$DEST/venv/bin/pip" install -q --upgrade pip claude-swap; then
-    # non-fatal: multi-account is an upgrade, not a requirement — the single-account keeper works
-    c "⚠ claude-swap install failed; continuing single-account." warn
-    c "  For multiple accounts install it yourself:  pipx install claude-swap" warn
-    rm -rf "$DEST/venv"
-  fi
+  "$DEST/venv/bin/pip" install -q --upgrade pip claude-swap || die "claude-swap install failed. Install it yourself (pipx install claude-swap) and re-run."
 fi
 CSWAP="$(command -v cswap || true)"
 [ -x "$DEST/venv/bin/cswap" ] && CSWAP="$DEST/venv/bin/cswap"
+[ -n "$CSWAP" ] || die "claude-swap not found after install."
+c "OK claude-swap: $("$CSWAP" --version 2>/dev/null || echo present)" ok
 
-if [ -n "$CSWAP" ] && [ "$("$CSWAP" list --json 2>/dev/null | grep -c '"email"')" -gt 0 ]; then
-  c "✓ cswap found with accounts — the display will cycle through all of them" ok
-elif [ -n "$CSWAP" ]; then
-  c "⚠ cswap installed but has no accounts yet. Add each one:" warn
-  c "    log in to Claude Code as that account, then:  $CSWAP add --alias <name>" warn
-elif [ -f "$DEST/credentials.json" ] || [ -f "$HOME/.claude/.credentials.json" ]; then
-  c "✓ Claude credentials found (the keeper will keep them fresh)" ok
-  c "  For MULTIPLE accounts, re-run with:  CLAUDETV_CSWAP=1 bash install.sh" info
+if [ "$("$CSWAP" list --json 2>/dev/null | grep -c '"email"')" -gt 0 ]; then
+  c "OK accounts registered; the display cycles through all of them" ok
 else
-  c "⚠ No Claude credentials yet. After install, log in once with:" warn
-  c "    python3 $DEST/claude_usage_server.py --login" warn
+  c "" ; c "!  No accounts registered yet. For EACH Claude account:" warn
+  if [ -f "$HOME/.claude/.credentials.json" ]; then
+    c "    $CSWAP add --alias <name>          # adopts the login already on this box" warn
+  else
+    c "    python3 $DEST/claude_usage_server.py --login   # mint a login (headless-friendly)" warn
+    c "    $CSWAP add --alias <name>                      # hand it to claude-swap" warn
+  fi
+  c "  Log in separately on each machine: refresh tokens rotate, so a shared login gets" warn
+  c "  one side quarantined." warn
 fi
 
 # --- idempotent: stop any existing instance before swapping files ---

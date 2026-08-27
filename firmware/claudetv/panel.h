@@ -12,6 +12,10 @@ button{cursor:pointer;width:100%}.grid{display:grid;grid-template-columns:1fr 1f
 button.ghost{background:#1c2331;border:1px solid #2c374a}code{background:#0d1119;border:1px solid #2c374a;border-radius:6px;padding:2px 6px;font-size:12px}
 </style></head><body>
 <h1>Claude<span class=coral>TV</span> <span class=muted id=ver></span></h1>
+<div class=card id=updcard style="display:none;border:1px solid #3fd2dd">
+<b style="color:#3fd2dd">Firmware update available</b>
+<div class=muted style="margin-top:6px">Take it from the Master Terminal on your collector host: it downloads the release and flashes this device over the LAN, no cable or download needed.</div>
+<button class=ghost style="margin-top:8px" onclick="fetch('/state').then(r=>r.json()).then(s=>window.open(s.terminal||'/','_blank'))">Open Master Terminal &#8599;</button></div>
 <div class=card><div class=row><span class=muted id=acclbl></span><span class=muted id=accn></span></div>
 <div class=row><span>Session (5h)</span><span class=big id=sess>--</span></div><div class=muted id=sessr></div>
 <div class=row><span>Week (7d)</span><span class=big id=week>--</span></div><div class=muted id=weekr></div>
@@ -41,12 +45,14 @@ function load(){fetch('/state').then(r=>r.json()).then(s=>{ver.textContent='v'+s
 // the card mirrors whichever account is on screen right now; the list below shows them all
 acclbl.textContent=s.label||'';accn.textContent=(s.nacc>1)?((s.acci+1)+'/'+s.nacc):'';
 acccard.style.display=(s.nacc>1)?'':'none';acyc.value=s.acyc;
+updcard.style.display=s.up?'':'none';
 acclist.innerHTML=(s.acc||[]).map((a,i)=>'<div class=row style=margin:2px:0><span>'+((i==s.acci)?'&#9679; ':'&#9675; ')
  +(a.l||('acct'+(i+1)))+(a.auth==2?' <span style=color:#ff4d68>expired</span>':'')+'</span><span>'
- +a.s+'% &middot; '+a.w+'%'+(a.f>=0?(' &middot; '+a.f+'%'):'')+'</span></div>').join('');
-sess.textContent=s.haveData?s.s+'%':'--';sessr.textContent=s.sr?('resets '+s.sr):'idle';
-week.textContent=s.haveData?s.w+'%':'--';weekr.textContent=s.wr?('resets '+s.wr):'';
-if(s.f>=0){fablerow.style.display='';fablelbl.textContent=(s.fl||'Fable')+' (7d)';fable.textContent=s.haveData?s.f+'%':'--';}else fablerow.style.display='none';
+ +pc(a.s)+' &middot; '+pc(a.w)+(a.f>=0?(' &middot; '+pc(a.f)):'')+'</span></div>').join('');
+const pc=v=>(v==null||v<0)?'--':v+'%';   // -1 = no reading; never render '-1%'
+sess.textContent=s.haveData?pc(s.s):'--';sessr.textContent=s.sr?('resets '+s.sr):'idle';
+week.textContent=s.haveData?pc(s.w):'--';weekr.textContent=s.wr?('resets '+s.wr):'';
+if(s.f>=0){fablerow.style.display='';fablelbl.textContent=(s.fl||'Fable')+' (7d)';fable.textContent=s.haveData?pc(s.f):'--';}else fablerow.style.display='none';
 wx.textContent=s.city+' '+s.wt+'°C '+s.wc;clock.textContent=s.time;
 bri.value=s.bri;bril.textContent=s.bri+'%';nEn.checked=s.ne;nStart.value=s.ns;nEnd.value=s.nf;nBri.value=s.nb;nbril.textContent=s.nb+'%';refresh.value=s.refresh;
 if(document.activeElement!==usage)usage.value=s.usage||'';
