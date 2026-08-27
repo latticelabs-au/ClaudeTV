@@ -23,7 +23,7 @@
 #include "panel.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "5.0"
+#define FW_VER  "5.1"
 // However many accounts cswap manages, the cycle shows up to this many. Raise freely: the cost
 // is 4 Strings + 4 ints of heap each, and the header switches from page dots to an "i/N"
 // counter past DOTS_MAX so the indicator never grows into the label.
@@ -39,7 +39,7 @@ ESP8266HTTPUpdateServer httpUpdater;
 
 uint16_t C_BG, C_PANEL, C_LINE, C_CORAL, C_CYAN, C_WHITE, C_GRAY, C_DIM, C_GREEN, C_AMBER, C_RED, C_SKY;
 unsigned long lastFetch=0, lastClock=0, lastWx=0, lastAcc=0;
-int connOK=-1, wxIdx=0; bool haveData=false, nightActive=false;
+int connOK=-1, wxIdx=0; bool haveData=false, nightActive=false, updAvail=false, pUpd=false;
 int dataAge=-1, pAuth=-1;
 // One account's usage. The card renders ONE account at a time and the display cycles through
 // them (the same turntable the weather metrics use), so every account keeps the full three
@@ -88,10 +88,21 @@ void drawLogo(){ tft.setSwapBytes(true); tft.pushImage(186,184,LOGO_W,LOGO_H,LOG
 void drawMetric(int cx,const char* label,int pct,const GFXfont* f){
   str(label,cx,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
   char b[8];
-  if(!haveData) strcpy(b,"--");
+  // pct<0 means the collector had no reading for this window. It must render as "--": the
+  // collector deliberately sends -1 rather than inventing a 0, and "-1%" would be a lie.
+  if(!haveData||pct<0) strcpy(b,"--");
   else if(pct==100) strcpy(b,"100");             // no '%': 88px at 18pt won't fit the column
   else snprintf(b,sizeof b,"%d%%",pct);
   str(b,cx,UCY+43,f,lvl(haveData?pct:-1),MC_DATUM,C_PANEL);
+}
+void drawUpdateMark(){
+  // small cyan up-arrow in the card's top-right corner. That corner is deliberately empty in
+  // both layouts (the F column is centred at 195, its number sits at y=76), so this marker
+  // never collides with a metric no matter how wide the numbers get.
+  if(!updAvail) return;
+  int x=UCX+UCW-16, y=UCY+8;
+  tft.fillTriangle(x,y, x-5,y+7, x+5,y+7, C_CYAN);
+  tft.fillRect(x-2,y+7,5,4,C_CYAN);
 }
 void drawUsageCard(){
   Acct& a=A();
@@ -105,20 +116,22 @@ void drawUsageCard(){
     drawMetric(FFCX,fLbl,a.f,&FreeSansBold18pt7b);
     // week + fable share the same 7d window (their resets land ~1s apart) -> ONE reset line
     if(a.wr.length()) str(a.wr.c_str(),FRSTX,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
+    drawUpdateMark();
     return;
   }
   // classic 2-col — account has no model-scoped weekly limit
   tft.drawFastVLine(120,UCY+14,UCH-28,C_LINE);
   // session (left col): reset centered under the column
   str("SESSION",LCX,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
-  char b[8]; if(haveData)snprintf(b,sizeof b,"%d%%",a.s); else strcpy(b,"--");
+  char b[8]; if(haveData&&a.s>=0)snprintf(b,sizeof b,"%d%%",a.s); else strcpy(b,"--");
   str(b,LCX,UCY+43,&FreeSansBold18pt7b,lvl(haveData?a.s:-1),MC_DATUM,C_PANEL);
   str(a.sr.length()?a.sr.c_str():"idle",UCX+12,UCY+67,&FreeSansBold9pt7b,C_DIM,ML_DATUM,C_PANEL);
   // week (right col): reset right-aligned so the wide date+time never crosses the card edge
   str("WEEK",RCX,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
-  if(haveData)snprintf(b,sizeof b,"%d%%",a.w); else strcpy(b,"--");
+  if(haveData&&a.w>=0)snprintf(b,sizeof b,"%d%%",a.w); else strcpy(b,"--");
   str(b,RCX,UCY+43,&FreeSansBold18pt7b,lvl(haveData?a.w:-1),MC_DATUM,C_PANEL);
   str(a.wr.length()?a.wr.c_str():"--",UCX+UCW-12,UCY+67,&FreeSansBold9pt7b,C_DIM,MR_DATUM,C_PANEL);
+  drawUpdateMark();
 }
 void drawWeatherCard(){
   tft.fillRoundRect(WCX,WCY,WCW,WCH,10,C_PANEL);
@@ -142,6 +155,7 @@ void drawUsageError(){          // dead Claude auth -> takeover the hero card (w
   str("re-auth on host",120,UCY+46,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
   char ag[16]; fmtAge(dataAge,ag,sizeof ag);
   if(ag[0]) str(ag,120,UCY+66,&FreeSans9pt7b,C_DIM,MC_DATUM,C_PANEL);
+  drawUpdateMark();
 }
 void drawDot(){ int au=A().auth; uint16_t c=(connOK!=1||au==2)?C_RED:(au==1?C_AMBER:C_GREEN); tft.fillCircle(18,DATE_Y,3,c); }
 void drawClock(){
@@ -178,12 +192,12 @@ void header(){
 }
 void render(bool force){
   Acct& a=A();
-  bool cardChg=force||a.auth!=pAuth||accIdx!=pAcc||a.s!=pS||a.w!=pW||a.f!=pF||a.sr!=pSR||a.wr!=pWR||a.fl!=pFL;
+  bool cardChg=force||a.auth!=pAuth||accIdx!=pAcc||updAvail!=pUpd||a.s!=pS||a.w!=pW||a.f!=pF||a.sr!=pSR||a.wr!=pWR||a.fl!=pFL;
   // nAcc matters on its own: dropping to one account must repaint the title and clear the dots
   bool hdrChg =force||accIdx!=pAcc||nAcc!=pNAcc||a.label!=pLBL;
   bool dotChg =force||connOK!=pConn||a.auth!=pAuth;
   if(hdrChg){ header(); pLBL=a.label; pNAcc=nAcc; }
-  if(cardChg){ if(a.auth==2)drawUsageError(); else drawUsageCard(); pS=a.s;pW=a.w;pF=a.f;pSR=a.sr;pWR=a.wr;pFL=a.fl; }
+  if(cardChg){ if(a.auth==2)drawUsageError(); else drawUsageCard(); pS=a.s;pW=a.w;pF=a.f;pSR=a.sr;pWR=a.wr;pFL=a.fl;pUpd=updAvail; }
   if(dotChg){ drawDot(); pConn=connOK; }
   pAuth=a.auth; pAcc=accIdx;
 }
@@ -210,6 +224,7 @@ void fetchUsage(){
       const char* a=doc["auth"]|"ok";
       int topAuth=(!strcmp(a,"dead"))?2:(!strcmp(a,"pending"))?1:0;
       dataAge=doc["age"]|-1;
+      updAvail=(doc["up"]|0)==1;   // collector found a newer firmware release
       if((doc["ok"]|0)==1){
         haveData=true;
         // Multi-account collector: acc[] carries every account. An older single-account
@@ -254,7 +269,7 @@ void handleState(){
   Acct& a=A();
   d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["auth"]=a.auth; d["age"]=dataAge;
   d["s"]=a.s; d["w"]=a.w; d["f"]=a.f; d["fl"]=a.fl; d["sr"]=a.sr; d["wr"]=a.wr;
-  d["nacc"]=nAcc; d["acci"]=accIdx; d["label"]=a.label;
+  d["nacc"]=nAcc; d["acci"]=accIdx; d["label"]=a.label; d["up"]=updAvail;
   JsonArray ar=d["acc"].to<JsonArray>();
   for(int i=0;i<nAcc&&i<MAXACC;i++){ JsonObject o=ar.add<JsonObject>();
     o["l"]=AC[i].label; o["s"]=AC[i].s; o["w"]=AC[i].w; o["f"]=AC[i].f; o["auth"]=AC[i].auth; }

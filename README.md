@@ -30,9 +30,12 @@ that you reflash **over WiFi — no soldering, fully reversible.**
 - A **GeekMagic SmallTV‑Ultra** (the **ESP8266** model — [~$15 on AliExpress](https://www.aliexpress.com/item/1005007937948865.html)).
 - An **always‑on Linux box** on your LAN (a NAS VM, a Pi, an old laptop). The device can't hold
   your Claude credentials, so this box reads your usage and feeds it to the display over your
-  network, keeping the auth token fresh for you. **Claude Code is not required on this box**:
-  log in once with `python claude_usage_server.py --login` (or reuse an existing Claude Code
-  login if the box has one).
+  network.
+- [**claude-swap**](https://github.com/realiti4/claude-swap) (`cswap`) on that box — the
+  installer sets it up for you. It holds your Claude logins and keeps their tokens fresh,
+  for **one account or a dozen**; ClaudeTV never holds a Claude token itself.
+  **Claude Code is not required**: `python3 claude_usage_server.py --login` mints a login on
+  a headless box, which `cswap add` then adopts.
 
 ---
 
@@ -118,53 +121,36 @@ Your Claude token is **never logged, shown, or sent anywhere except `api.anthrop
 
 ---
 
-## Authentication: one login, lasts forever
+## Authentication
 
-The host authenticates with your **Claude subscription login**, not an API key, and after that one
-login it maintains itself indefinitely. The OAuth access token lives ~8 hours, but the refresh
-token that comes with it carries a **~28‑day validity window that is re‑granted on every refresh**.
-The collector refreshes natively every few hours (a plain HTTPS call to Anthropic's public‑client
-token endpoint, the same one Claude Code uses), so the window keeps rolling and the login never
-ages out. No cron re‑logins, no weekly ritual.
+ClaudeTV holds **no Claude token and runs no OAuth**. [claude-swap](https://github.com/realiti4/claude-swap)
+owns your logins, refreshes them, and quarantines any that genuinely die — for one account
+exactly as for twelve, so there is only ever one code path and nothing that can drift.
 
-Two ways to do the one login:
+You authenticate with your **Claude subscription login**, not an API key. Two things that
+look like they should work but **don't** (save yourself the detour):
 
-- **Standalone (recommended, no Claude Code needed)**: `python claude_usage_server.py --login`
-  prints a URL; open it on any device, sign in to Claude, paste the code back. Credentials land in
-  the collector's own store (`credentials.json` beside the script, chmod 600) and are rotated
-  atomically from then on.
-- **Co‑located Claude Code**: if the box already runs Claude Code, just `/login` there once; the
-  collector reads and maintains `~/.claude/.credentials.json`, writing rotations back in Claude
-  Code's own format so both stay happy.
+- **API keys (`sk-ant-api…`)**: the usage endpoint reports *subscription* limits (5h / 7d /
+  model-scoped), which API-key accounts don't have. Wrong credential entirely.
+- **`claude setup-token`**: that long-lived token is scoped for Claude Code *inference* and
+  is rejected (**403**) by the usage endpoint.
 
-You only re‑login if the credential is **genuinely revoked** (a real 401/403 from the usage
-endpoint, shown as **LOGIN EXPIRED** on the device), not for routine operation.
+If a login really does die, only that account flips to **LOGIN EXPIRED** on the display and
+alerts by name; the others keep showing. Re-register it with `cswap add --alias <name>`.
 
-**Want a hot standby?** Do both logins. Each login is its own independent OAuth token family
-(Anthropic allows concurrent logins), the keeper keeps every family's window rolling, and the
-collector **fails over automatically** if the primary is ever rejected, with an alert on your
-configured channels. Auth outages themselves also alert (dead / failover / recovered), so you
-hear about a needed re‑login from Discord or email within minutes instead of noticing a frozen
-display. The only unfixables: the box being offline for 28+ days, or an account‑wide revocation
-(password change, "log out everywhere"), which kills every family at once.
-
-Two things that look like they should work but **don't** (save yourself the detour):
-
-- **API keys (`sk-ant-api…`)**: the `api/oauth/usage` endpoint reports your *subscription* limits
-  (5h / 7d / model-scoped), which API-key accounts don't have. Wrong credential entirely.
-- **`claude setup-token`**: that long-lived token is scoped for Claude Code *inference* and is
-  rejected (**403**) by the usage endpoint. Use a subscription login as above.
-
+> ⚠️ **Log in separately on every machine.** Refresh tokens rotate, so if two machines hold
+> the *same* login (a `cswap export`/`import`, or a copied credential file) the first one to
+> refresh invalidates the other's copy and that account gets quarantined. Anthropic allows
+> concurrent logins — do one per box.
 ---
 
 ## Multiple accounts
 
-Two accounts, five, a dozen — ClaudeTV shows them all. It reads them from
-[**claude-swap**](https://github.com/realiti4/claude-swap) (`cswap`), which already owns
-multi‑account credential storage, token keeping and per‑account usage polling. The device shows
-**one account at a time and cycles**, so every account keeps the full three‑number card; the
-header carries the account label plus page dots (or a compact `3/8` counter once there are more
-than six).
+One account, five, a dozen — all the same path. ClaudeTV reads every account from
+[**claude-swap**](https://github.com/realiti4/claude-swap) (`cswap`), which owns credential
+storage, token upkeep and per‑account usage polling. With more than one account the device
+shows **one at a time and cycles**, so every account keeps the full three‑number card; the
+header carries the account label plus page dots (or a compact `3/8` counter past six).
 
 ### 1 · Install cswap on the collector host
 
@@ -252,6 +238,12 @@ accounts** in the master terminal if you want it immediately.
   refresh interval, collector URL, reboot, OTA, and a link to the master terminal.
 - **Master terminal** (`http://<host>:8088/`) — live status, **city search** (sets location +
   timezone automatically), token keeper, service control, device link.
+- **In‑app firmware updates** — the master terminal checks GitHub, downloads the release and
+  flashes the device over your LAN in one click. The device shows a small cyan marker when an
+  update is waiting, so you notice without opening anything. No cable, no manual download.
+- **Knows when you are actually blocked** — with auto‑switching, one account capping is a
+  non‑event (cswap moves to another). ClaudeTV alerts only when **every** account is out,
+  judged against cswap's own `autoswitch.threshold` so the two never disagree.
 - **Emulator** (`emulator/index.html`) — a 240×240 browser preview that pulls live collector data
   and positions text with the **device's real GFX font advance tables**, so string widths match the
   ESP render exactly — tweak the layout without reflashing.

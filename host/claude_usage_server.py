@@ -3,24 +3,24 @@
 ClaudeTV collector + Master Terminal.
 
 - Serves the ESP display its data at  GET /usage
-- Serves a branded management terminal at  GET /  (live status, weather/Claude config CRUD,
-  token-keeper status, service control)
-- Polls Anthropic /api/oauth/usage (the Claude Code /usage endpoint) for session/week % plus
-  the model-scoped weekly limit (e.g. Fable) out of limits[], and open-meteo (no key) for
-  weather. Always serves last-good; backs off on HTTP 429.
+- Serves a branded management terminal at  GET /  (accounts, quota, config, service control)
+- Reads every Claude account from claude-swap (cswap) and open-meteo (no key) for weather.
+  Always serves last-good; never fabricates a number it was not given.
 
-TOKEN KEEPER: the Claude OAuth access token is short-lived (~8h) but comes with a refresh
-token whose ~28-day validity window ROLLS FORWARD on every refresh, so one login lasts
-indefinitely as long as the keeper refreshes at least monthly (it refreshes every ~8h). The
-keeper speaks the OAuth refresh grant natively (the same public-client token endpoint Claude
-Code uses) and writes the rotated pair back atomically, so Claude Code is NOT required on this
-box: either reuse a co-located Claude Code login (~/.claude/.credentials.json) or run
-`python claude_usage_server.py --login` once to mint the collector's own credentials.
-The token is NEVER logged, shown, or sent anywhere but Anthropic.
+ACCOUNTS: claude-swap is the SINGLE source, for one account or twelve. It owns credential
+storage, token upkeep and per-account usage polling, so this collector holds no Claude
+token and runs no OAuth at runtime — there is exactly one code path and nothing that could
+rotate a token family cswap also owns. `--login` remains only as a one-time ENROLLMENT
+helper for a headless box with no Claude Code: it mints a credential that `cswap add`
+then adopts, and plays no part in steady-state operation.
+
+QUOTA: with auto-switching, one account hitting its cap is a non-event — cswap moves to
+another. The state worth alerting on is every account being out at once, judged against
+cswap's own autoswitch.threshold so the two never disagree.
 
 Config is read from environment / a .env beside this file and is editable from the terminal.
 """
-import base64, hashlib, json, os, secrets, shutil, subprocess, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
+import base64, hashlib, json, os, re, secrets, shutil, subprocess, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -31,13 +31,12 @@ except Exception:
     def TZ(): return None
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 START_TS = time.time()
 
 EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", "DEVICE_URL",
-            "CLAUDE_CREDENTIALS", "REFRESH_MARGIN_MIN",
-            # --- accounts: cswap backend (multi-account) or the native single-account keeper ---
-            "CSWAP_BIN", "CSWAP_ACCOUNTS", "ACCOUNT_LABEL",
+            # --- accounts: claude-swap is the single source, for one account or many ---
+            "CSWAP_BIN", "CSWAP_ACCOUNTS", "UPDATE_EVERY",
+            "NOTIFY_FLEET_MAXED", "MAXED_THRESHOLD",
             # --- reset notifications (non-secret; secrets live in SECRET_KEYS below) ---
             "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_AUTH",
             "NOTIFY_EMAIL",
@@ -51,8 +50,9 @@ DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Au
             # a given account lands every ~N polls: 90s keeps two accounts under ~3 min stale.
             "USAGE_EVERY": "90", "WEATHER_EVERY": "900", "PORT": "8088",
             "DEVICE_URL": "http://claudetv.local",
-            "CLAUDE_CREDENTIALS": "", "REFRESH_MARGIN_MIN": "30",
-            "CSWAP_BIN": "", "CSWAP_ACCOUNTS": "", "ACCOUNT_LABEL": "CLAUDE",
+            "CSWAP_BIN": "", "CSWAP_ACCOUNTS": "", "UPDATE_EVERY": "21600",
+            # blank threshold = follow cswap's own autoswitch.threshold
+            "NOTIFY_FLEET_MAXED": "true", "MAXED_THRESHOLD": "",
             "NOTIFY_SESSION_RESET": "false", "NOTIFY_SESSION_MAXED": "false",
             "NOTIFY_WEEK_RESET": "false", "NOTIFY_AUTH": "true", "NOTIFY_EMAIL": "false",
             "SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls", "SMTP_FROM": "",
@@ -74,7 +74,6 @@ def load_config():
                 if k in DEFAULTS: env[k] = v.strip()
     for k in DEFAULTS:
         ev = os.environ.get("CLAUDETV_" + k)
-        if ev is None and k == "CLAUDE_CREDENTIALS": ev = os.environ.get(k)
         if ev: env[k] = ev
     return env
 
@@ -88,26 +87,16 @@ def save_config(updates):
     with open(ENV_PATH, "w", encoding="utf-8") as f:
         f.write("# ClaudeTV collector config (managed by the master terminal)\n")
         for k in EDITABLE + SECRET_KEYS:
-            key = k if k == "CLAUDE_CREDENTIALS" else "CLAUDETV_" + k
+            key = "CLAUDETV_" + k
             f.write("%s=%s\n" % (key, CONFIG.get(k, "")))
     try: os.chmod(ENV_PATH, 0o600)                      # .env now holds webhook URLs + SMTP pass
     except OSError: pass
 
 CONFIG = load_config()
 PORT = int(CONFIG["PORT"])
-# Credential store resolution: an explicit config path wins; else the collector's own store
-# (created by --login, lives beside .env so it follows the install dir); else a co-located
-# Claude Code login. Both stores use Claude Code's {"claudeAiOauth": {...}} format.
-CRED_OWN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
-CRED_CLAUDE_CODE = os.path.expanduser("~/.claude/.credentials.json")
-def cred_stores():
-    """Ordered list of available credential stores. When BOTH exist they are independent OAuth
-    token families for the same account (Anthropic allows concurrent logins), giving a hot
-    standby: the keeper keeps every family's rolling window fresh and the poller fails over
-    if the primary is rejected. An explicit config path pins a single store."""
-    if CONFIG["CLAUDE_CREDENTIALS"]: return [os.path.expanduser(CONFIG["CLAUDE_CREDENTIALS"])]
-    return [p for p in (CRED_OWN, CRED_CLAUDE_CODE) if os.path.exists(p)] or [CRED_CLAUDE_CODE]
-def cred_path(): return cred_stores()[0]
+# Where `--login` drops a freshly minted credential for `cswap add` to adopt: Claude Code's
+# own {"claudeAiOauth": {...}} format in its own location, because that is what cswap reads.
+CRED_OWN = os.path.expanduser("~/.claude/.credentials.json")
 def wx_url(): return ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
     "&current=temperature_2m,weather_code,apparent_temperature,relative_humidity_2m"
     "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1"
@@ -116,22 +105,13 @@ def wx_url(): return ("https://api.open-meteo.com/v1/forecast?latitude=%s&longit
 _lock = threading.Lock()
 _accounts = []        # ordered account records; see cswap_accounts_from_json for the shape
 _usage_ts = 0; _usage_err = "starting"; _wx = None; _wx_err = ""
-_source = ""          # "cswap" (multi-account) or "native" (single-account OAuth keeper)
-_source_err = ""      # why cswap was not used, surfaced in the terminal
-_last_refresh = 0; _refresh_err = ""; _refreshing = False; _auth_dead = False
-_cred_used = ""       # store that served the last successful poll (standby detection + display)
+_source_err = ""      # why cswap could not be read, surfaced in the dashboards
 _alerted = {}         # per-account: one auth-dead alert per outage episode
 _migrated = False     # legacy single-account notify state re-homed onto the primary account
+_fleet = {}           # last fleet verdict, surfaced in the terminal and the device payload
 _force_poll = False   # dashboards can demand an immediate re-read instead of waiting for the timer
 
-# ---------- token keeper ----------
-def _creds(path=None):
-    p = path or cred_path()
-    for _ in range(3):
-        try: return json.load(open(p, encoding="utf-8"))["claudeAiOauth"]
-        except Exception: time.sleep(0.2)
-    return json.load(open(p, encoding="utf-8"))["claudeAiOauth"]
-
+# ---------- one-time login helper (enrollment only; cswap owns all upkeep) ----------
 # Anthropic's public OAuth client (the one Claude Code itself uses). Not a secret: it is a
 # public PKCE client id, the same value shipped in every Claude Code install.
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -171,96 +151,6 @@ def _write_creds(resp, path):
     with os.fdopen(fd, "w", encoding="utf-8") as f: json.dump(full, f)
     os.replace(tmp, path)
 
-def refresh_token(reason="", path=None):
-    """Refresh the OAuth access token NATIVELY via the token endpoint (no Claude Code needed) and
-    write the rotated pair back. The refresh token's ~28-day window rolls forward on every refresh,
-    so this keeps one login alive indefinitely. Returns True on success. Does NOT decide auth-dead:
-    that is driven solely by whether the USAGE endpoint accepts the token."""
-    global _last_refresh, _refresh_err, _refreshing
-    if _refreshing: return False
-    _refreshing = True
-    try:
-        path = path or cred_path()
-        try:
-            rt = _creds(path).get("refreshToken")
-        except Exception as e:
-            _refresh_err = "credentials unreadable: %s" % str(e)[:40]; return False
-        if not rt:
-            _refresh_err = "no refresh token in credentials (log in again)"; return False
-        for attempt in (1, 2):
-            try:
-                resp = _oauth_post({"grant_type": "refresh_token", "refresh_token": rt,
-                                    "client_id": OAUTH_CLIENT_ID})
-            except urllib.error.HTTPError as e:
-                body = ""
-                try: body = e.read().decode()[:200]
-                except Exception: pass
-                if e.code == 400 and "invalid_grant" in body and attempt == 1:
-                    # Someone else (e.g. an interactive Claude Code session) may have rotated the
-                    # pair after we read it; re-read the file and retry once with the newer token.
-                    try: nrt = _creds(path).get("refreshToken")
-                    except Exception: nrt = None
-                    if nrt and nrt != rt:
-                        rt = nrt; continue
-                _refresh_err = "refresh http %d%s" % (e.code, " (re-login needed)" if e.code == 400 else "")
-                print("[%s] token refresh: %s" % (time.strftime("%H:%M:%S"), _refresh_err)); return False
-            except Exception as e:
-                _refresh_err = "refresh: %s" % str(e)[:50]; return False
-            _write_creds(resp, path)
-            _last_refresh = int(time.time()); _refresh_err = ""
-            print("[%s] token refreshed (%s) valid +%dm, refresh window +%dd" % (
-                time.strftime("%H:%M:%S"), reason or "keeper", int(resp.get("expires_in", 0)) / 60,
-                int(resp.get("refresh_token_expires_in", 0)) / 86400))
-            return True
-        return False
-    finally:
-        _refreshing = False
-
-def keeper():
-    while True:
-        try:
-            # cswap owns credential storage and rotation for its accounts. Refresh tokens ROTATE:
-            # a second keeper refreshing the same family invalidates cswap's copy and gets the
-            # account quarantined, so stand fully down in cswap mode and touch no credential file.
-            if _source == "cswap":
-                time.sleep(300); continue
-            if not _source and cswap_bin():     # source undecided at startup and cswap is present
-                time.sleep(5); continue         # -> wait for the first poll to settle it
-            margin = int(CONFIG["REFRESH_MARGIN_MIN"]) * 60 * 1000
-            for path in cred_stores():                  # keep EVERY family's rolling window fresh
-                if not os.path.exists(path): continue
-                try: c = _creds(path)
-                except Exception: continue
-                # only refresh a token that HAS a refresh token; a long-lived token (no
-                # refreshToken) needs no keeping alive, so don't hit the token endpoint pointlessly.
-                if not c.get("refreshToken"): continue
-                exp = int(c.get("expiresAt", 0)); rt_exp = int(c.get("refreshTokenExpiresAt", 0))
-                # refresh near access-token expiry, and ALSO if the ~28-day refresh window has
-                # somehow run below 21 days: it re-arms to ~28d on every refresh, so a low window
-                # means refreshes have been stuck (stale expiresAt, clock skew) and must not wait.
-                if (exp == 0 or (exp - time.time() * 1000) < margin) or \
-                   (rt_exp and (rt_exp - time.time() * 1000) < 21 * 86400 * 1000):
-                    refresh_token("proactive", path)
-        except Exception as e:
-            print("[%s] keeper error: %s" % (time.strftime("%H:%M:%S"), e))
-        time.sleep(900 if _auth_dead else 120)
-
-def token_status():
-    try:
-        c = _creds(); exp = c.get("expiresAt", 0) / 1000.0
-        if exp and exp < time.time(): return "expired", c.get("subscriptionType", "?"), 0
-        return "valid", c.get("subscriptionType", "?"), int(exp - time.time()) if exp else 0
-    except Exception as e:
-        return "missing", str(e)[:40], 0
-
-def auth_state():
-    """Compact state the device reacts to: ok | dead | pending.
-    dead    = the usage endpoint rejected the token (401/403) -> log in again on the host
-              (`--login`, or `claude /login` when co-located with Claude Code).
-    pending = token expired/missing but the keeper may still recover it (transient)."""
-    if _auth_dead: return "dead"
-    return "ok" if token_status()[0] == "valid" else "pending"
-
 # ---------- data fetchers ----------
 def _clock(dt): h = dt.hour % 12 or 12; return "%d:%02d%s" % (h, dt.minute, "am" if dt.hour < 12 else "pm")
 def _clock_short(dt):
@@ -271,56 +161,6 @@ def _parse(iso):
     if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
     tz = TZ(); return dt.astimezone(tz) if tz else dt.astimezone()
 
-def _scoped_weekly(data):
-    """The model-scoped weekly limit (e.g. Fable), read GENERICALLY out of limits[].
-    There is no top-level key for it — seven_day_opus/seven_day_sonnet are a different
-    (null) thing. Shape: {kind:'weekly_scoped', percent, scope:{model:{display_name}}}.
-    It shares the seven_day reset window (they land 1s apart), so it needs no own reset.
-    Returns (percent, LABEL) or (-1, "") when the account has no scoped limit."""
-    for lim in (data.get("limits") or []):
-        if lim.get("kind") != "weekly_scoped": continue
-        pct = lim.get("percent")
-        if pct is None: continue
-        name = (((lim.get("scope") or {}).get("model") or {}).get("display_name") or "").strip()
-        return round(float(pct)), name.upper()[:7]
-    return -1, ""
-
-def fetch_usage():
-    """Poll the usage endpoint, failing over across credential stores: if the primary family is
-    rejected (401/403) and a standby store exists, try it before giving up. Whichever store
-    answers becomes _cred_used; dropping to a standby fires a one-shot alert."""
-    global _cred_used
-    stores = cred_stores(); data = None; served = None; last = None
-    for i, path in enumerate(stores):
-        try:
-            tok = _creds(path)["accessToken"]
-        except Exception as e:
-            last = e; continue
-        req = urllib.request.Request(USAGE_URL, headers={"Authorization": "Bearer " + tok,
-            "Content-Type": "application/json", "Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=8) as r: data = json.loads(r.read().decode())
-            served = path; break
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code in (401, 403) and i < len(stores) - 1:
-                print("[%s] store rejected (http %d), trying standby: %s" % (
-                    time.strftime("%H:%M:%S"), e.code, stores[i + 1])); continue
-            raise
-    if data is None: raise last if last else RuntimeError("no credential store")
-    if served != stores[0] and _cred_used != served:
-        _auth_alert("standby", "Anthropic rejected the primary Claude login; the display is now "
-                    "running on the standby login (%s). Everything keeps working, but re-login "
-                    "the primary when convenient." % served)
-    _cred_used = served
-    fh, sw = data.get("five_hour") or {}, data.get("seven_day") or {}
-    out = {"s": round(float(fh.get("utilization", 0))), "w": round(float(sw.get("utilization", 0))), "sr": "", "wr": ""}
-    if fh.get("resets_at"): out["sr"] = _clock(_parse(fh["resets_at"]))
-    if sw.get("resets_at"):
-        d = _parse(sw["resets_at"]); out["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
-    out["f"], out["fl"] = _scoped_weekly(data)
-    return out, {"session": fh.get("resets_at"), "week": sw.get("resets_at")}
-
 # ---------- accounts: cswap backend (multi-account) + native single-account fallback ----------
 # cswap (github.com/realiti4/claude-swap) already owns multi-account credential storage, token
 # keeping and per-account usage polling, and publishes all of it as `cswap list --json`. When it
@@ -329,6 +169,19 @@ def fetch_usage():
 # single account, so an existing install keeps working untouched after an upgrade.
 CSWAP_SCHEMA = 1
 LABEL_MAX = 8                      # "PERSONAL" — the widest label the device header fits
+
+# cswap's usageStatus vocabulary (claude_swap/json_output.py: usage_fields). Two things matter:
+# `usage` is None for EVERY status except ok (display numbers move to lastGoodUsage), and only
+# some statuses actually need a human:
+#   ok                   usage present
+#   token_expired        transient — cswap defers the refresh and retries automatically
+#   api_key              managed API-key account: no subscription quota exists at all
+#   keychain_unavailable transient — the active keychain is unreadable
+#   foreign_credential   transient — the live credential belongs to another account mid-switch,
+#                        "a switch repairs the drift". This is the ordinary `cswap auto` window.
+#   unavailable/unknown/error   transient — the usage fetch failed
+#   relogin_required / no_credentials / expired   genuinely needs a human to log in again
+CSWAP_DEAD = {"relogin_required", "no_credentials", "expired"}
 
 def cswap_bin():
     """Configured path, else a venv beside this script, else the first `cswap` on PATH."""
@@ -339,10 +192,6 @@ def cswap_bin():
                  os.path.join(here, "venv", "Scripts", "cswap.exe")):
         if os.path.exists(cand): return cand
     return shutil.which("cswap") or ""
-
-def pick_source(cswap_ok):
-    """Backend selection, in one place: cswap when it answers with accounts, else native."""
-    return "cswap" if cswap_ok else "native"
 
 _cswap_ver = {"bin": "", "ver": ""}
 def cswap_version():
@@ -380,24 +229,37 @@ def cswap_accounts_from_json(doc, only=""):
         raise ValueError("unsupported cswap schemaVersion %r (expected %d)" % (ver, CSWAP_SCHEMA))
     recs, match = [], []
     for a in doc.get("accounts") or []:
-        usage = a.get("usage") or {}
-        fh, sd = usage.get("fiveHour") or {}, usage.get("sevenDay") or {}
+        status = (a.get("usageStatus") or "ok").strip().lower()
+        # usage is None for EVERY non-ok status; display-grade numbers move to lastGoodUsage.
+        usage = a.get("usage")
+        stale = not isinstance(usage, dict)
+        if stale: usage = a.get("lastGoodUsage") or {}
+        fh, sd = usage.get("fiveHour"), usage.get("sevenDay")
+        # usage_to_json emits fiveHour/sevenDay/scoped ONLY when present, so an ok row can still
+        # be partial. Treat that as stale too: coercing an absent window to 0% is exactly what
+        # made a routine `cswap` account switch look like a 100%-to-0% Anthropic "gift" reset.
+        if not isinstance(fh, dict) or not isinstance(sd, dict): stale = True
+        fh, sd = fh or {}, sd or {}
         scoped = next((x for x in (usage.get("scoped") or []) if _pct(x) is not None), None)
-        u = {"s": _pct(fh) or 0, "w": _pct(sd) or 0, "sr": "", "wr": "",
+        s_pct, w_pct = _pct(fh), _pct(sd)
+        # -1 means "not known", never 0. Nothing downstream may invent a number it was not given.
+        u = {"s": s_pct if s_pct is not None else -1,
+             "w": w_pct if w_pct is not None else -1, "sr": "", "wr": "",
              "f": _pct(scoped) if scoped else -1,
              "fl": (scoped.get("name") or "").strip().upper()[:7] if scoped else ""}
         if fh.get("resetsAt"): u["sr"] = _clock(_parse(fh["resetsAt"]))
         if sd.get("resetsAt"):
             d = _parse(sd["resetsAt"]); u["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
-        status = (a.get("usageStatus") or "ok").strip().lower()
         email, num = a.get("email") or "", a.get("number", "?")
         recs.append({"key": "%s:%s" % (num, email), "label": _label(a.get("alias"), email, num),
-                     "email": email, "active": bool(a.get("active")), "u": u,
+                     "email": email, "active": bool(a.get("active")), "u": u, "stale": stale,
+                     "disabled": bool(a.get("disabled")),
                      "resets": {"session": fh.get("resetsAt"), "week": sd.get("resetsAt")},
-                     # cswap reports a quarantined / expired account here; anything but ok means
-                     # that account needs a re-login, which the device renders as LOGIN EXPIRED.
-                     "auth": "ok" if status == "ok" else "dead",
-                     "age": int(a.get("usageAgeSeconds") or 0),
+                     # Only a status that genuinely needs a human is "dead". Transient ones
+                     # (token_expired, foreign_credential mid-switch, unavailable) must NOT
+                     # flip the device to LOGIN EXPIRED or fire an auth alert.
+                     "auth": "dead" if status in CSWAP_DEAD else "ok",
+                     "age": int(a.get("usageAgeSeconds") or a.get("lastGoodAgeSeconds") or 0),
                      "err": "" if status == "ok" else status})
         match.append({str(num), (a.get("alias") or "").lower(), email.lower(),
                       recs[-1]["label"].lower()} - {""})
@@ -410,6 +272,149 @@ def cswap_accounts_from_json(doc, only=""):
                 picked.append(rec); break
     return picked
 
+# ---------- fleet exhaustion (the "you are actually blocked" signal) ----------
+# With cswap auto-switching, ONE account hitting its cap is a non-event: cswap moves to another
+# account and Claude keeps working. The alert that matters is when NO account has headroom left.
+# cswap's own switch policy decides what "no headroom" means, so read it from cswap rather than
+# inventing a second threshold that could disagree with the thing doing the switching:
+#   trigger    binding window = MAX(5h, 7d [, model]) >= threshold  -> switch away
+#   guard      candidate's binding window < threshold
+#   hysteresis candidate must beat the current one by >= hysteresisPct
+#   tiebreak   consume-first prefers the soonest-resetting weekly that still has room
+#   cooldown   floor between proactive switches, bypassed at a hard limit
+# Only the threshold decides exhaustion; hysteresis/cooldown/strategy are surfaced for context.
+SWITCH_DEFAULTS = {"threshold": 90.0, "hysteresis": 10.0, "cooldown": 300.0,
+                   "strategy": "best", "model": None}
+_SWITCH_KEYS = {"autoswitch.threshold": "threshold", "autoswitch.hysteresisPct": "hysteresis",
+                "autoswitch.cooldownSeconds": "cooldown", "autoswitch.strategy": "strategy",
+                "autoswitch.model": "model"}
+
+def switch_policy_from_json(doc):
+    """Resolve the effective policy: cswap's settings, then any ClaudeTV override on top."""
+    p = dict(SWITCH_DEFAULTS)
+    for s in ((doc or {}).get("settings") or []):
+        key = _SWITCH_KEYS.get(s.get("key"))
+        if not key: continue
+        v = s.get("value")
+        if v is None and key != "model": continue
+        p[key] = v if key in ("strategy", "model") else float(v)
+    override = (CONFIG.get("MAXED_THRESHOLD") or "").strip()
+    if override:
+        try: p["threshold"] = float(override)
+        except ValueError: print("[fleet] ignoring non-numeric MAXED_THRESHOLD %r" % override)
+    return p
+
+_policy_cache = {"at": 0, "p": None}
+def switch_policy():
+    """Cached `cswap config --json`; re-read every 10 min so tuning cswap takes effect."""
+    if _policy_cache["p"] and time.time() - _policy_cache["at"] < 600:
+        # the override is cheap and may change from the terminal, so re-apply it every call
+        return switch_policy_from_json(_policy_cache.get("raw"))
+    raw = None
+    exe = cswap_bin()
+    if exe:
+        try:
+            r = subprocess.run([exe, "config", "--json"], capture_output=True, text=True, timeout=20)
+            if r.returncode == 0: raw = json.loads(r.stdout)
+        except Exception as e:
+            print("[fleet] cswap config unreadable (%s); using defaults" % str(e)[:60])
+    _policy_cache.update({"at": time.time(), "raw": raw})
+    p = switch_policy_from_json(raw)
+    _policy_cache["p"] = p
+    return p
+
+def binding_pct(rec, policy):
+    """The window that will trigger a switch first: the worst of 5h and 7d, plus the model-scoped
+    weekly only when cswap is configured to fold that model into the decision."""
+    u = rec["u"]
+    windows = [u.get("s", -1), u.get("w", -1)]
+    if policy.get("model") and u.get("f", -1) >= 0: windows.append(u["f"])
+    usable = [v for v in windows if v is not None and v >= 0]
+    return max(usable) if usable else -1
+
+def _eligible(rec):
+    """Accounts cswap could actually switch onto. A disabled or dead account's headroom is not
+    available to you, so counting it would under-report a real block."""
+    return not rec.get("disabled") and rec.get("auth") != "dead"
+
+def fleet_state(accounts, policy):
+    """Is the whole fleet out of quota? Returns the accounts that still have room, the binding
+    percentage of each, and the best remaining account.
+
+    An account whose usage we cannot currently see blocks the "exhausted" verdict entirely: it
+    might be the one with room, and a false "you are blocked" is worse than a late one."""
+    rows, unknown = [], 0
+    for rec in accounts:
+        if not _eligible(rec): continue
+        b = -1 if rec.get("stale") else binding_pct(rec, policy)
+        if b < 0: unknown += 1
+        else: rows.append((rec["label"], b))
+    headroom = [lbl for lbl, b in rows if b < policy["threshold"]]
+    best = min(rows, key=lambda r: r[1])[0] if rows else ""
+    return {"exhausted": bool(rows) and not headroom and not unknown, "headroom": headroom,
+            "binding": dict(rows), "best": best, "usable": len(rows), "unknown": unknown,
+            "threshold": policy["threshold"]}
+
+_fleet_last = {}          # edge-trigger memory: {"exhausted": bool}
+_FLEET_TITLES = {"exhausted": "\U0001F6D1 ClaudeTV: every Claude account is out of quota",
+                 "recovered": "\U0001F7E2 ClaudeTV: quota available again"}
+
+def _fleet_alert(event, body):
+    """Fleet block/recovery alert. Reuses the notify channels; never raises."""
+    try:
+        if not (_truthy(CONFIG.get("NOTIFY_FLEET_MAXED")) and _channels()): return
+        threading.Thread(target=_dispatch, args=(_FLEET_TITLES[event], body, _channels(),
+                         "fleet_" + event), daemon=True).start()
+    except Exception as e:
+        print("[fleet] alert error: %s" % e)
+
+def fleet_check(accounts, policy):
+    """Edge-triggered: alert when the fleet runs out, and once more when room returns. A poll
+    that cannot see the fleet (all stale) leaves the previous verdict standing rather than
+    inventing a recovery."""
+    try:
+        st = fleet_state(accounts, policy)
+        if not st["usable"]: return st                  # nothing to judge; hold the last verdict
+        was = _fleet_last.get("exhausted")
+        if st["exhausted"] and not was:
+            _fleet_last["exhausted"] = True
+            worst = ", ".join("%s %d%%" % (l, b) for l, b in sorted(st["binding"].items()))
+            _fleet_alert("exhausted", "Every Claude account is at or above %g%% on its binding "
+                         "window, so there is nothing for cswap to switch to and Claude Code is "
+                         "blocked until one resets. Now: %s." % (st["threshold"], worst))
+            print("[%s] FLEET exhausted (%s)" % (time.strftime("%H:%M:%S"), worst))
+        elif was and st["headroom"]:
+            # Recovery needs POSITIVE evidence that an account has room. "not exhausted" is not
+            # enough: a poll where one account is unreadable also fails the exhausted test, and
+            # treating that as recovery would sound the all-clear on a block still in force.
+            _fleet_last["exhausted"] = False
+            _fleet_alert("recovered", "%s has room again (below %g%%), so cswap can switch back "
+                         "and Claude Code is usable." % (st["best"], st["threshold"]))
+            print("[%s] FLEET recovered (%s)" % (time.strftime("%H:%M:%S"), st["best"]))
+        elif was is None:
+            _fleet_last["exhausted"] = st["exhausted"]  # baseline silently on first sight
+        return st
+    except Exception as e:
+        print("[fleet] check error: %s" % e)
+        return {"exhausted": False, "headroom": [], "binding": {}, "best": "", "usable": 0,
+                "threshold": policy.get("threshold", 0)}
+
+def notifiable(rec):
+    """May this reading drive reset detection?
+
+    Only a COMPLETE, FRESH poll may. A stale or partial one fed to the notifier reads as a
+    plunge to 0% and fires a phantom 'gift' reset — which is how an ordinary `cswap` account
+    switch ended up alerting as an Anthropic gift. Display keeps showing last-good either way;
+    only the notifier is gated, because it is the part that cannot take back a false positive."""
+    return not rec.get("stale") and rec["u"]["s"] >= 0 and rec["u"]["w"] >= 0
+
+def notify_key(rec):
+    """Namespace for a account's reset state: the STABLE identity, never the display label.
+    cswap omits `alias` entirely when unset, so a label can flip between the alias and an
+    email-derived fallback. Keying on it splits one account into two divergent histories, and
+    the stale one then reads as an enormous drop the moment it is picked up again."""
+    return rec.get("key") or rec["label"].lower()
+
 def cswap_accounts():
     """Read accounts from cswap. Each call also nudges cswap to refresh its stalest account, so
     polling this on the usage timer is what keeps every account's numbers current."""
@@ -419,13 +424,6 @@ def cswap_accounts():
     if p.returncode != 0:
         raise RuntimeError("cswap list exited %d: %s" % (p.returncode, (p.stderr or "").strip()[:120]))
     return cswap_accounts_from_json(json.loads(p.stdout), CONFIG.get("CSWAP_ACCOUNTS", ""))
-
-def native_accounts():
-    """Single-account fallback: the OAuth keeper above, shaped as one account record. auth is
-    'ok' because the fetch just succeeded; the poller marks records dead on a 401/403."""
-    u, resets = fetch_usage()
-    return [{"key": "native", "label": _label(CONFIG.get("ACCOUNT_LABEL"), "", 1), "email": "",
-             "active": True, "u": u, "resets": resets, "auth": "ok", "age": 0, "err": ""}]
 
 def usage_wire(accounts, wx, primary=""):
     """Build the device payload.
@@ -451,6 +449,137 @@ def usage_wire(accounts, wx, primary=""):
     st["acc"] = [{"l": a["label"], "auth": a["auth"], **a["u"]} for a in accts]
     if wx: st.update(wx)
     return st
+
+# ---------- in-app firmware updater ----------
+# The collector already reaches both GitHub and the device, and the stock ESP8266HTTPUpdateServer
+# at /update takes a plain multipart POST — the same thing `curl -F firmware=@...` does. So the
+# whole download-and-flash dance can happen from the terminal with one button, and nobody needs
+# a laptop, a release page and a curl incantation to take a firmware update.
+GITHUB_RELEASES = "https://api.github.com/repos/latticelabs-au/ClaudeTV/releases/latest"
+FW_MIN, FW_MAX = 200_000, 1_048_576      # sanity bounds for an ESP8266 4M1M image
+
+def parse_release(doc):
+    """Pull the generic firmware image out of a GitHub release payload."""
+    doc = doc or {}
+    asset = next((a for a in (doc.get("assets") or [])
+                  if (a.get("name") or "").endswith("-generic.bin")), None) or {}
+    return {"tag": (doc.get("tag_name") or "").strip(),
+            "name": asset.get("name", ""), "url": asset.get("browser_download_url", ""),
+            "size": int(asset.get("size") or 0),
+            "notes": (doc.get("body") or "")[:4000],
+            "published": doc.get("published_at") or ""}
+
+def ver_tuple(v):
+    """'v5.0' / '5.0.1' -> (5, 0, 1). Unknown sorts lowest so it never looks newer."""
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(n) for n in nums[:3]) if nums else ()
+
+def update_available(current, latest):
+    """True only when BOTH versions are known and latest is genuinely newer. An unreachable
+    device reports no version, and must not be nagged about an update we cannot justify."""
+    c, l = ver_tuple(current), ver_tuple(latest)
+    return bool(c) and bool(l) and l > c
+
+def check_image(data):
+    """Refuse to push anything that is not plausibly an ESP8266 image. A GitHub outage that
+    serves an HTML error page must never reach the device's flash."""
+    if not data or len(data) < FW_MIN or len(data) > FW_MAX:
+        raise ValueError("firmware image is %d bytes, expected %d..%d" % (len(data or b""), FW_MIN, FW_MAX))
+    if data[0] != 0xE9:                  # ESP image magic
+        raise ValueError("not an ESP8266 firmware image (bad magic 0x%02X)" % data[0])
+    return True
+
+def _multipart(field, filename, data):
+    """Minimal multipart/form-data body — the shape ESP8266HTTPUpdateServer parses."""
+    b = "----ClaudeTV" + secrets.token_hex(8)
+    head = ('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\n'
+            'Content-Type: application/octet-stream\r\n\r\n' % (b, field, filename))
+    return ("multipart/form-data; boundary=%s" % b,
+            head.encode() + data + ("\r\n--%s--\r\n" % b).encode())
+
+def device_url():
+    return (CONFIG.get("DEVICE_URL") or "").rstrip("/")
+
+def device_info():
+    """The device's own /state — firmware version, connection, which account it is showing."""
+    with urllib.request.urlopen(device_url() + "/state", timeout=8) as r:
+        return json.loads(r.read().decode())
+
+_release = {"at": 0, "rel": None}
+def latest_release(force=False):
+    if not force and _release["rel"] and time.time() - _release["at"] < 3600:
+        return _release["rel"]
+    req = urllib.request.Request(GITHUB_RELEASES, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": "ClaudeTV"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        rel = parse_release(json.loads(r.read().decode()))
+    _release.update({"at": time.time(), "rel": rel})
+    return rel
+
+# Live progress for the terminal to poll. Flashing is a one-at-a-time, hard-to-undo action.
+_update = {"state": "idle", "msg": "", "at": 0, "device_ver": "", "latest": ""}
+
+def update_status():
+    st = dict(_update)
+    rel = _release["rel"] or {}
+    st["latest"] = rel.get("tag", "")
+    st["notes"] = rel.get("notes", "")
+    st["can_update"] = bool(rel.get("url")) and update_available(st.get("device_ver", ""), st["latest"])
+    st["device_url"] = device_url()
+    return st
+
+def update_check():
+    """Refresh both sides of the comparison: what the device runs, what GitHub offers."""
+    try:
+        _update["device_ver"] = str(device_info().get("ver", ""))
+    except Exception as e:
+        _update["device_ver"] = ""
+        _update["msg"] = "device unreachable at %s (%s)" % (device_url(), str(e)[:60])
+    try:
+        latest_release(force=True)
+        if _update["device_ver"]: _update["msg"] = ""
+    except Exception as e:
+        _update["msg"] = "release check failed: %s" % str(e)[:80]
+    st = update_status()
+    # cached so the hot /usage path never recomputes or reaches the network
+    _update["can_update"] = st["can_update"]
+    _update["latest"] = st["latest"]
+    return st
+
+def _do_update():
+    def stage(state, msg=""):
+        _update.update({"state": state, "msg": msg, "at": int(time.time())})
+        print("[%s] update: %s %s" % (time.strftime("%H:%M:%S"), state, msg))
+    try:
+        rel = latest_release()
+        if not rel.get("url"): raise RuntimeError("no firmware asset in the latest release")
+        stage("downloading", rel["name"])
+        req = urllib.request.Request(rel["url"], headers={"User-Agent": "ClaudeTV"})
+        with urllib.request.urlopen(req, timeout=120) as r: data = r.read()
+        check_image(data)
+        stage("flashing", "%s (%d KB) -> %s" % (rel["name"], len(data) // 1024, device_url()))
+        ctype, body = _multipart("firmware", rel["name"], data)
+        req = urllib.request.Request(device_url() + "/update", data=body,
+                                     headers={"Content-Type": ctype, "User-Agent": "ClaudeTV"})
+        with urllib.request.urlopen(req, timeout=240) as r: r.read()
+        stage("rebooting", "device is restarting on %s" % rel["tag"])
+        # the ESP reboots straight after a successful flash; wait for it to answer again
+        for _ in range(30):
+            time.sleep(4)
+            try:
+                _update["device_ver"] = str(device_info().get("ver", ""))
+                stage("done", "device now runs v%s" % _update["device_ver"]); return
+            except Exception: pass
+        stage("done", "flashed; the device has not answered yet — give it a moment")
+    except Exception as e:
+        stage("failed", str(e)[:160])
+
+def update_start():
+    if _update["state"] in ("downloading", "flashing", "rebooting"):
+        return {"ok": 0, "msg": "an update is already running"}
+    _update.update({"state": "starting", "msg": "", "at": int(time.time())})
+    threading.Thread(target=_do_update, daemon=True).start()
+    return {"ok": 1}
 
 def geocode(q):
     url = "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=6&language=en&format=json" % urllib.parse.quote(q)
@@ -529,17 +658,52 @@ def _load_reset_log():
         except Exception: _reset_log = []
     return _reset_log
 
-def migrate_notify_state(primary):
-    """The single-account build stored {'session':…, 'week':…} at the top level. Re-home it under
-    the primary account key so its history and reset dedup survive the upgrade, instead of the
-    account baselining as brand new. Idempotent."""
+def _newer(a, b):
+    """Of two per-window state dicts, the one whose tracked resets_at is later."""
+    if not isinstance(a, dict): return b
+    if not isinstance(b, dict): return a
+    ra, rb = _iso_dt(a.get("ra")), _iso_dt(b.get("ra"))
+    if ra and rb: return a if ra >= rb else b
+    return a if ra else b
+
+def migrate_notify_state(accounts):
+    """Re-home reset state onto stable account keys. Handles both historical layouts:
+
+      * the single-account build's flat {'session':…, 'week':…}  -> the first account's key
+      * v5.0's label-keyed namespaces                            -> that account's key
+
+    Label keys are the reason this exists: cswap omits `alias` when unset, so one account could
+    accumulate two namespaces (e.g. 'personal' and the email-derived 'varma.ad') with divergent
+    history. Those are MERGED per window, keeping the entry that tracked the later resets_at, so
+    the surviving baseline is the freshest one rather than an arbitrary winner. Idempotent."""
     st = _load_notify_state()
+    if not accounts: return False
+    keys = {notify_key(r) for r in accounts}
+    changed = False
+
     legacy = {k: st.pop(k) for k in ("session", "week") if isinstance(st.get(k), dict)}
     if legacy:
-        st.setdefault(primary, {}).update(legacy)
-        _save_notify_state()
+        primary = notify_key(accounts[0])
+        for kind, val in legacy.items():
+            st.setdefault(primary, {})[kind] = _newer(st.get(primary, {}).get(kind), val)
+        changed = True
         print("[notify] migrated single-account reset state onto '%s'" % primary)
-    return bool(legacy)
+
+    for rec in accounts:
+        key = notify_key(rec)
+        # every alias this account could have presented itself as
+        aliases = {rec["label"].lower(), (rec.get("email") or "").split("@")[0][:LABEL_MAX].lower()}
+        for old in aliases - keys:
+            src = st.pop(old, None)
+            if not isinstance(src, dict): continue
+            dst = st.setdefault(key, {})
+            for kind, val in src.items():
+                dst[kind] = _newer(dst.get(kind), val)
+            changed = True
+            print("[notify] merged reset state '%s' -> '%s'" % (old, key))
+
+    if changed: _save_notify_state()
+    return changed
 
 def _log_reset(window, cls, detail, acct=""):
     """Append-only record of every reset — expected rollovers AND Anthropic 'gifts'."""
@@ -666,7 +830,7 @@ def _should_notify(kind, prev):
                 or (_was_maxed(prev) and _truthy(CONFIG.get("NOTIFY_SESSION_MAXED"))))
     return _truthy(CONFIG.get("NOTIFY_WEEK_RESET"))
 
-def notify_check(u, resets, acct=""):
+def notify_check(u, resets, acct="", label=""):
     """Detect + log usage-window resets (see the section header), then notify per the toggles.
     Per window: session=s / resets_at.five_hour; week=(w OR f) / resets_at.seven_day. Baselines
     silently on first sight; fires once per reset. Never breaks the poller.
@@ -703,10 +867,11 @@ def notify_check(u, resets, acct=""):
                 cur["fired_for"] = ended
             if cur != prev: st[kind] = cur; changed = True
             if reset:
-                _log_reset(kind, cls, _reset_detail(kind, prev, u), acct)
+                shown = label or acct                   # humans see the label, state uses the key
+                _log_reset(kind, cls, _reset_detail(kind, prev, u), shown)
                 if _should_notify(kind, prev) and _channels():
                     title, body = _reset_message(kind, u, cls, kind == "session" and _was_maxed(prev))
-                    if acct: title = "[%s] %s" % (acct, title)
+                    if shown: title = "[%s] %s" % (shown, title)
                     threading.Thread(target=_dispatch, args=(title, body, _channels(), kind + "_reset"),
                                      daemon=True).start()
         if changed: _save_notify_state()
@@ -744,26 +909,24 @@ def notify_status():
             "recent_resets": _load_reset_log()[-10:], "last_sent": _notify_last}
 
 def fetch_accounts():
-    """Read every account from the active backend, preferring cswap and falling back to the
-    native keeper. Re-checks for cswap on every poll, so installing it (or removing it) takes
-    effect without a restart."""
-    global _source, _source_err
-    if cswap_bin():
-        try:
-            accts = cswap_accounts()
-            if accts:
-                if _source != "cswap": print("[%s] accounts: cswap (%d)" % (time.strftime("%H:%M:%S"), len(accts)))
-                _source, _source_err = pick_source(True), ""
-                return accts
-            _source_err = "cswap has no accounts (run: cswap add)"
-        except Exception as e:
-            _source_err = str(e)[:120]
-            print("[%s] cswap unusable, falling back to the native keeper: %s"
-                  % (time.strftime("%H:%M:%S"), _source_err))
-    else:
-        _source_err = "cswap not installed"
-    _source = pick_source(False)
-    return native_accounts()
+    """Read every account from cswap — the single source, for one account or twelve.
+
+    There is deliberately no second code path. ClaudeTV does no OAuth of its own at runtime, so
+    there is no keeper that could rotate a token family cswap also owns, and one account behaves
+    exactly like many. When cswap is missing or empty this raises: the caller keeps serving
+    last-good and the dashboards show a setup state, which is honest rather than a silent
+    half-working fallback."""
+    global _source_err
+    if not cswap_bin():
+        _source_err = "claude-swap is not installed on this host"
+        raise RuntimeError(_source_err)
+    accts = cswap_accounts()
+    if not accts:
+        _source_err = "claude-swap has no accounts yet (run: cswap add --alias <name>)"
+        raise RuntimeError(_source_err)
+    if _source_err: print("[%s] accounts: cswap (%d)" % (time.strftime("%H:%M:%S"), len(accts)))
+    _source_err = ""
+    return accts
 
 def _auth_transitions(accts):
     """Edge-triggered per-account dead/recovered alerts: one per account per outage episode."""
@@ -782,8 +945,8 @@ def _auth_transitions(accts):
                         % rec["label"])
 
 def poller():
-    global _accounts, _usage_ts, _usage_err, _wx, _wx_err, _auth_dead, _migrated, _force_poll
-    next_u = 0.0; backoff = int(CONFIG["USAGE_EVERY"]); next_w = 0.0
+    global _accounts, _usage_ts, _usage_err, _wx, _wx_err, _migrated, _force_poll, _fleet
+    next_u = 0.0; backoff = int(CONFIG["USAGE_EVERY"]); next_w = 0.0; next_upd = 30.0
     while True:
         now = time.time()
         if now >= next_u or _force_poll:
@@ -791,30 +954,34 @@ def poller():
             try:
                 accts = fetch_accounts()
                 with _lock:
-                    _accounts = accts; _usage_ts = int(now); _usage_err = ""; _auth_dead = False
+                    _accounts = accts; _usage_ts = int(now); _usage_err = ""
                 _auth_transitions(accts)
-                if not _migrated and accts:             # first poll: re-home pre-multi-account state
+                if not _migrated and accts:             # first poll: re-home state onto stable keys
                     _migrated = True
-                    migrate_notify_state(accts[0]["label"].lower())
+                    migrate_notify_state(accts)
                 backoff = int(CONFIG["USAGE_EVERY"]); next_u = now + backoff
                 for rec in accts:                       # detect/log/notify resets (never raises)
-                    notify_check(rec["u"], rec["resets"], acct=rec["label"].lower())
-            except urllib.error.HTTPError as e:
-                with _lock: _usage_err = "http %d" % e.code
-                if e.code in (401, 403):                 # EVERY credential store rejected = dead
-                    with _lock:
-                        _auth_dead = True                 # (only 401/403 means dead; 429 is rate-limit)
-                        for rec in _accounts: rec["auth"] = "dead"   # keep the device honest
-                    _auth_transitions(_accounts or [{"key": "native", "label": "CLAUDE",
-                                                     "email": "", "auth": "dead"}])
-                    refresh_token("auth-fail")            # best-effort recovery (only if a refresh token exists)
-                    next_u = now + 300
-                else:
-                    ra = e.headers.get("Retry-After"); wait = int(ra) if (ra and ra.isdigit()) else min(backoff * 2, 600)
-                    backoff = wait; next_u = now + wait
+                    # A stale/partial reading is skipped outright rather than baselined: writing
+                    # it would make the NEXT good poll look like a jump back up.
+                    if notifiable(rec):
+                        notify_check(rec["u"], rec["resets"], acct=notify_key(rec),
+                                     label=rec["label"])
+                # "every account is out" is the only state that actually blocks you; one account
+                # capping just makes cswap switch. Checked after the per-account pass so the
+                # verdict uses this poll's numbers.
+                _f = fleet_check(accts, switch_policy())
+                with _lock: _fleet = _f
             except Exception as e:
+                # cswap owns credentials and their upkeep, so a failure here is cswap being
+                # absent, empty or briefly unhappy — never an auth verdict. Per-account auth
+                # comes from usageStatus alone, so a hiccup can no longer flip the device to
+                # LOGIN EXPIRED. Keep last-good and retry.
+                with _lock: _usage_err = str(e)[:90]
                 next_u = now + 30
-                with _lock: _usage_err = str(e)[:50]
+        if now >= next_upd:
+            try: update_check()
+            except Exception as e: print("[update] check error: %s" % str(e)[:80])
+            next_upd = now + max(3600, int(CONFIG.get("UPDATE_EVERY") or 21600))
         if now >= next_w:
             try:
                 w = fetch_weather()
@@ -831,25 +998,25 @@ def device_json(primary=""):
     # collector-side staleness (when we last polled) beats a per-account cache age here: it is
     # what the device's "stale Nm" readout has always meant.
     st["age"] = (int(time.time()) - ts) if ts else -1
+    # a firmware update the user can take from the terminal in one click; the device just
+    # shows a small marker so it is discoverable without opening anything.
+    if _update.get("can_update"): st["up"] = 1
     if err: st["err"] = err
     return st
 
 def full_state():
-    tok, sub, exp_in = token_status()
-    with _lock: accts, ts, err, wx, wxe, lr, re_, refg = list(_accounts), _usage_ts, _usage_err, _wx, _wx_err, _last_refresh, _refresh_err, _refreshing
+    with _lock: accts, ts, err, wx, wxe = list(_accounts), _usage_ts, _usage_err, _wx, _wx_err
     u = accts[0]["u"] if accts else None
     return {"service": {"uptime_s": int(time.time() - START_TS), "port": PORT},
-            "accounts": {"source": _source, "source_err": _source_err, "cswap": cswap_bin(),
+            "fleet": {**_fleet, "policy": switch_policy()},
+            "accounts": {"ready": bool(accts), "source_err": _source_err, "cswap": cswap_bin(),
                          "cswap_ver": cswap_version(), "filter": CONFIG.get("CSWAP_ACCOUNTS", ""),
                          "list": [{"key": a["key"], "label": a["label"], "email": a["email"],
                                    "active": a["active"], "auth": a["auth"], "age": a["age"],
-                                   "err": a["err"], **a["u"]} for a in accts]},
-            "token": {"status": tok, "plan": sub, "expires_in_s": exp_in, "auth": auth_state(),
-                      "last_refresh_s": (int(time.time()) - lr) if lr else -1,
-                      "refresh_err": re_, "refreshing": refg, "cred": _cred_used or cred_path(),
-                      "stores": len(cred_stores()),
-                      "standby": bool(_cred_used and _cred_used != cred_stores()[0])},
+                                   "err": a["err"], "stale": a.get("stale", False),
+                                   "disabled": a.get("disabled", False), **a["u"]} for a in accts]},
             "usage": {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err, **(u or {})},
+            "update": update_status(),
             "weather": (wx or {}), "weather_err": wxe, "config": {k: CONFIG[k] for k in EDITABLE},
             "notify": notify_status()}
 
@@ -871,7 +1038,7 @@ label{font-size:12px;color:var(--gray);display:block;margin:8px 0 3px}
 input{width:100%;background:#0d1119;color:#e6e9ef;border:1px solid var(--line);border-radius:8px;padding:9px;font:inherit}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
 button{background:var(--coral);color:#1a0f0a;border:0;border-radius:8px;padding:10px 14px;font:inherit;font-weight:700;cursor:pointer;width:100%}
-button.ghost{background:#1c2331;color:#e6e9ef;border:1px solid var(--line)}.muted{color:var(--gray);font-size:12px}
+button.ghost{background:#1c2331;color:#e6e9ef;border:1px solid var(--line)}button:disabled{opacity:.45;cursor:not-allowed}.muted{color:var(--gray);font-size:12px}
 a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:12px;word-break:break-all}
 .foot{text-align:center;margin-top:16px}.foot a{color:var(--cyan);text-decoration:none;font-size:12px}
 </style></head><body>
@@ -890,16 +1057,21 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <button style="background:#39c3cd;color:#06222a;font-weight:700;margin-top:8px" onclick="window.open(devUrl||'http://claudetv.local','_blank')">Open ClaudeTV device &#8599;</button>
 <div class=grid style=margin-top:8px><button class=ghost onclick=restart()>Restart service</button><button class=ghost onclick=load()>Refresh</button></div></div>
 
-<div class=card id=tokcard><h2>Claude token keeper</h2>
-<div class=row><span>Token</span><span class=pill id=tok>--</span></div>
-<div class=row><span>Expires in</span><span id=texp>--</span></div>
-<div class=row><span>Last refresh</span><span id=tref>--</span></div>
-<div class=row><span class=muted>credentials</span><span class=muted id=cred></span></div>
-<div class=row><span class=muted id=terr></span><button style="width:auto" class=ghost onclick=refresh()>Refresh now</button></div></div>
+<div class=card><h2>Device firmware</h2>
+<div class=row><span>Installed</span><span class=pill id=fwnow>--</span></div>
+<div class=row><span>Latest release</span><span class=pill id=fwnew>--</span></div>
+<div class=muted id=fwmsg></div>
+<div class=grid style=margin-top:8px><button class=ghost onclick=fwcheck()>Check for updates</button>
+<button id=fwbtn onclick=fwflash() disabled>Update device</button></div>
+<div class=muted style="margin-top:8px">Downloads the release image and flashes it over your LAN. The device reboots itself; nothing to download or plug in.</div></div>
+
+
 
 <div class=card><h2>Accounts</h2>
 <div class=row><span>Source</span><span class=pill id=src>--</span></div>
 <div class=muted id=srcerr></div>
+<div class=row id=fleetrow style="display:none"><span>Quota</span><span class=pill id=fleet>--</span></div>
+<div class=muted id=fleetmeta></div>
 <div id=accts style="margin-top:6px"></div>
 <div id=cswapadd class=muted style="display:none;margin-top:8px"></div>
 <div class=grid style=margin-top:8px><button class=ghost onclick=poll()>Re-read accounts</button>
@@ -926,11 +1098,10 @@ same login the first to refresh invalidates the other and that account gets quar
 <input type=hidden id=CITY><input type=hidden id=LAT><input type=hidden id=LON><input type=hidden id=TZ>
 <label style="margin-top:8px" for=WEATHER_EVERY>Weather refresh (s)</label><input id=WEATHER_EVERY></div>
 
-<div class=card><h2>Claude config</h2>
-<label for=CLAUDE_CREDENTIALS>Credentials path (blank = auto: collector's own login, else Claude Code's)</label><input id=CLAUDE_CREDENTIALS placeholder=auto>
-<div class=grid><div><label for=REFRESH_MARGIN_MIN>Refresh margin (min)</label><input id=REFRESH_MARGIN_MIN></div><div><label for=USAGE_EVERY>Usage poll (s)</label><input id=USAGE_EVERY></div></div>
-<label for=PORT>Port</label><input id=PORT>
-<div class=muted style="margin-top:8px">No Claude Code on this box? Run <code>python claude_usage_server.py --login</code> once; the keeper then renews the token itself, forever.</div></div>
+<div class=card><h2>Collector</h2>
+<div class=grid><div><label for=USAGE_EVERY>Usage poll (s)</label><input id=USAGE_EVERY></div><div><label for=PORT>Port</label><input id=PORT></div></div>
+<label for=MAXED_THRESHOLD>Blocked-at threshold %% (blank = follow cswap's autoswitch.threshold)</label><input id=MAXED_THRESHOLD placeholder="from cswap">
+<div class=muted style="margin-top:8px">Credentials and token upkeep belong to <b>claude-swap</b>; ClaudeTV never holds a Claude token.</div></div>
 
 <div class=card><h2>Reset notifications</h2>
 <div class=muted>Get pinged when your Claude usage window rolls over to a fresh quota (the reset Anthropic only posts on X).</div>
@@ -969,25 +1140,36 @@ function fmtAgo(s){if(s<0)return 'never';if(s<60)return s+'s ago';let m=Math.flo
 function pill(el,cls,txt){el.className='pill '+cls;el.textContent=txt}
 function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  up.textContent=fmtUp(s.service.uptime_s);
- // cswap owns credentials and token keeping in cswap mode, so the native keeper card is moot
- tokcard.style.display=(s.accounts&&s.accounts.source=='cswap')?'none':'';
- const t=s.token;pill(tok,t.status=='valid'?'ok':(t.status=='expired'?'warn':'bad'),t.status+' ('+t.plan+')');
- texp.textContent=t.refreshing?'refreshing…':(t.expires_in_s>0?fmtUp(t.expires_in_s):'--');
- tref.textContent=fmtAgo(t.last_refresh_s);cred.textContent=t.cred+(t.stores>1?' (+standby)':'');
- terr.textContent=(t.standby?'⚠ running on STANDBY login · ':'')+(t.refresh_err?('⚠ '+t.refresh_err):'');
- const u=s.usage,A=s.accounts||{source:'',list:[]},cs=A.source=='cswap';
- pill(src,cs?'ok':'warn',cs?('cswap · '+A.list.length+(A.list.length==1?' account':' accounts')):'native · single account');
- srcerr.textContent=cs?((A.cswap_ver||'cswap')+' · '+A.cswap):(A.source_err?('⚠ '+A.source_err):'');
+ const u=s.usage,A=s.accounts||{ready:false,list:[]},cs=!!A.ready;
+ pill(src,cs?'ok':'bad',cs?('claude-swap · '+A.list.length+(A.list.length==1?' account':' accounts')):'setup needed');
+ srcerr.textContent=cs?((A.cswap_ver||'cswap')+' · '+A.cswap):('⚠ '+(A.source_err||'claude-swap not ready'));
+ // fleet verdict: one account capping is normal (cswap switches); ALL of them is a block
+ const U=s.update||{};
+ pill(fwnow,U.device_ver?'ok':'bad',U.device_ver?('v'+U.device_ver):'device unreachable');
+ pill(fwnew,U.can_update?'warn':'ok',U.latest||'--');
+ // while a flash runs, the state field narrates it; otherwise show any error
+ const busy=['starting','downloading','flashing','rebooting'].indexOf(U.state)>=0;
+ fwmsg.textContent=busy?(U.state+'… '+(U.msg||'')):(U.msg||(U.can_update?('update '+U.latest+' available'):'up to date'));
+ fwbtn.disabled=busy||!U.can_update;
+ fwbtn.textContent=busy?'updating…':('Update device'+(U.can_update?(' to '+U.latest):''));
+ if(!busy&&fwpoll){clearInterval(fwpoll);fwpoll=null;}
+ const F=s.fleet||{},P=F.policy||{};
+ fleetrow.style.display=(A.list.length?'':'none');
+ pill(fleet,F.exhausted?'bad':'ok',F.exhausted?'ALL ACCOUNTS OUT':((F.headroom||[]).length+' with room'));
+ fleetmeta.textContent=P.threshold?('blocked at '+P.threshold+'% binding · cswap '+P.strategy
+   +' · hysteresis '+P.hysteresis+'pp · cooldown '+P.cooldown+'s'+(P.model?(' · model '+P.model):'')):'';
  // no cswap on this box -> tell them exactly how to get multi-account, inline
  cswapadd.style.display=cs?'none':'';
  cswapadd.innerHTML=cs?'':'Want more than one account? Install <b>claude-swap</b> on this host, then add each login.';
  accts.innerHTML=(A.list||[]).map(a=>{const dead=a.auth=='dead';
-   const f=a.f>=0?(' · '+(a.fl||'F')+' <b>'+a.f+'%</b>'):'';
+   const pc=v=>(v==null||v<0)?'--':v+'%';   // -1 = no reading this poll
+   const f=a.f>=0?(' · '+(a.fl||'F')+' <b>'+pc(a.f)+'</b>'):'';
    return '<div style="border-top:1px solid var(--line);padding:8px 0">'
     +'<div class=row style=margin:0><span><b>'+a.label+'</b>'+(a.active?' <span class=muted>· active</span>':'')
       +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?'LOGIN EXPIRED':'ok')+'</span></div>'
     +'<div class=row style="margin:2px 0"><span class=muted>'+(a.email||'')+'</span>'
-      +'<span>S <b>'+a.s+'%</b> · W <b>'+a.w+'%</b>'+f+'</span></div>'
+      +'<span>'+(a.stale?'<span style=color:#f0ad36>stale </span>':'')
+        +'S <b>'+pc(a.s)+'</b> · W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
     +'<div class=row style=margin:0><span class=muted>'+(a.sr?('resets '+a.sr):'idle')+(a.wr?(' · '+a.wr):'')
       +'</span><span class=muted>'+(a.err||(a.age?a.age+'s':''))+'</span></div></div>';}).join('')
    ||'<div class=muted>no accounts — run <code>cswap add</code>, or log in with --login</div>';
@@ -1011,7 +1193,7 @@ citySearch.oninput=function(){clearTimeout(geoT);const q=this.value.trim();if(q.
   rs.forEach(h=>{const b=document.createElement('button');b.className='ghost';b.style.marginBottom='4px';b.textContent=h.label;b.onclick=()=>pickCity(h);geoResults.appendChild(b);});});},350);};
 function pickCity(h){geoResults.innerHTML='';citySearch.value='';pill(svc,'warn','applying…');
  fetch('/api/config?CITY='+encodeURIComponent(h.city)+'&LAT='+h.lat+'&LON='+h.lon+'&TZ='+encodeURIComponent(h.tz),{method:'POST'}).then(()=>setTimeout(load,3500));}
-function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','CLAUDE_CREDENTIALS','REFRESH_MARGIN_MIN','USAGE_EVERY','PORT',
+function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','USAGE_EVERY','PORT','MAXED_THRESHOLD','CSWAP_ACCOUNTS',
   'SMTP_HOST','SMTP_PORT','SMTP_SECURITY','SMTP_FROM','SMTP_USER','NOTIFY_EMAIL_TO'];
  const parts=ks.map(k=>k+'='+encodeURIComponent(document.getElementById(k).value));
  ['NOTIFY_SESSION_RESET','NOTIFY_SESSION_MAXED','NOTIFY_WEEK_RESET','NOTIFY_AUTH','NOTIFY_EMAIL'].forEach(k=>parts.push(k+'='+(document.getElementById(k).checked?'true':'false')));
@@ -1021,9 +1203,12 @@ function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL
 function ntest(ch){nres.textContent='testing '+ch+'…';
  fetch('/api/notify-test?channel='+ch,{method:'POST'}).then(r=>r.json()).then(d=>{
   nres.textContent=Object.entries(d.results||{}).map(([k,v])=>k+': '+v).join(' · ')||'no channel configured';}).catch(()=>{nres.textContent='test failed'});}
+function fwcheck(){fwmsg.textContent='checking…';fetch('/api/update?action=check',{method:'POST'}).then(load)}
+function fwflash(){if(!confirm('Download the latest firmware and flash the device now?\\n\\nThe device reboots and is unavailable for about a minute.'))return;
+ fwbtn.disabled=true;fetch('/api/update?action=flash',{method:'POST'}).then(()=>{fwpoll=setInterval(load,3000);load()})}
+let fwpoll=null;
 function poll(){pill(svc,'warn','re-reading…');fetch('/api/service?action=poll',{method:'POST'}).then(()=>setTimeout(()=>{pill(svc,'ok','running');load()},1500))}
 function restart(){if(!confirm('Restart collector?'))return;fetch('/api/service?action=restart',{method:'POST'}).then(()=>{pill(svc,'warn','restarting');setTimeout(load,3500)})}
-function refresh(){pill(tok,'warn','refreshing');fetch('/api/service?action=refresh',{method:'POST'}).then(()=>setTimeout(load,8000))}
 load();setInterval(load,3000);
 </script></body></html>"""
 
@@ -1062,16 +1247,26 @@ class H(BaseHTTPRequestHandler):
             globals()["_force_poll"] = True          # re-read accounts now (dashboard button)
             self._send(200, "application/json", '{"ok":1}')
         elif path == "/api/service" and q.get("action") == "refresh":
-            self._send(200, "application/json", '{"ok":1}'); threading.Thread(target=lambda: refresh_token("manual"), daemon=True).start()
+            self._send(200, "application/json", '{"ok":1}')
+        elif path == "/api/update" and q.get("action") == "check":
+            self._send(200, "application/json", json.dumps(update_check()))
+        elif path == "/api/update" and q.get("action") == "flash":
+            self._send(200, "application/json", json.dumps(update_start()))
         elif path == "/api/notify-test":
             self._send(200, "application/json", json.dumps({"results": notify_test(q.get("channel", "all"))}))
         else: self._send(404, "text/plain", "not found")
 
 
 def oauth_login():
-    """One-time interactive PKCE login: mints the collector's OWN credentials (no Claude Code
-    needed on this box). Open the printed URL on ANY device, log in, paste the code back here.
-    The running service picks the new store up on its next poll; no restart needed."""
+    """One-time ENROLLMENT helper for a headless box with no Claude Code.
+
+    Mints a credential in Claude Code's own format and location so that `cswap add` can adopt it
+    as a managed account. That is its whole job: cswap owns everything afterwards, including
+    refreshing. Open the printed URL on ANY device, log in, paste the code back here.
+
+    Run it once PER ACCOUNT, each followed by `cswap add --alias <name>`. Log in separately on
+    every machine rather than copying credentials around: refresh tokens rotate, so a shared
+    token family means the first machine to refresh invalidates the other's copy."""
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     state = secrets.token_urlsafe(32)
@@ -1092,14 +1287,19 @@ def oauth_login():
         except Exception: pass
         print("Login failed: http %d %s" % (e.code, body)); raise SystemExit(1)
     _write_creds(resp, CRED_OWN)
-    print("Logged in. Credentials saved to %s (0600)." % CRED_OWN)
-    print("The collector will use this store from its next poll and keep it fresh forever.")
+    print("Logged in. Credential written to %s (0600)." % CRED_OWN)
+    print("\nNow hand it to claude-swap, which manages it from here on:\n")
+    print("    cswap add --alias <name>\n")
+    print("Repeat this whole step for each additional account.")
 
 if __name__ == "__main__":
     import sys
     if "--login" in sys.argv:
         oauth_login(); raise SystemExit(0)
-    threading.Thread(target=keeper, daemon=True).start()
+    if not cswap_bin():
+        print("WARNING: claude-swap (cswap) is not installed — ClaudeTV reads all accounts from\n"
+              "         it. Install it and add an account, then this starts serving:\n"
+              "           pipx install claude-swap && cswap add --alias <name>")
     threading.Thread(target=poller, daemon=True).start()
     print("ClaudeTV collector + terminal on http://0.0.0.0:%d  (device -> /usage, terminal -> /)" % PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

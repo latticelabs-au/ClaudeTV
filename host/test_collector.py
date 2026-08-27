@@ -107,8 +107,11 @@ class TestCswapMapping(TzPinned):
         self.assertEqual(srv.cswap_accounts_from_json(d)[0]["label"], "AVERYLON")
 
     def test_unhealthy_account_is_marked_dead_but_still_listed(self):
+        # "relogin_required" is one of cswap's real dead states (see CSWAP_DEAD); a status it
+        # never emits must not be treated as dead, which is what test_transient_statuses covers.
         d = doc()
-        d["accounts"][1]["usageStatus"] = "quarantined"
+        d["accounts"][1]["usageStatus"] = "relogin_required"
+        d["accounts"][1]["usage"] = None
         accts = srv.cswap_accounts_from_json(d)
         self.assertEqual(len(accts), 2)
         self.assertEqual(accts[1]["auth"], "dead")
@@ -171,6 +174,366 @@ class TestManyAccounts(TzPinned):
     def test_every_account_gets_its_own_notify_namespace(self):
         accts = srv.cswap_accounts_from_json(many(5))
         self.assertEqual(len({a["key"] for a in accts}), 5)
+
+
+class TestUnavailableUsage(TzPinned):
+    """cswap sets usage=None for EVERY non-ok status, and usage_to_json emits fiveHour /
+    sevenDay / scoped only when present. Absent data must never become 0%: the notifier reads
+    a drop to 0 as a reset, which is how an account switch got logged as an Anthropic 'gift'."""
+
+    def _one(self, **over):
+        d = doc()
+        d["accounts"] = [d["accounts"][1]]
+        d["accounts"][0].update(over)
+        return srv.cswap_accounts_from_json(d)[0]
+
+    def test_null_usage_is_marked_stale_not_zero(self):
+        rec = self._one(usageStatus="unavailable", usage=None)
+        self.assertTrue(rec["stale"])
+        self.assertNotEqual(rec["u"]["s"], 0)
+        self.assertNotEqual(rec["u"]["w"], 0)
+
+    def test_null_usage_falls_back_to_last_good_for_display(self):
+        rec = self._one(usageStatus="foreign_credential", usage=None,
+                        lastGoodUsage={"fiveHour": {"pct": 42.0,
+                                                    "resetsAt": "2026-08-25T17:00:00+00:00"},
+                                       "sevenDay": {"pct": 61.0,
+                                                    "resetsAt": "2026-08-27T01:00:00+00:00"}})
+        self.assertTrue(rec["stale"])
+        self.assertEqual(rec["u"]["s"], 42)
+        self.assertEqual(rec["u"]["w"], 61)
+
+    def test_missing_seven_day_inside_ok_is_stale_not_zero(self):
+        # the exact fossil found in notify_state.json: w=0 recorded beside f=56
+        d = doc()
+        d["accounts"] = [d["accounts"][1]]
+        del d["accounts"][0]["usage"]["sevenDay"]
+        rec = srv.cswap_accounts_from_json(d)[0]
+        self.assertTrue(rec["stale"])
+        self.assertNotEqual(rec["u"]["w"], 0)
+
+    def test_missing_five_hour_inside_ok_is_stale(self):
+        d = doc()
+        d["accounts"] = [d["accounts"][1]]
+        del d["accounts"][0]["usage"]["fiveHour"]
+        self.assertTrue(srv.cswap_accounts_from_json(d)[0]["stale"])
+
+    def test_complete_ok_usage_is_not_stale(self):
+        self.assertFalse(self._one()["stale"])
+
+    def test_transient_statuses_are_not_dead(self):
+        for st in ("token_expired", "keychain_unavailable", "foreign_credential",
+                   "unavailable", "unknown", "error"):
+            rec = self._one(usageStatus=st, usage=None)
+            self.assertNotEqual(rec["auth"], "dead", "%s must not read as a dead login" % st)
+            self.assertTrue(rec["stale"], st)
+
+    def test_only_real_relogin_states_are_dead(self):
+        for st in ("relogin_required", "no_credentials", "expired"):
+            self.assertEqual(self._one(usageStatus=st, usage=None)["auth"], "dead", st)
+
+    def test_api_key_account_has_no_subscription_quota(self):
+        rec = self._one(usageStatus="api_key", usage=None)
+        self.assertNotEqual(rec["auth"], "dead")
+        self.assertTrue(rec["stale"])
+
+    def test_stale_accounts_are_never_fed_to_the_notifier(self):
+        good = self._one()
+        bad = self._one(usageStatus="unavailable", usage=None)
+        self.assertTrue(srv.notifiable(good))
+        self.assertFalse(srv.notifiable(bad))
+
+
+class TestNotifyKeyStability(TzPinned):
+    """cswap omits `alias` entirely when unset, so the LABEL is volatile. State must key on the
+    stable account identity or one account grows two namespaces with divergent history, and the
+    stale one then reads as a huge drop."""
+
+    def test_key_survives_the_alias_being_removed(self):
+        with_alias = srv.cswap_accounts_from_json(doc())[1]
+        d = doc()
+        del d["accounts"][1]["alias"]
+        without = srv.cswap_accounts_from_json(d)[1]
+        self.assertNotEqual(with_alias["label"], without["label"])   # label does change
+        self.assertEqual(with_alias["key"], without["key"])          # identity does not
+
+    def test_notify_namespace_is_the_key_not_the_label(self):
+        d = doc()
+        del d["accounts"][1]["alias"]
+        self.assertEqual(srv.notify_key(srv.cswap_accounts_from_json(doc())[1]),
+                         srv.notify_key(srv.cswap_accounts_from_json(d)[1]))
+
+
+CSWAP_SETTINGS = {
+    "schemaVersion": 1,
+    "path": "/home/a/.local/share/claude-swap/settings.json",
+    "settings": [
+        {"key": "autoswitch.threshold", "value": 95.0, "isSet": True},
+        {"key": "autoswitch.intervalSeconds", "value": 60.0, "isSet": False},
+        {"key": "autoswitch.cooldownSeconds", "value": 300.0, "isSet": False},
+        {"key": "autoswitch.hysteresisPct", "value": 5.0, "isSet": True},
+        {"key": "autoswitch.strategy", "value": "consume-first", "isSet": True},
+        {"key": "autoswitch.includeApiKeyAccounts", "value": False, "isSet": False},
+        {"key": "autoswitch.model", "value": None, "isSet": False},
+    ],
+}
+
+
+class TestSwitchPolicy(unittest.TestCase):
+    """The thresholds that decide "are we actually blocked" belong to cswap, not to ClaudeTV.
+    Read them from `cswap config --json` so a user who tuned cswap gets consistent behaviour."""
+
+    def setUp(self):
+        self._cfg = {k: srv.CONFIG.get(k) for k in
+                     ("MAXED_THRESHOLD", "MAXED_SCOPE", "NOTIFY_FLEET_MAXED")}
+        for k in self._cfg: srv.CONFIG[k] = ""
+
+    def tearDown(self):
+        srv.CONFIG.update({k: (v if v is not None else "") for k, v in self._cfg.items()})
+
+    def test_reads_thresholds_from_cswap(self):
+        p = srv.switch_policy_from_json(CSWAP_SETTINGS)
+        self.assertEqual(p["threshold"], 95.0)
+        self.assertEqual(p["hysteresis"], 5.0)
+        self.assertEqual(p["cooldown"], 300.0)
+        self.assertEqual(p["strategy"], "consume-first")
+        self.assertIsNone(p["model"])
+
+    def test_falls_back_to_cswap_defaults_when_unreadable(self):
+        p = srv.switch_policy_from_json(None)
+        self.assertEqual(p["threshold"], srv.SWITCH_DEFAULTS["threshold"])
+        self.assertEqual(p["strategy"], srv.SWITCH_DEFAULTS["strategy"])
+
+    def test_claudetv_config_overrides_cswap(self):
+        srv.CONFIG["MAXED_THRESHOLD"] = "80"
+        p = srv.switch_policy_from_json(CSWAP_SETTINGS)
+        self.assertEqual(p["threshold"], 80.0)
+        self.assertEqual(p["hysteresis"], 5.0)      # untouched keys still come from cswap
+
+    def test_ignores_a_nonsense_override(self):
+        srv.CONFIG["MAXED_THRESHOLD"] = "banana"
+        self.assertEqual(srv.switch_policy_from_json(CSWAP_SETTINGS)["threshold"], 95.0)
+
+
+class TestFleetExhaustion(TzPinned):
+    """With auto-switch, ONE account hitting its cap is not a block: cswap moves to another and
+    Claude keeps running. You are only actually blocked when no account has headroom left."""
+
+    POLICY = {"threshold": 95.0, "hysteresis": 5.0, "cooldown": 300.0,
+              "strategy": "consume-first", "model": None}
+
+    def acct(self, label, s, w, f=-1, stale=False, disabled=False, auth="ok"):
+        return {"key": "k:" + label, "label": label.upper(), "email": label + "@e.com",
+                "active": False, "stale": stale, "disabled": disabled, "auth": auth,
+                "age": 5, "err": "", "resets": {"session": None, "week": None},
+                "u": {"s": s, "w": w, "f": f, "fl": "FABLE" if f >= 0 else "",
+                      "sr": "", "wr": ""}}
+
+    def test_binding_window_is_the_worse_of_session_and_week(self):
+        self.assertEqual(srv.binding_pct(self.acct("a", 20, 80), self.POLICY), 80)
+        self.assertEqual(srv.binding_pct(self.acct("a", 96, 10), self.POLICY), 96)
+
+    def test_scoped_window_counts_only_when_cswap_tracks_a_model(self):
+        rec = self.acct("a", 10, 10, f=99)
+        self.assertEqual(srv.binding_pct(rec, self.POLICY), 10)
+        p = dict(self.POLICY, model="Fable")
+        self.assertEqual(srv.binding_pct(rec, p), 99)
+
+    def test_one_maxed_account_is_not_a_block(self):
+        fleet = [self.acct("work", 99, 40), self.acct("personal", 5, 20)]
+        st = srv.fleet_state(fleet, self.POLICY)
+        self.assertFalse(st["exhausted"])
+        self.assertEqual(st["headroom"], ["PERSONAL"])
+
+    def test_every_account_maxed_is_a_block(self):
+        fleet = [self.acct("work", 99, 40), self.acct("personal", 20, 97)]
+        st = srv.fleet_state(fleet, self.POLICY)
+        self.assertTrue(st["exhausted"])
+        self.assertEqual(st["headroom"], [])
+
+    def test_exactly_at_the_threshold_counts_as_exhausted(self):
+        st = srv.fleet_state([self.acct("a", 95, 0)], self.POLICY)
+        self.assertTrue(st["exhausted"])
+
+    def test_stale_accounts_cannot_prove_exhaustion(self):
+        # unknown usage is not evidence of being out; refuse to claim a block we cannot see
+        fleet = [self.acct("work", 99, 40), self.acct("personal", -1, -1, stale=True)]
+        self.assertFalse(srv.fleet_state(fleet, self.POLICY)["exhausted"])
+
+    def test_disabled_accounts_are_excluded_from_the_fleet(self):
+        # cswap will never switch onto a disabled account, so its headroom is not available
+        fleet = [self.acct("work", 99, 40), self.acct("spare", 1, 1, disabled=True)]
+        self.assertTrue(srv.fleet_state(fleet, self.POLICY)["exhausted"])
+
+    def test_dead_accounts_are_excluded_from_the_fleet(self):
+        fleet = [self.acct("work", 99, 40), self.acct("old", 1, 1, auth="dead")]
+        self.assertTrue(srv.fleet_state(fleet, self.POLICY)["exhausted"])
+
+    def test_no_usable_accounts_is_not_reported_as_exhausted(self):
+        self.assertFalse(srv.fleet_state([self.acct("a", -1, -1, stale=True)],
+                                         self.POLICY)["exhausted"])
+
+    def test_binding_account_is_named(self):
+        fleet = [self.acct("work", 99, 40), self.acct("personal", 5, 20)]
+        self.assertEqual(srv.fleet_state(fleet, self.POLICY)["best"], "PERSONAL")
+
+
+class TestFleetAlerts(TzPinned):
+    POLICY = TestFleetExhaustion.POLICY
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        self._alert = srv._fleet_alert
+        srv._fleet_alert = lambda ev, body: self.sent.append(ev)
+        self._state = dict(srv._fleet_last)
+        srv._fleet_last.clear()
+
+    def tearDown(self):
+        srv._fleet_alert = self._alert
+        srv._fleet_last.clear(); srv._fleet_last.update(self._state)
+        super().tearDown()
+
+    def acct(self, *a, **k): return TestFleetExhaustion.acct(self, *a, **k)
+
+    def test_fires_once_when_the_fleet_runs_out(self):
+        out = [self.acct("work", 99, 40), self.acct("personal", 97, 20)]
+        srv.fleet_check(out, self.POLICY)
+        srv.fleet_check(out, self.POLICY)
+        self.assertEqual(self.sent, ["exhausted"])
+
+    def test_does_not_fire_while_any_account_has_room(self):
+        srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 5, 5)], self.POLICY)
+        self.assertEqual(self.sent, [])
+
+    def test_recovery_fires_once_after_a_block(self):
+        srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 97, 20)], self.POLICY)
+        srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 2, 20)], self.POLICY)
+        srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 3, 20)], self.POLICY)
+        self.assertEqual(self.sent, ["exhausted", "recovered"])
+
+    def test_a_switch_between_two_healthy_accounts_is_silent(self):
+        a = [self.acct("work", 96, 40), self.acct("personal", 5, 20)]
+        b = [self.acct("work", 96, 40), self.acct("personal", 30, 20)]
+        srv.fleet_check(a, self.POLICY); srv.fleet_check(b, self.POLICY)
+        self.assertEqual(self.sent, [])
+
+    def test_a_stale_poll_does_not_clear_an_active_block(self):
+        out = [self.acct("work", 99, 40), self.acct("personal", 97, 20)]
+        srv.fleet_check(out, self.POLICY)
+        srv.fleet_check([self.acct("work", -1, -1, stale=True),
+                         self.acct("personal", -1, -1, stale=True)], self.POLICY)
+        self.assertEqual(self.sent, ["exhausted"])   # no phantom "recovered"
+
+    def test_a_partly_readable_poll_does_not_clear_an_active_block(self):
+        """The nastier half of the same bug: with one account still visibly out and the other
+        unreadable, `exhausted` correctly goes false — but that is "cannot tell", not "you have
+        room", and must not sound the all-clear."""
+        srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 97, 20)], self.POLICY)
+        srv.fleet_check([self.acct("work", 99, 40),
+                         self.acct("personal", -1, -1, stale=True)], self.POLICY)
+        self.assertEqual(self.sent, ["exhausted"])
+
+    def test_recovery_needs_an_account_with_actual_headroom(self):
+        srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 97, 20)], self.POLICY)
+        srv.fleet_check([self.acct("work", 99, 40),
+                         self.acct("personal", -1, -1, stale=True)], self.POLICY)
+        srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 10, 20)], self.POLICY)
+        self.assertEqual(self.sent, ["exhausted", "recovered"])
+
+
+RELEASE = {
+    "tag_name": "v5.1",
+    "published_at": "2026-08-27T10:00:00Z",
+    "body": "### What's new\nStuff.",
+    "assets": [
+        {"name": "claudetv-v5.1-generic.bin",
+         "browser_download_url": "https://github.com/x/releases/download/v5.1/claudetv-v5.1-generic.bin",
+         "size": 505968},
+        {"name": "checksums.txt", "browser_download_url": "https://x/checksums.txt", "size": 90},
+    ],
+}
+
+
+class TestFirmwareUpdater(unittest.TestCase):
+    """Flashing should not require a laptop, a download and a curl incantation: the collector
+    already talks to both GitHub and the device's OTA endpoint."""
+
+    def test_picks_the_generic_image_out_of_the_release(self):
+        r = srv.parse_release(RELEASE)
+        self.assertEqual(r["tag"], "v5.1")
+        self.assertEqual(r["name"], "claudetv-v5.1-generic.bin")
+        self.assertTrue(r["url"].endswith("claudetv-v5.1-generic.bin"))
+        self.assertEqual(r["size"], 505968)
+
+    def test_release_without_a_firmware_asset_is_not_offered(self):
+        r = srv.parse_release({"tag_name": "v9", "assets": [{"name": "notes.txt"}]})
+        self.assertEqual(r["url"], "")
+
+    def test_version_comparison_ignores_the_v_prefix(self):
+        self.assertTrue(srv.update_available("5.0", "v5.1"))
+        self.assertTrue(srv.update_available("v5.0", "5.0.1"))
+        self.assertFalse(srv.update_available("5.1", "v5.1"))
+        self.assertFalse(srv.update_available("v5.2", "v5.1"))
+
+    def test_unknown_current_version_does_not_claim_an_update(self):
+        # a device we cannot reach must not be reported as out of date
+        self.assertFalse(srv.update_available("", ""))
+
+    def test_multipart_body_matches_what_the_esp_update_endpoint_expects(self):
+        ctype, body = srv._multipart("firmware", "fw.bin", b"\xde\xad\xbe\xef")
+        self.assertTrue(ctype.startswith("multipart/form-data; boundary="))
+        boundary = ctype.split("boundary=")[1]
+        self.assertIn(b'name="firmware"', body)
+        self.assertIn(b'filename="fw.bin"', body)
+        self.assertIn(b"\xde\xad\xbe\xef", body)
+        self.assertTrue(body.rstrip().endswith(("--%s--" % boundary).encode()))
+
+    def test_refuses_to_flash_something_that_is_not_a_firmware_image(self):
+        with self.assertRaises(ValueError):
+            srv.check_image(b"<!DOCTYPE html><html>nope</html>")
+
+    def test_accepts_a_plausible_esp8266_image(self):
+        srv.check_image(b"\xe9" + b"\x00" * 200000)      # ESP magic byte, sane size
+
+
+class TestEmbeddedJavaScript(unittest.TestCase):
+    """The dashboards are JS embedded in a Python triple-quoted string, so a `\\n` meant for
+    JavaScript silently becomes a REAL newline and splits a string literal across lines — which
+    kills the whole script and leaves a blank dashboard with only a console error. That shipped
+    once; these are the cheap structural checks that catch it without a JS engine."""
+
+    def _script(self, text):
+        self.assertIn("<script>", text)
+        return text.split("<script>", 1)[1].split("</script>", 1)[0]
+
+    def _assert_sane(self, js, where):
+        for n, line in enumerate(js.splitlines(), 1):
+            stripped = line.split("//")[0] if not line.strip().startswith("http") else line
+            # a line ending mid-string is the exact failure mode we are guarding against
+            self.assertEqual(stripped.count("'") % 2, 0,
+                             "%s line %d has an unbalanced single quote: %s" % (where, n, line[:120]))
+        for opener, closer in (("{", "}"), ("(", ")"), ("[", "]")):
+            self.assertEqual(js.count(opener), js.count(closer),
+                             "%s has unbalanced %s%s" % (where, opener, closer))
+
+    def test_master_terminal_script_is_structurally_sound(self):
+        self._assert_sane(self._script(srv.TERMINAL), "TERMINAL")
+
+    def test_master_terminal_has_no_raw_newline_inside_a_dialog_string(self):
+        # the specific bug: confirm('...\n...') written with a real newline
+        for call in ("confirm(", "alert(", "prompt("):
+            for chunk in srv.TERMINAL.split(call)[1:]:
+                head = chunk.split(")", 1)[0]
+                self.assertNotIn("\n", head, "%s... contains a real newline; use a \\\\n escape" % call)
+
+    def test_device_panel_script_is_structurally_sound(self):
+        panel = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "firmware", "claudetv", "panel.h")
+        if not os.path.exists(panel):
+            self.skipTest("panel.h not present")
+        with open(panel, encoding="utf-8") as f:
+            self._assert_sane(self._script(f.read()), "panel.h")
 
 
 class TestWireContract(TzPinned):
@@ -280,6 +643,25 @@ class TestPerAccountResets(TzPinned):
         self.assertTrue(logged)
         self.assertEqual({e["window"] for e in logged}, {"session", "week"})
 
+    def test_a_cswap_switch_does_not_log_a_gift_reset(self):
+        """Regression, reported 2026-08-27: a routine `cswap auto` switch alerted as an
+        Anthropic gift. Mid-switch cswap returns usageStatus=foreign_credential with usage=None;
+        the mapper used to coerce that to 0% and the notifier read 86% -> 0% as a reset."""
+        d = doc()
+        d["accounts"] = [d["accounts"][1]]
+        d["accounts"][0]["usage"]["sevenDay"]["pct"] = 86.0
+        live = srv.cswap_accounts_from_json(d)[0]
+        srv.notify_check(live["u"], live["resets"], acct=srv.notify_key(live))
+        self.assertEqual(srv._load_reset_log(), [])          # baseline, silent
+
+        d["accounts"][0].update(usageStatus="foreign_credential", usage=None)
+        mid = srv.cswap_accounts_from_json(d)[0]
+        self.assertFalse(srv.notifiable(mid))                # the guard that fixes it
+        if srv.notifiable(mid):
+            srv.notify_check(mid["u"], mid["resets"], acct=srv.notify_key(mid))
+        self.assertEqual(srv._load_reset_log(), [], "a cswap switch must not log a reset")
+        self.assertNotEqual(mid["auth"], "dead", "a switch must not read as a dead login")
+
     def test_reset_log_entries_name_the_account(self):
         self._check("personal", 73, 73, "2026-08-25T13:19:00+00:00", "2026-08-30T23:59:00+00:00")
         self._check("personal", 0, 0, "2026-08-25T13:19:00+00:00", "2026-08-30T23:59:00+00:00")
@@ -290,18 +672,76 @@ class TestPerAccountResets(TzPinned):
             json.dump({"session": {"s": 73, "ra": "2026-08-25T17:00:00+00:00"},
                        "week": {"w": 73, "ra": "2026-08-27T01:00:00+00:00"}}, f)
         srv._notify_state = None
-        srv.migrate_notify_state("work")
+        accts = srv.cswap_accounts_from_json(doc())
+        srv.migrate_notify_state(accts)
         st = srv._load_notify_state()
-        self.assertEqual(st["work"]["session"]["s"], 73)
+        key = srv.notify_key(accts[0])
+        self.assertEqual(st[key]["session"]["s"], 73)
         self.assertNotIn("session", st)
 
+    def test_label_keyed_state_migrates_onto_the_stable_key(self):
+        accts = srv.cswap_accounts_from_json(doc())
+        with open(srv.NOTIFY_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"personal": {"session": {"s": 5, "ra": "2026-08-26T15:49:59+00:00"}}}, f)
+        srv._notify_state = None
+        srv.migrate_notify_state(accts)
+        st = srv._load_notify_state()
+        self.assertNotIn("personal", st)
+        self.assertEqual(st[srv.notify_key(accts[1])]["session"]["s"], 5)
 
-class TestBackendSelection(unittest.TestCase):
-    def test_cswap_source_wins_when_it_returns_accounts(self):
-        self.assertEqual(srv.pick_source(cswap_ok=True), "cswap")
+    def test_split_namespaces_merge_keeping_the_freshest_baseline(self):
+        # the real artefact: one account split across 'personal' and the email-derived 'varma.ad'
+        accts = srv.cswap_accounts_from_json(doc())
+        with open(srv.NOTIFY_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({
+                "personal": {"week": {"w": 0, "f": 56, "ra": "2026-08-30T23:59:59+00:00"}},
+                "varma.ad": {"week": {"w": 90, "f": 56, "ra": "2026-09-06T23:59:59+00:00"}},
+            }, f)
+        srv._notify_state = None
+        srv.migrate_notify_state(accts)
+        st = srv._load_notify_state()
+        self.assertNotIn("personal", st)
+        self.assertNotIn("varma.ad", st)
+        self.assertEqual(st[srv.notify_key(accts[1])]["week"]["w"], 90)   # later ra wins
 
-    def test_falls_back_to_native_without_cswap(self):
-        self.assertEqual(srv.pick_source(cswap_ok=False), "native")
+    def test_migration_is_idempotent(self):
+        accts = srv.cswap_accounts_from_json(doc())
+        with open(srv.NOTIFY_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"personal": {"session": {"s": 5, "ra": "2026-08-26T15:49:59+00:00"}}}, f)
+        srv._notify_state = None
+        srv.migrate_notify_state(accts)
+        first = json.loads(json.dumps(srv._load_notify_state()))
+        self.assertFalse(srv.migrate_notify_state(accts))
+        self.assertEqual(srv._load_notify_state(), first)
+
+
+class TestCswapIsRequired(TzPinned):
+    """cswap is the single source of accounts, for one account or twelve. There is no second
+    code path: ClaudeTV does no OAuth of its own at runtime, so there is nothing to drift."""
+
+    def test_a_single_account_goes_through_cswap_like_any_other(self):
+        d = doc(); d["accounts"] = [d["accounts"][0]]
+        accts = srv.cswap_accounts_from_json(d)
+        self.assertEqual(len(accts), 1)
+        self.assertEqual(accts[0]["label"], "WORK")
+        self.assertFalse(accts[0]["stale"])
+
+    def test_no_accounts_yields_a_setup_state_not_a_crash(self):
+        w = srv.usage_wire([], {})
+        self.assertEqual(w["ok"], 0)
+        self.assertEqual(w["n"], 0)
+        self.assertTrue(w["err"])
+
+    def test_the_native_oauth_runtime_is_gone(self):
+        # these existed only to poll Anthropic directly; cswap owns that now
+        for gone in ("keeper", "refresh_token", "cred_stores", "cred_path", "fetch_usage",
+                     "native_accounts", "token_status", "auth_state", "pick_source"):
+            self.assertFalse(hasattr(srv, gone), "%s should have been removed" % gone)
+
+    def test_login_survives_as_an_enrollment_helper(self):
+        # a headless box has no Claude Code to log in with, so ClaudeTV still mints the
+        # credential that `cswap add` then adopts
+        self.assertTrue(hasattr(srv, "oauth_login"))
 
 
 if __name__ == "__main__":
