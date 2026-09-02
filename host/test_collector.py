@@ -365,6 +365,36 @@ class TestFleetExhaustion(TzPinned):
         fleet = [self.acct("work", 99, 40), self.acct("spare", 1, 1, disabled=True)]
         self.assertTrue(srv.fleet_state(fleet, self.POLICY)["exhausted"])
 
+    def test_a_benched_account_with_room_is_named_as_the_reason(self):
+        # the live case: work capped, the spare sitting at 7% but held out by `cswap disable`.
+        # Excluding it from the verdict is right; failing to SAY so is what read as a broken
+        # detector, since "every account is out of quota" is false of the account you can see.
+        fleet = [self.acct("work", 100, 40), self.acct("personal", 7, 42, disabled=True)]
+        st = srv.fleet_state(fleet, self.POLICY)
+        self.assertTrue(st["exhausted"])
+        self.assertEqual(st["benched"], [{"label": "PERSONAL", "pct": 42, "why": "disabled"}])
+
+    def test_a_dead_account_is_benched_with_its_own_reason(self):
+        fleet = [self.acct("work", 99, 40), self.acct("old", 1, 1, auth="dead")]
+        st = srv.fleet_state(fleet, self.POLICY)
+        self.assertEqual([b["why"] for b in st["benched"]], ["login expired"])
+
+    def test_a_benched_account_without_room_is_not_offered_as_a_way_out(self):
+        # enabling it would not help: it is over the threshold too
+        fleet = [self.acct("work", 99, 40), self.acct("spare", 98, 20, disabled=True)]
+        self.assertEqual(srv.fleet_state(fleet, self.POLICY)["benched"], [])
+
+    def test_a_benched_account_we_cannot_read_is_not_offered_either(self):
+        fleet = [self.acct("work", 99, 40), self.acct("spare", -1, -1, stale=True, disabled=True)]
+        st = srv.fleet_state(fleet, self.POLICY)
+        self.assertEqual(st["benched"], [])
+        self.assertTrue(st["exhausted"])      # unreadable AND benched: still not a candidate
+
+    def test_benched_accounts_do_not_count_as_unreadable(self):
+        # a disabled account must not suppress the verdict the way a stale in-rotation one does
+        fleet = [self.acct("work", 99, 40), self.acct("spare", 1, 1, disabled=True)]
+        self.assertEqual(srv.fleet_state(fleet, self.POLICY)["unknown"], 0)
+
     def test_dead_accounts_are_excluded_from_the_fleet(self):
         fleet = [self.acct("work", 99, 40), self.acct("old", 1, 1, auth="dead")]
         self.assertTrue(srv.fleet_state(fleet, self.POLICY)["exhausted"])
@@ -383,9 +413,9 @@ class TestFleetAlerts(TzPinned):
 
     def setUp(self):
         super().setUp()
-        self.sent = []
+        self.sent = []; self.bodies = []
         self._alert = srv._fleet_alert
-        srv._fleet_alert = lambda ev, body: self.sent.append(ev)
+        srv._fleet_alert = lambda ev, body: (self.sent.append(ev), self.bodies.append(body))
         self._state = dict(srv._fleet_last)
         srv._fleet_last.clear()
 
@@ -411,6 +441,18 @@ class TestFleetAlerts(TzPinned):
         srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 2, 20)], self.POLICY)
         srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 3, 20)], self.POLICY)
         self.assertEqual(self.sent, ["exhausted", "recovered"])
+
+    def test_a_block_caused_by_a_benched_account_says_so(self):
+        srv.fleet_check([self.acct("work", 100, 40),
+                         self.acct("personal", 7, 42, disabled=True)], self.POLICY)
+        self.assertEqual(self.sent, ["benched"])
+        self.assertIn("PERSONAL 42% (disabled)", self.bodies[0])
+        self.assertIn("cswap enable", self.bodies[0])
+
+    def test_a_genuine_all_out_block_keeps_the_original_wording(self):
+        srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 97, 20)], self.POLICY)
+        self.assertEqual(self.sent, ["exhausted"])
+        self.assertIn("Every Claude account", self.bodies[0])
 
     def test_a_switch_between_two_healthy_accounts_is_silent(self):
         a = [self.acct("work", 96, 40), self.acct("personal", 5, 20)]

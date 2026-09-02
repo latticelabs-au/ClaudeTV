@@ -335,7 +335,13 @@ def binding_pct(rec, policy):
 def _eligible(rec):
     """Accounts cswap could actually switch onto. A disabled or dead account's headroom is not
     available to you, so counting it would under-report a real block."""
-    return not rec.get("disabled") and rec.get("auth") != "dead"
+    return not _bench_reason(rec)
+
+def _bench_reason(rec):
+    """Why an account is held out of rotation, worded as the remedy is. '' when it is in."""
+    if rec.get("disabled"): return "disabled"
+    if rec.get("auth") == "dead": return "login expired"
+    return ""
 
 def fleet_state(accounts, policy):
     """Is the whole fleet out of quota? Returns the accounts that still have room, the binding
@@ -343,20 +349,29 @@ def fleet_state(accounts, policy):
 
     An account whose usage we cannot currently see blocks the "exhausted" verdict entirely: it
     might be the one with room, and a false "you are blocked" is worse than a late one."""
-    rows, unknown = [], 0
+    rows, unknown, benched = [], 0, []
     for rec in accounts:
-        if not _eligible(rec): continue
         b = -1 if rec.get("stale") else binding_pct(rec, policy)
+        why = _bench_reason(rec)
+        if why:
+            # A benched account still cannot end a block, because cswap will not switch onto it.
+            # But when one is sitting on real headroom it IS the reason you are stuck, and naming
+            # it turns "every account is out of quota" - which reads as a broken detector when you
+            # know the spare is at 7% - into something you can act on.
+            if 0 <= b < policy["threshold"]:
+                benched.append({"label": rec["label"], "pct": b, "why": why})
+            continue
         if b < 0: unknown += 1
         else: rows.append((rec["label"], b))
     headroom = [lbl for lbl, b in rows if b < policy["threshold"]]
     best = min(rows, key=lambda r: r[1])[0] if rows else ""
     return {"exhausted": bool(rows) and not headroom and not unknown, "headroom": headroom,
             "binding": dict(rows), "best": best, "usable": len(rows), "unknown": unknown,
-            "threshold": policy["threshold"]}
+            "benched": benched, "threshold": policy["threshold"]}
 
 _fleet_last = {}          # edge-trigger memory: {"exhausted": bool}
 _FLEET_TITLES = {"exhausted": "\U0001F6D1 ClaudeTV: every Claude account is out of quota",
+                 "benched": "\U0001F6D1 ClaudeTV: no Claude account left in rotation",
                  "recovered": "\U0001F7E2 ClaudeTV: quota available again"}
 
 def _fleet_alert(event, body):
@@ -379,10 +394,21 @@ def fleet_check(accounts, policy):
         if st["exhausted"] and not was:
             _fleet_last["exhausted"] = True
             worst = ", ".join("%s %d%%" % (l, b) for l, b in sorted(st["binding"].items()))
-            _fleet_alert("exhausted", "Every Claude account is at or above %g%% on its binding "
-                         "window, so there is nothing for cswap to switch to and Claude Code is "
-                         "blocked until one resets. Now: %s." % (st["threshold"], worst))
-            print("[%s] FLEET exhausted (%s)" % (time.strftime("%H:%M:%S"), worst))
+            if st["benched"]:
+                spare = ", ".join("%s %d%% (%s)" % (b["label"], b["pct"], b["why"])
+                                  for b in st["benched"])
+                _fleet_alert("benched", "Every account cswap can switch to is at or above %g%% on "
+                             "its binding window, so Claude Code is blocked. In rotation: %s. Held "
+                             "OUT of rotation and still has room: %s - `cswap enable <account>` "
+                             "puts it back and unblocks you now."
+                             % (st["threshold"], worst, spare))
+            else:
+                _fleet_alert("exhausted", "Every Claude account is at or above %g%% on its binding "
+                             "window, so there is nothing for cswap to switch to and Claude Code is "
+                             "blocked until one resets. Now: %s." % (st["threshold"], worst))
+            print("[%s] FLEET blocked (%s)%s" % (time.strftime("%H:%M:%S"), worst,
+                  "".join(" [benched: %s %d%% %s]" % (b["label"], b["pct"], b["why"])
+                          for b in st["benched"])))
         elif was and st["headroom"]:
             # Recovery needs POSITIVE evidence that an account has room. "not exhausted" is not
             # enough: a poll where one account is unreadable also fails the exhausted test, and
@@ -397,7 +423,7 @@ def fleet_check(accounts, policy):
     except Exception as e:
         print("[fleet] check error: %s" % e)
         return {"exhausted": False, "headroom": [], "binding": {}, "best": "", "usable": 0,
-                "threshold": policy.get("threshold", 0)}
+                "benched": [], "threshold": policy.get("threshold", 0)}
 
 def notifiable(rec):
     """May this reading drive reset detection?
@@ -1153,11 +1179,13 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  fwbtn.disabled=busy||!U.can_update;
  fwbtn.textContent=busy?'updating…':('Update device'+(U.can_update?(' to '+U.latest):''));
  if(!busy&&fwpoll){clearInterval(fwpoll);fwpoll=null;}
- const F=s.fleet||{},P=F.policy||{};
+ const F=s.fleet||{},P=F.policy||{},B=F.benched||[];
  fleetrow.style.display=(A.list.length?'':'none');
- pill(fleet,F.exhausted?'bad':'ok',F.exhausted?'ALL ACCOUNTS OUT':((F.headroom||[]).length+' with room'));
- fleetmeta.textContent=P.threshold?('blocked at '+P.threshold+'% binding · cswap '+P.strategy
-   +' · hysteresis '+P.hysteresis+'pp · cooldown '+P.cooldown+'s'+(P.model?(' · model '+P.model):'')):'';
+ pill(fleet,F.exhausted?'bad':'ok',F.exhausted?(B.length?'NO ACCOUNT IN ROTATION':'ALL ACCOUNTS OUT'):((F.headroom||[]).length+' with room'));
+ fleetmeta.textContent=(F.exhausted&&B.length?(B.map(b=>b.label+' has room ('+b.pct+'%) but is '+b.why
+   +' - cswap enable '+b.label.toLowerCase()).join('; ')+' · '):'')
+   +(P.threshold?('blocked at '+P.threshold+'% binding · cswap '+P.strategy
+   +' · hysteresis '+P.hysteresis+'pp · cooldown '+P.cooldown+'s'+(P.model?(' · model '+P.model):'')):'');
  // no cswap on this box -> tell them exactly how to get multi-account, inline
  cswapadd.style.display=cs?'none':'';
  cswapadd.innerHTML=cs?'':'Want more than one account? Install <b>claude-swap</b> on this host, then add each login.';
