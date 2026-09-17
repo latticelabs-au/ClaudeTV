@@ -43,7 +43,7 @@ EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", 
             "CSWAP_BIN", "CSWAP_ACCOUNTS", "UPDATE_EVERY",
             # --- accounts: codex is the optional second source, one CODEX_HOME per account ---
             "CODEX_BIN", "CODEX_ACCOUNTS", "CODEX_EVERY", "CODEX_TIMEOUT", "CODEX_SCOPED",
-            "CODEX_MAXED_THRESHOLD",
+            "CODEX_MAXED_THRESHOLD", "CODEX_LABELS",
             "NOTIFY_FLEET_MAXED", "MAXED_THRESHOLD",
             # --- reset notifications (non-secret; secrets live in SECRET_KEYS below) ---
             "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_AUTH",
@@ -63,6 +63,8 @@ DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Au
             # endpoint, so this is deliberately slow. 300 is also the enforced floor.
             "CODEX_BIN": "", "CODEX_ACCOUNTS": "", "CODEX_EVERY": "300", "CODEX_TIMEOUT": "20",
             "CODEX_SCOPED": "", "CODEX_MAXED_THRESHOLD": "100",
+            # display names chosen in the terminal, folder=Name pairs (e.g. default=Astra,work=Team)
+            "CODEX_LABELS": "",
             # blank threshold = follow cswap's own autoswitch.threshold
             "NOTIFY_FLEET_MAXED": "true", "MAXED_THRESHOLD": "",
             "NOTIFY_SESSION_RESET": "false", "NOTIFY_SESSION_MAXED": "false",
@@ -835,6 +837,56 @@ def codex_fleet_check(accounts):
 _codex = {"accts": [], "ts": 0, "next": 0.0, "fails": 0, "force": False, "last": 0.0,
           "good": {}, "hold": {}, "ident": {}, "pending": None, "fleet": {}}
 
+def codex_labels():
+    """{slot: name} chosen in the master terminal (CODEX_LABELS, 'default=Astra,work=Team'). The
+    slot stays the identity, so a rename never moves reset history or alert state."""
+    out = {}
+    for part in (CONFIG.get("CODEX_LABELS") or "").split(","):
+        k, _, v = part.partition("=")
+        if k.strip() and v.strip(): out[k.strip().lower()] = v.strip()
+    return out
+
+# cswap's own alias rule (letters, digits, . - _, not purely numeric), tightened so a name can
+# never START with '-': it is passed to `cswap alias` as an argument and must not read as an option.
+_NAME_OK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
+
+def rename_account(key, name):
+    """Rename an account from the master terminal. '' puts the default name back.
+
+    Claude aliases belong to cswap, so that side IS `cswap alias <slot> <name>` and the new label
+    is read back from cswap on an immediate re-poll. Codex has no such owner, so its name is a
+    label override in our own config, applied at once. Either way the record KEY is untouched."""
+    name = (name or "").strip()
+    if name and (not _NAME_OK.fullmatch(name) or name.isdigit()):
+        return {"ok": 0, "err": "use letters, digits, . - and _ (max 32, not only digits, must not start with a symbol)"}
+    with _lock: rec = next((a for a in _accounts if a.get("key") == key), None)
+    if not rec: return {"ok": 0, "err": "unknown account"}
+    if rec.get("provider") == "codex":
+        slot = rec["slot"]; labels = codex_labels()
+        if name: labels[slot] = name
+        else: labels.pop(slot, None)
+        save_config({"CODEX_LABELS": ",".join("%s=%s" % kv for kv in sorted(labels.items()))})
+        folder = next((h[1] for h in codex_homes(CONFIG.get("CODEX_ACCOUNTS", ""), seen=set(_codex["good"]))
+                       if h[0] == slot), "")
+        alias = name or folder
+        label = _label(alias, rec.get("email") or "", "") if (alias or rec.get("email")) else "CODEX"
+        # the published record and the last-good copy are patched in place, so the display does not
+        # wait up to CODEX_EVERY for a name change; the next refresh reads the same override
+        for r in (rec, _codex["good"].get(slot)):
+            if r: r["label"] = label
+        return {"ok": 1, "label": label}
+    exe, num = cswap_bin(), str(key).split(":", 1)[0]
+    if not exe or not num.isdigit(): return {"ok": 0, "err": "claude-swap is not available for this account"}
+    try:
+        p = subprocess.run([exe, "alias", num] + ([name] if name else ["--unset"]),
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return {"ok": 0, "err": "cswap alias failed: %s" % str(e)[:120]}
+    if p.returncode != 0:
+        return {"ok": 0, "err": ((p.stderr or p.stdout or "cswap alias failed").strip().splitlines() or ["cswap alias failed"])[-1][:200]}
+    globals()["_force_poll"] = True                        # read the new alias back from cswap now
+    return {"ok": 1, "label": _label(name, rec.get("email") or "", num)}
+
 def codex_refresh(now, force=False, reader=None):
     """One I/O pass: discover, read, map, merge last-good. Pure I/O and mapping: it touches no
     notifier state, which stays on the poller thread (see codex_apply_pending). Never raises
@@ -851,6 +903,7 @@ def codex_refresh(now, force=False, reader=None):
     out = []
     for slot, alias, path in homes:
         if slot not in raws: out.append(prev[slot]); continue
+        alias = codex_labels().get(slot) or alias          # a name chosen in the terminal wins
         try: rec = codex_account_from_rpc(slot, alias, path, raws[slot], CONFIG.get("CODEX_SCOPED", ""))
         except Exception as e:
             # One account's reply we cannot map must cost THAT account a reading, never the pass:
@@ -1696,6 +1749,7 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
    return '<div style="border-top:1px solid var(--line);padding:8px 0">'
     +'<div class=row style=margin:0><span><b>'+esc(a.label)+'</b> <span class=muted>'+(a.provider=='codex'?'codex':'claude')+(a.plan?(' '+esc(a.plan)):'')
       +'</span>'+(a.blocked?' <span style=color:#f0ad36>blocked</span>':'')+(a.provider!='codex'&&a.active?' <span class=muted>active</span>':'')
+      +' <a href=# class=muted data-rename="'+esc(a.key)+'" data-label="'+esc(a.label)+'" style="text-decoration:underline">rename</a>'
       +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?'LOGIN EXPIRED':'ok')+'</span></div>'
     +'<div class=row style="margin:2px 0"><span class=muted>'+esc(a.email||'')+'</span>'
       +'<span>'+(a.stale?'<span style=color:#f0ad36>stale </span>':'')
@@ -1741,6 +1795,15 @@ function fwcheck(){fwmsg.textContent='checking…';fetch('/api/update?action=che
 function fwflash(){if(!confirm('Download the latest firmware and flash the device now?\\n\\nThe device reboots and is unavailable for about a minute.'))return;
  fwbtn.disabled=true;fetch('/api/update?action=flash',{method:'POST'}).then(()=>{fwpoll=setInterval(load,3000);load()})}
 let fwpoll=null;
+// Rename works for both providers: Claude names are cswap aliases, Codex names are kept by ClaudeTV.
+function renameAcct(key,cur){
+ const n=prompt('Name for '+cur+' (letters, digits, . - and _; the display shows the first 8 characters; leave blank to put the default name back)',cur);
+ if(n===null)return;
+ fetch('/api/rename?key='+encodeURIComponent(key)+'&name='+encodeURIComponent(n.trim()),{method:'POST'}).then(r=>r.json())
+  .then(j=>{if(!j.ok)alert(j.err||'rename failed');load();setTimeout(load,2500);setTimeout(load,6000);}).catch(()=>alert('rename failed'));
+}
+document.addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('[data-rename]');
+ if(b){e.preventDefault();renameAcct(b.dataset.rename,b.dataset.label);}});
 function poll(){pill(svc,'warn','re-reading…');fetch('/api/service?action=poll',{method:'POST'}).then(()=>setTimeout(()=>{pill(svc,'ok','running');load()},1500))}
 function restart(){if(!confirm('Restart collector?'))return;fetch('/api/service?action=restart',{method:'POST'}).then(()=>{pill(svc,'warn','restarting');setTimeout(load,3500)})}
 load();setInterval(load,3000);
@@ -1787,6 +1850,8 @@ class H(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(update_check()))
         elif path == "/api/update" and q.get("action") == "flash":
             self._send(200, "application/json", json.dumps(update_start()))
+        elif path == "/api/rename":
+            self._send(200, "application/json", json.dumps(rename_account(q.get("key", ""), q.get("name", ""))))
         elif path == "/api/notify-test":
             self._send(200, "application/json", json.dumps({"results": notify_test(q.get("channel", "all"))}))
         else: self._send(404, "text/plain", "not found")
