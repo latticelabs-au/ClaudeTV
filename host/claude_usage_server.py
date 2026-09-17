@@ -20,7 +20,7 @@ cswap's own autoswitch.threshold so the two never disagree.
 
 Config is read from environment / a .env beside this file and is editable from the terminal.
 """
-import base64, hashlib, json, os, re, secrets, shutil, subprocess, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
+import base64, hashlib, json, os, re, secrets, shutil, signal, subprocess, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -664,6 +664,89 @@ def codex_with_last_good(rec, good, now):
         if not rec["email"]: rec["email"], rec["label"] = good["email"], good["label"]
         rec["good_at"] = good.get("good_at", now); rec["age"] = int(now - rec["good_at"])
     return rec
+
+def _codex_reap(p):
+    """Closing stdin makes the app-server exit by itself (30ms, rc 0). The kill is the fallback
+    for a server that is hung on a backend call, which Codex itself never abandons."""
+    try: p.stdin.close()
+    except Exception: pass
+    try: p.wait(2)
+    except Exception:
+        try:
+            if os.name == "nt": p.kill()
+            else: os.killpg(p.pid, signal.SIGKILL)
+        except Exception:
+            try: p.kill()
+            except Exception: pass
+        try: p.wait(5)
+        except Exception: pass
+    try: p.stdout.close()
+    except Exception: pass
+
+def codex_rpc_read(exe, home, deadline_s=20.0):
+    """One short-lived `codex app-server` for one CODEX_HOME. Returns
+    {account: reply|None, limits: reply|None, driver_err: ''|'timeout'|'unavailable'} where a
+    reply is the whole JSON-RPC message. Never raises, always reaps the child. ONE absolute
+    deadline covers spawn, handshake and both reads. `exe` may be a list (tests run a fake)."""
+    out = {"account": None, "limits": None, "driver_err": ""}
+    end = time.monotonic() + deadline_s
+    env = dict(os.environ); env["CODEX_HOME"] = home
+    kw = ({"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)} if os.name == "nt"
+          else {"start_new_session": True})
+    try:
+        p = subprocess.Popen((exe if isinstance(exe, list) else [exe]) + ["app-server", "--disable", "plugins"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
+                             cwd=tempfile.gettempdir(), **kw)
+    except Exception:
+        out["driver_err"] = "unavailable"; return out
+    replies = {}; cv = threading.Condition(); st = {"eof": False}
+    def reader():
+        try:
+            for line in p.stdout:
+                try: o = json.loads(line)
+                except ValueError: continue          # log chatter, partial lines
+                # anything without an id we sent is a notification (remoteControl/status/changed ...)
+                if isinstance(o, dict) and "id" in o and ("result" in o or "error" in o):
+                    with cv: replies[o["id"]] = o; cv.notify_all()
+        except Exception: pass
+        finally:
+            with cv: st["eof"] = True; cv.notify_all()
+    threading.Thread(target=reader, daemon=True).start()
+    def send(o): p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
+    def wait(ids):
+        with cv: cv.wait_for(lambda: all(i in replies for i in ids) or st["eof"],
+                             max(0.0, end - time.monotonic()))
+        return all(i in replies for i in ids)
+    try:
+        send({"method": "initialize", "id": 1, "params": {"clientInfo": {
+              "name": "claudetv", "title": "ClaudeTV collector", "version": "1"}}})
+        if wait([1]):
+            send({"method": "initialized"})
+            send({"method": "account/read", "id": 2, "params": {"refreshToken": False}})
+            # the flag skips a second backend lookup; supportsLunaReserve is deliberately never
+            # sent (Codex source: passive usage readers must not opt in)
+            send({"method": "account/rateLimits/read", "id": 3,
+                  "params": {"excludeResetCreditDetails": True}})
+            wait([2, 3])
+    except Exception: pass
+    out["account"], out["limits"] = replies.get(2), replies.get(3)
+    if out["limits"] is None: out["driver_err"] = "unavailable" if st["eof"] else "timeout"
+    _codex_reap(p)
+    return out
+
+def codex_poll(exe, homes, deadline_s, reader=None):
+    """Read every home CONCURRENTLY: a poll costs the slowest single read, and a hung backend
+    costs one deadline rather than one per account. Results come back in `homes` order."""
+    reader = reader or codex_rpc_read
+    res = [None] * len(homes)
+    def one(i, path):
+        try: res[i] = reader(exe, path, deadline_s)
+        except Exception: res[i] = None
+    ths = [threading.Thread(target=one, args=(i, h[2]), daemon=True) for i, h in enumerate(homes)]
+    for t in ths: t.start()
+    for t in ths: t.join(deadline_s + 10)
+    return [r or {"account": None, "limits": None, "driver_err": "timeout"} for r in res]
 
 # ---------- in-app firmware updater ----------
 # The collector already reaches both GitHub and the device, and the stock ESP8266HTTPUpdateServer

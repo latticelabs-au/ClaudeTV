@@ -7,7 +7,7 @@ Covers the multi-account seam: mapping `cswap list --json` into account records,
 backwards-compatible /usage wire contract, and per-account reset detection (including the
 account-switch-is-not-a-reset case that produced a phantom 'gift' in the single-account build).
 """
-import json, os, tempfile, unittest
+import json, os, subprocess, sys, tempfile, time, unittest
 
 import claude_usage_server as srv
 
@@ -1014,6 +1014,125 @@ class TestCodexConfig(unittest.TestCase):
         old = srv.CONFIG.get("CODEX_BIN"); srv.CONFIG["CODEX_BIN"] = "/definitely/not/here/codex"
         try: self.assertEqual(srv.codex_bin(), "")
         finally: srv.CONFIG["CODEX_BIN"] = old
+
+
+FAKE_CODEX = r'''
+import json, os, sys, time
+home = os.environ.get("CODEX_HOME", "")
+def rd(n, d=""):
+    try: return open(os.path.join(home, n), encoding="utf-8").read().strip()
+    except Exception: return d
+mode = rd("mode", "ok")
+json.dump(sys.argv[1:], open(os.path.join(home, "argv.json"), "w"))
+def out(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+if mode == "exit": sys.exit(3)
+for line in sys.stdin:
+    try: m = json.loads(line)
+    except ValueError: continue
+    meth, i = m.get("method"), m.get("id")
+    if meth == "initialize":
+        if mode == "noinit": time.sleep(600)
+        sys.stdout.write("WARN not json at all\n"); sys.stdout.flush()
+        out({"method": "remoteControl/status/changed", "params": {}})
+        out({"id": i, "result": {"userAgent": "fake"}})
+    elif meth == "account/read":
+        out({"id": i, "result": {"account": None if mode == "loggedout" else
+             {"type": "chatgpt", "email": "cosmo@example.com", "planType": "prolite"},
+             "requiresOpenaiAuth": True}})
+    elif meth == "account/rateLimits/read":
+        json.dump(m.get("params"), open(os.path.join(home, "params.json"), "w"))
+        if mode == "hang": time.sleep(600)
+        elif mode == "loggedout":
+            out({"id": i, "error": {"code": -32600,
+                 "message": "codex account authentication required to read rate limits"}})
+        else: out({"id": i, "result": json.loads(rd("limits.json", "{}"))})
+'''
+
+
+class TestCodexDriver(unittest.TestCase):
+    """Drives a fake `codex` that speaks the same stdio protocol. The real binary is covered by
+    TestCodexLiveContract (opt-in) and by the acceptance run in Task 8."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        fake = os.path.join(self.tmp.name, "fake_codex.py")
+        with open(fake, "w", encoding="utf-8") as f: f.write(FAKE_CODEX)
+        self.exe = [sys.executable, fake]
+        self.made = []; made = self.made
+        self._popen = subprocess.Popen
+
+        class Spy(subprocess.Popen):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k); made.append(self)
+        subprocess.Popen = Spy
+
+    def tearDown(self):
+        subprocess.Popen = self._popen
+        for p in self.made:
+            try: p.kill()
+            except Exception: pass
+        self.tmp.cleanup()
+
+    def home(self, mode, name):
+        p = os.path.join(self.tmp.name, name); os.makedirs(p, exist_ok=True)
+        with open(os.path.join(p, "mode"), "w") as f: f.write(mode)
+        with open(os.path.join(p, "limits.json"), "w") as f: json.dump(CODEX_LIMITS["result"], f)
+        return p
+
+    def test_happy_path_reads_through_log_chatter_and_notifications(self):
+        o = srv.codex_rpc_read(self.exe, self.home("ok", "a"), 10)
+        self.assertEqual(o["driver_err"], "")
+        self.assertEqual(o["limits"]["result"]["accountId"], "acc-1")
+        self.assertEqual(o["account"]["result"]["account"]["planType"], "prolite")
+
+    def test_launches_lean_and_polls_politely(self):
+        h = self.home("ok", "a"); srv.codex_rpc_read(self.exe, h, 10)
+        def load(name):
+            with open(os.path.join(h, name)) as f: return json.load(f)
+        self.assertEqual(load("argv.json"), ["app-server", "--disable", "plugins"])
+        self.assertEqual(load("params.json"), {"excludeResetCreditDetails": True})
+
+    def test_the_child_is_always_reaped(self):
+        for mode in ("ok", "loggedout", "exit", "hang"):
+            srv.codex_rpc_read(self.exe, self.home(mode, "r_" + mode), 1.0)
+        self.assertEqual([p.poll() is not None for p in self.made], [True] * 4)
+
+    def test_a_logged_out_home_reaches_the_status_table_as_dead(self):
+        o = srv.codex_rpc_read(self.exe, self.home("loggedout", "a"), 10)
+        self.assertEqual(srv.codex_status(o["account"], o["limits"], o["driver_err"]), ("dead", "login_required"))
+
+    def test_a_server_that_exits_early_is_unavailable_not_an_exception(self):
+        self.assertEqual(srv.codex_rpc_read(self.exe, self.home("exit", "a"), 10)["driver_err"], "unavailable")
+
+    def test_a_missing_binary_is_unavailable_not_an_exception(self):
+        self.assertEqual(srv.codex_rpc_read(["definitely-not-a-binary-xyz"], self.home("ok", "a"), 5)["driver_err"],
+                         "unavailable")
+
+    def test_no_handshake_times_out_inside_the_deadline(self):
+        t0 = time.monotonic(); o = srv.codex_rpc_read(self.exe, self.home("noinit", "a"), 1.5)
+        self.assertEqual(o["driver_err"], "timeout"); self.assertLess(time.monotonic() - t0, 6.0)
+
+    def test_largest_plausible_input_eight_hung_accounts_within_a_wall_clock_budget(self):
+        """MAXACC is 8 and Codex never abandons a hung backend. The budget is measured time:
+        one deadline plus the 2s graceful-exit wait, NOT eight of them."""
+        homes = [("h%d" % i, "h%d" % i, self.home("hang", "hang%d" % i)) for i in range(8)]
+        t0 = time.monotonic(); res = srv.codex_poll(self.exe, homes, 2.0); wall = time.monotonic() - t0
+        self.assertEqual([r["driver_err"] for r in res], ["timeout"] * 8)
+        self.assertLess(wall, 8.0, "8 hung accounts took %.1fs: reads are not concurrent" % wall)
+        self.assertEqual(len(self.made), 8)
+        self.assertTrue(all(p.poll() is not None for p in self.made), "a hung child was left running")
+
+    def test_one_hung_home_does_not_poison_the_others(self):
+        homes = [("a", "a", self.home("ok", "m_ok")), ("b", "b", self.home("hang", "m_hang")),
+                 ("c", "c", self.home("loggedout", "m_lo"))]
+        res = srv.codex_poll(self.exe, homes, 2.0)
+        self.assertEqual([r["driver_err"] for r in res], ["", "timeout", ""])
+        self.assertEqual(res[2]["limits"]["error"]["code"], -32600)
+
+    def test_a_reader_that_raises_is_contained(self):
+        def boom(exe, home, deadline): raise RuntimeError("nope")
+        res = srv.codex_poll("x", [("a", "a", "/h")], 1.0, reader=boom)
+        self.assertEqual(res, [{"account": None, "limits": None, "driver_err": "timeout"}])
 
 if __name__ == "__main__":
     unittest.main()
