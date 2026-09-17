@@ -1782,6 +1782,8 @@ rtk git archive --format=tar HEAD host | ssh ubuntu 'set -e; d=$(mktemp -d /tmp/
   sleep 40; grep -i -E "codex|error|Traceback" run.log | head; cd /; rm -rf "$d"; pgrep -u $(id -u) -af "[c]odex app-server" | wc -l'
 ```
 
+NEVER stop the scratch collector with `pkill`/`pgrep -f` by script name on this host. Production runs the same file name under systemd with parent PID 1, so a name pattern kills the live service (this happened once during acceptance on 2026-09-17: 5 seconds of downtime before `Restart=always` brought it back). Let `timeout` end the scratch process, or kill the exact PID you started.
+
 Expected, all of:
 - the full suite is `OK` on Python 3.12 (the dev machine runs 3.14);
 - the live contract tests pass on the host's codex;
