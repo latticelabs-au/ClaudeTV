@@ -958,5 +958,62 @@ class TestCodexLastGood(TzPinned):
             srv.codex_account_from_rpc("default", "", "/h", cx_raw(None, None, "timeout")), None, 1.0)
         self.assertEqual((bad["u"]["s"], bad["u"]["w"]), (-1, -1))
 
+
+class TestCodexDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dot = os.path.join(self.tmp.name, "dot"); self.root = os.path.join(self.tmp.name, "root")
+        os.makedirs(self.dot)
+        for n in ("Work", "alt"): os.makedirs(os.path.join(self.root, n))
+
+    def tearDown(self): self.tmp.cleanup()
+
+    def homes(self, only="", seen=()):
+        return srv.codex_homes(only, self.dot, self.root, seen)
+
+    def login(self): open(os.path.join(self.dot, "auth.json"), "w").close()
+
+    def test_default_home_counts_only_once_it_holds_a_login(self):
+        self.assertNotIn("default", [h[0] for h in self.homes()])
+        self.login()
+        self.assertEqual(self.homes()[0], ("default", "", self.dot))
+
+    def test_every_directory_under_the_root_is_an_account_logged_in_or_not(self):
+        self.assertEqual(sorted(h[0] for h in self.homes()), ["alt", "work"])
+
+    def test_slot_is_lowercase_but_the_alias_keeps_its_case(self):
+        self.assertIn(("work", "Work", os.path.join(self.root, "Work")), self.homes())
+
+    def test_filter_selects_and_orders_and_ignores_unknown_names(self):
+        self.login()
+        self.assertEqual([h[0] for h in self.homes("alt, default,nope")], ["alt", "default"])
+
+    def test_a_default_home_seen_good_survives_a_logout_so_it_can_show_login_expired(self):
+        self.assertEqual([h[0] for h in self.homes("default", seen={"default"})], ["default"])
+
+    def test_a_missing_root_is_not_an_error(self):
+        self.assertEqual(srv.codex_homes("", self.dot, os.path.join(self.tmp.name, "nope")), [])
+
+    def test_a_directory_named_default_cannot_shadow_the_real_default(self):
+        os.makedirs(os.path.join(self.root, "default")); self.login()
+        self.assertEqual([h[0] for h in self.homes()].count("default"), 1)
+
+
+class TestCodexConfig(unittest.TestCase):
+    def test_new_keys_have_working_defaults_and_are_editable(self):
+        for k, v in (("CODEX_BIN", ""), ("CODEX_ACCOUNTS", ""), ("CODEX_EVERY", "300"),
+                     ("CODEX_TIMEOUT", "20"), ("CODEX_SCOPED", ""), ("CODEX_MAXED_THRESHOLD", "100")):
+            self.assertEqual(srv.DEFAULTS[k], v); self.assertIn(k, srv.EDITABLE)
+
+    def test_cfg_num_survives_garbage(self):
+        old = srv.CONFIG.get("CODEX_EVERY"); srv.CONFIG["CODEX_EVERY"] = "banana"
+        try: self.assertEqual(srv._cfg_num("CODEX_EVERY", 300), 300.0)
+        finally: srv.CONFIG["CODEX_EVERY"] = old
+
+    def test_an_explicit_binary_that_does_not_exist_resolves_to_nothing(self):
+        old = srv.CONFIG.get("CODEX_BIN"); srv.CONFIG["CODEX_BIN"] = "/definitely/not/here/codex"
+        try: self.assertEqual(srv.codex_bin(), "")
+        finally: srv.CONFIG["CODEX_BIN"] = old
+
 if __name__ == "__main__":
     unittest.main()

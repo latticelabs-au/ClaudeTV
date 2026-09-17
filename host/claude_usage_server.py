@@ -36,6 +36,9 @@ START_TS = time.time()
 EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", "DEVICE_URL",
             # --- accounts: claude-swap is the single source, for one account or many ---
             "CSWAP_BIN", "CSWAP_ACCOUNTS", "UPDATE_EVERY",
+            # --- accounts: codex is the optional second source, one CODEX_HOME per account ---
+            "CODEX_BIN", "CODEX_ACCOUNTS", "CODEX_EVERY", "CODEX_TIMEOUT", "CODEX_SCOPED",
+            "CODEX_MAXED_THRESHOLD",
             "NOTIFY_FLEET_MAXED", "MAXED_THRESHOLD",
             # --- reset notifications (non-secret; secrets live in SECRET_KEYS below) ---
             "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_AUTH",
@@ -51,6 +54,10 @@ DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Au
             "USAGE_EVERY": "90", "WEATHER_EVERY": "900", "PORT": "8088",
             "DEVICE_URL": "http://claudetv.local",
             "CSWAP_BIN": "", "CSWAP_ACCOUNTS": "", "UPDATE_EVERY": "21600",
+            # Every Codex read is one live backend request per account, against a private
+            # endpoint, so this is deliberately slow. 300 is also the enforced floor.
+            "CODEX_BIN": "", "CODEX_ACCOUNTS": "", "CODEX_EVERY": "300", "CODEX_TIMEOUT": "20",
+            "CODEX_SCOPED": "", "CODEX_MAXED_THRESHOLD": "100",
             # blank threshold = follow cswap's own autoswitch.threshold
             "NOTIFY_FLEET_MAXED": "true", "MAXED_THRESHOLD": "",
             "NOTIFY_SESSION_RESET": "false", "NOTIFY_SESSION_MAXED": "false",
@@ -490,6 +497,58 @@ def usage_wire(accounts, wx, primary=""):
 
 CODEX_MAIN_BUCKET = "codex"
 DAY_MINS, WEEK_MINS = 1440, 10080
+CODEX_DEAD_HOLD = 1800                  # a dead login is re-read this often, not every poll
+CODEX_DEFAULT_HOME = os.path.expanduser("~/.codex")
+CODEX_HOMES_ROOT = os.path.expanduser("~/.claudetv/codex")
+
+def _cfg_num(key, default):
+    try: return float(CONFIG.get(key) or default)
+    except (TypeError, ValueError): return float(default)
+
+def codex_bin():
+    """Configured path, else ~/.local/bin/codex (a systemd unit has a bare PATH), else PATH."""
+    explicit = (CONFIG.get("CODEX_BIN") or "").strip()
+    if explicit: return explicit if os.path.exists(explicit) else ""
+    cand = os.path.expanduser("~/.local/bin/codex")
+    if os.path.exists(cand): return cand
+    return shutil.which("codex") or ""
+
+_codex_ver = {"bin": "", "ver": ""}
+def codex_version():
+    """`codex --version`, cached per binary path so the dashboards can show it for free."""
+    exe = codex_bin()
+    if not exe: return ""
+    if _codex_ver["bin"] != exe:
+        v = ""
+        try:
+            p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=15)
+            v = (p.stdout or p.stderr or "").strip().splitlines()[0][:40]
+        except Exception: pass
+        _codex_ver.update({"bin": exe, "ver": v})
+    return _codex_ver["ver"]
+
+def codex_homes(only="", default_home=None, root=None, seen=()):
+    """Ordered [(slot, alias, path)]. `slot` is the STABLE identity ('default' or the directory
+    name) and keys everything downstream; it never depends on a reply, so it is the same on a
+    good poll and a failed one. ~/.codex counts once it holds a login (or has been seen good
+    this run, so a later logout shows LOGIN EXPIRED instead of vanishing); every directory
+    under the root counts, logged in or not. auth.json is only ever stat'ed, never opened.
+    `only` is a comma list of slots: it filters BEFORE polling and sets the order."""
+    default_home = default_home or CODEX_DEFAULT_HOME; root = root or CODEX_HOMES_ROOT
+    found = []
+    if os.path.isfile(os.path.join(default_home, "auth.json")) or "default" in seen:
+        found.append(("default", "", default_home))
+    try: names = sorted(os.listdir(root))
+    except OSError: names = []
+    for n in names:
+        if n.lower() != "default" and os.path.isdir(os.path.join(root, n)):
+            found.append((n.lower(), n, os.path.join(root, n)))
+    want = [w.strip().lower() for w in (only or "").split(",") if w.strip()]
+    if not want: return found
+    by = {h[0]: h for h in found}; picked = []
+    for w in want:
+        if w in by and by[w] not in picked: picked.append(by[w])
+    return picked
 
 # Codex gives no structured HTTP status, only this message shape (codex-rs backend-client):
 #   "failed to fetch codex rate limits: GET <url> failed: 401 Unauthorized; content-type=...; body=..."
