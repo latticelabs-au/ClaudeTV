@@ -255,6 +255,11 @@ and their page dots), so a mixed fleet reads at a glance. A single Codex-only se
 `CODEX USAGE` title. This needs firmware **v5.2**; an older device still cycles Codex accounts,
 just in coral and with the classic card.
 
+**Renaming:** every account row in the master terminal has a **rename** link, for Claude and Codex
+alike. A Claude name is a claude-swap alias, so the terminal simply runs `cswap alias` for you; a
+Codex name is kept by ClaudeTV (`CLAUDETV_CODEX_LABELS`). The display shows the first 8 characters,
+a blank name puts the default back, and a rename never touches reset history or alert state.
+
 **Good to know:**
 
 - OpenAI decides which limits a plan has. Some plans currently report only a weekly limit. Those
@@ -284,6 +289,7 @@ just in coral and with the classic card.
 | `CLAUDETV_CODEX_TIMEOUT` | `20` | hard deadline for one read |
 | `CLAUDETV_CODEX_SCOPED` | off | part of a model limit's name to show as the third number (for example `spark`) |
 | `CLAUDETV_CODEX_MAXED_THRESHOLD` | `100` | percent at which an account counts as out |
+| `CLAUDETV_CODEX_LABELS` | none | display names set from the terminal, `folder=Name` pairs (`default=Astra,work=Team`) |
 
 ---
 

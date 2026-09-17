@@ -1435,6 +1435,102 @@ class TestCodexWireAndCli(CodexIsolated):
             self.assertEqual(cm.exception.code, 2)
 
 
+class TestRenameFromTheTerminal(CodexIsolated):
+    """The name on the display is editable from the master terminal, for both providers. Claude
+    aliases belong to cswap, so that side is `cswap alias`; Codex gets a label override in our own
+    config. Record KEYS never change, so reset history and alert state survive a rename."""
+
+    def setUp(self):
+        super().setUp()
+        self._env = srv.ENV_PATH; srv.ENV_PATH = os.path.join(self.tmp.name, ".env")
+        self._labels = srv.CONFIG.get("CODEX_LABELS"); srv.CONFIG["CODEX_LABELS"] = ""
+        self._run, self._cswap, self._force = subprocess.run, srv.cswap_bin, srv._force_poll
+        self.ran = []
+        self.reply = (0, "", "")
+        def fake_run(argv, **kw):
+            self.ran.append(list(argv)); rc, out, err = self.reply
+            return subprocess.CompletedProcess(argv, rc, out, err)
+        subprocess.run = fake_run; srv.cswap_bin = lambda: "cswap"
+        self.rd = self.reader({"/h/default": cx_raw(), "/h/work": cx_raw()})
+        srv._publish("claude", srv.cswap_accounts_from_json(doc()))
+        srv._codex["pending"] = srv.codex_refresh(1000.0, reader=self.rd); srv.codex_apply_pending()
+
+    def tearDown(self):
+        subprocess.run, srv.cswap_bin, srv._force_poll = self._run, self._cswap, self._force
+        srv.ENV_PATH = self._env; srv.CONFIG["CODEX_LABELS"] = self._labels or ""
+        super().tearDown()
+
+    def labels(self): return [a["label"] for a in srv._accounts]
+
+    # ---- codex
+    def test_a_codex_account_is_renamed_at_once_and_keeps_its_key(self):
+        self.assertEqual(self.labels(), ["WORK", "PERSONAL", "COSMO", "WORK"])
+        r = srv.rename_account("codex:default", "Astra")
+        self.assertEqual((r["ok"], r["label"]), (1, "ASTRA"))
+        self.assertEqual(self.labels(), ["WORK", "PERSONAL", "ASTRA", "WORK"])        # no waiting for the next poll
+        self.assertEqual([a["key"] for a in srv._accounts][2], "codex:default")        # history stays attached
+        self.assertEqual(self.ran, [])                                                 # codex never touches cswap
+
+    def test_the_codex_name_survives_the_next_poll_and_a_restart(self):
+        srv.rename_account("codex:default", "Astra")
+        self.assertEqual(srv.codex_refresh(1300.0, reader=self.rd)[0]["label"], "ASTRA")
+        self.assertIn("CLAUDETV_CODEX_LABELS=default=Astra", open(srv.ENV_PATH, encoding="utf-8").read())
+        self.assertEqual(srv.codex_labels(), {"default": "Astra"})
+
+    def test_a_failed_read_keeps_the_chosen_name(self):
+        srv.rename_account("codex:default", "Astra")
+        bad = self.reader({"/h/default": cx_raw(None, None, "timeout"), "/h/work": cx_raw()})
+        self.assertEqual(srv.codex_refresh(1300.0, reader=bad)[0]["label"], "ASTRA")
+
+    def test_a_blank_name_puts_the_default_back(self):
+        srv.rename_account("codex:default", "Astra"); srv.rename_account("codex:work", "Team")
+        self.assertEqual(srv.rename_account("codex:default", "")["label"], "COSMO")    # back to the email
+        self.assertEqual(srv.rename_account("codex:work", "  ")["label"], "WORK")      # back to the folder
+        self.assertEqual(srv.codex_labels(), {})
+
+    def test_the_display_label_is_capped_but_the_full_name_is_kept(self):
+        self.assertEqual(srv.rename_account("codex:default", "astra-prolite")["label"], "ASTRA-PR")
+        self.assertEqual(srv.codex_labels(), {"default": "astra-prolite"})
+
+    # ---- claude
+    def test_a_claude_account_is_renamed_through_cswap_and_reread_immediately(self):
+        srv._force_poll = False
+        r = srv.rename_account("2:varma.adityaa@gmail.com", "Home")
+        self.assertEqual(r["ok"], 1)
+        self.assertEqual(self.ran, [["cswap", "alias", "2", "Home"]])
+        self.assertTrue(srv._force_poll)                       # the new alias is read back from cswap
+
+    def test_a_blank_name_removes_the_cswap_alias(self):
+        srv.rename_account("2:varma.adityaa@gmail.com", "")
+        self.assertEqual(self.ran, [["cswap", "alias", "2", "--unset"]])
+
+    def test_a_cswap_refusal_is_shown_to_the_user(self):
+        self.reply = (1, "", "Error: alias 'work' is already used by account 1")
+        r = srv.rename_account("2:varma.adityaa@gmail.com", "work")
+        self.assertEqual(r["ok"], 0); self.assertIn("already used", r["err"])
+
+    # ---- both
+    def test_names_that_could_be_read_as_options_or_paths_never_reach_a_subprocess(self):
+        for bad in ("--unset", "-x", "a b", "a/b", "..", "a;rm", "x" * 33, "12345", "naïve", "$(id)"):
+            with self.subTest(bad):
+                self.assertEqual(srv.rename_account("2:varma.adityaa@gmail.com", bad)["ok"], 0)
+                self.assertEqual(srv.rename_account("codex:default", bad)["ok"], 0)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(srv.codex_labels(), {})
+
+    def test_an_unknown_account_is_refused(self):
+        self.assertEqual(srv.rename_account("codex:nope", "X")["ok"], 0)
+        self.assertEqual(srv.rename_account("9:nobody@example.com", "X")["ok"], 0)
+        self.assertEqual(self.ran, [])
+
+    def test_a_rename_does_not_disturb_reset_history(self):
+        before = json.dumps(srv._load_notify_state().get("codex:default"), sort_keys=True)
+        srv.rename_account("codex:default", "Astra")
+        srv._codex["pending"] = srv.codex_refresh(1300.0, reader=self.rd); srv.codex_apply_pending()
+        self.assertEqual(json.dumps(srv._load_notify_state().get("codex:default"), sort_keys=True), before)
+        self.assertEqual(srv._load_reset_log(), [])
+
+
 @unittest.skipUnless(os.environ.get("CLAUDETV_LIVE_CODEX") == "1" and srv.codex_bin()
                      and os.path.isfile(os.path.join(srv.CODEX_DEFAULT_HOME, "auth.json")),
                      "set CLAUDETV_LIVE_CODEX=1 on a host with a logged-in codex")
@@ -1589,6 +1685,10 @@ class TestCodexHardening(CodexIsolated):
         recs = [srv.codex_account_from_rpc(s, s, "/h/" + s, cx_raw()) for s in ("work", "personal")]
         self.assertEqual([srv.notify_key(r) for r in recs], ["codex:work", "codex:personal"])
         self.assertEqual(len({r["key"] for r in recs + srv.cswap_accounts_from_json(doc())}), 4)
+
+    def test_the_terminal_offers_a_rename_on_every_account_row(self):
+        for needle in ("data-rename=", "/api/rename", "function renameAcct"):
+            self.assertIn(needle, srv.TERMINAL)
 
     def test_the_terminal_shows_the_codex_fleet_and_warns_past_the_device_limit(self):
         for needle in ("id=cxfleet", "s.codex_fleet", "id=maxwarn", "A.list.length>8"):
