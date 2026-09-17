@@ -67,7 +67,7 @@ Grab the prebuilt image from the [latest release](https://github.com/latticelabs
 and flash it over the clock's stock web updater (find its IP on your router):
 
 ```bash
-curl -F "firmware=@claudetv-v4.7-generic.bin" http://<device-ip>/update
+curl -F "firmware=@claudetv-v5.2-generic.bin" http://<device-ip>/update
 ```
 
 On first boot the device opens a **`ClaudeTV-Setup`** WiFi hotspot. Join it, pick your WiFi, and

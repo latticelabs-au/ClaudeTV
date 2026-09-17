@@ -349,7 +349,13 @@ void setup(){
 
   WiFi.mode(WIFI_STA);
   if(strlen(WIFI_SSID)>0){                      // baked creds (personal build) -> direct connect
+    // Also SAVE them to the SDK's WiFi config: ESP8266 core 3.x no longer does that by default. The
+    // in-app updater always flashes the GENERIC image, which has no baked creds and reconnects from
+    // that saved config through WiFiManager. Without this, a personal-build device dropped onto the
+    // setup hotspot after its first in-app update. The SDK only rewrites flash when they change.
+    WiFi.persistent(true);
     WiFi.begin(WIFI_SSID,WIFI_PASS);
+    WiFi.persistent(false);
     unsigned long t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<25000){delay(250);yield();}
   }
   if(WiFi.status()!=WL_CONNECTED){               // generic build / bad creds -> captive portal
