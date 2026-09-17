@@ -2,6 +2,7 @@
 firmware/claudetv/config.h
 **/.credentials.json
 **/credentials.json
+**/auth.json
 *.env
 **/notify_state.json
 **/resets.log
@@ -17,6 +18,7 @@ build/
 *.d.o
 
 # editor / OS
+.playwright-mcp/
 .vscode/
 .idea/
 .DS_Store

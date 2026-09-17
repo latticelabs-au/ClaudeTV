@@ -11,7 +11,7 @@ canvas{image-rendering:pixelated;width:480px;height:480px;display:block}
 <button onclick="toggleDead()">Toggle auth-dead</button></div>
 <script>
 const C={bg:'#000000',panel:'#171f2e',line:'#2c374a',coral:'#ff7a55',cyan:'#3fd2dd',white:'#ffffff',
-gray:'#a4b0c2',dim:'#74859b',green:'#54d36e',amber:'#f0ad36',red:'#ff4d68',sky:'#84cdf2'};
+gray:'#a4b0c2',dim:'#74859b',green:'#54d36e',amber:'#f0ad36',red:'#ff4d68',sky:'#84cdf2',codex:'#a98bff',codexDim:'#4a3d80'};
 // Arial only supplies glyph SHAPES; all positioning uses the device's real GFX xAdvance
 // tables (ADV below, generated from TFT_eSPI FreeSans*.h) so string widths are 1:1 device-true.
 const F={tiny:'bold 14px Arial',s9:'15px Arial',b12:'bold 21px Arial',b18:'bold 31px Arial'};
@@ -37,7 +37,7 @@ function nacc(){return (data.acc&&data.acc.length)?data.acc.length:1;}
 function A(){
  const a=(data.acc&&data.acc.length)?data.acc[ai%data.acc.length]:data;
  return {s:a.s,w:a.w,f:(a.f==null?-1:a.f),fl:a.fl||'',sr:a.sr||'',wr:a.wr||'',
-         auth:a.auth||data.auth||'ok',l:a.l||''};
+         auth:a.auth||data.auth||'ok',l:a.l||'',p:a.p||'c'};
 }
 function stepAcct(){ai=(ai+1)%nacc();render();}
 function acclbl(){const e=document.getElementById('acclbl');if(e)e.textContent=(A().l||'single')+' ('+(ai%nacc()+1)+'/'+nacc()+')';}
@@ -67,13 +67,24 @@ function metrics(d){return [['NOW',d.wt,'°'],['FEELS',d.wfl,'°'],['HIGH',d.whi
 function step(){mi=(mi+1)%6;document.getElementById('mi').textContent=mi;render();}
 function usageCard(){
  rr(UCX,UCY,UCW,UCH,10,C.panel);
- if(A().f>=0) usageCard3(); else usageCard2();
+ const a=A();
+ if(a.p=='x'&&a.s<0&&a.f<0) usageCard1(); else if(a.f>=0) usageCard3(); else usageCard2();
+}
+function usageCard1(){   // Codex plan with a weekly limit only: one hero, no dead SESSION column (1:1 with firmware)
+ const a=A(),p=data.haveData?a.w:-1;
+ T("WEEK",120,UCY+18,F.s9,C.gray,'center');
+ T(p<0?"--":p+"%",120,UCY+47,F.b18,lvl(p),'center');   // a lone 100% = 88px fits, so it keeps its %
+ T(a.wr?("resets "+a.wr):"--",120,UCY+72,F.tiny,C.dim,'center');
 }
 function vline(px){x.strokeStyle=C.line;x.lineWidth=1;x.beginPath();x.moveTo(px+0.5,UCY+14);x.lineTo(px+0.5,UCY+UCH-14);x.stroke();}
 function usageCard2(){   // classic 2-col — account has no model-scoped weekly limit
  const a=A(); vline(120);
- col(LCX,"SESSION",data.haveData?a.s:-1,a.sr||"idle");
- col(RCX,"WEEK",data.haveData?a.w:-1,a.wr||"--");
+ // resets are edge-aligned exactly as the firmware draws them (session left at UCX+12, week right
+ // at UCX+UCW-12): centred, "Dec 30 12:59pm" = 134px under RCX would cross the card edge.
+ // when the two would touch, the week reset drops its minutes (1:1 with firmware)
+ let wr=a.wr; if(a.sr&&wr&&mw(a.sr,F.tiny)+mw(wr,F.tiny)>UCW-24-8) wr=wr.replace(/:\d\d(?=[ap]m$)/,'');
+ num(LCX,"SESSION",data.haveData?a.s:-1); T(a.sr||"idle",UCX+12,UCY+72,F.tiny,C.dim,'left');
+ num(RCX,"WEEK",data.haveData?a.w:-1);    T(wr||"--",UCX+UCW-12,UCY+72,F.tiny,C.dim,'right');
 }
 function usageCard3(){   // S (5h) | W + F (7d) sharing ONE reset — three Bold18 heroes
  const a=A(); vline(FDIV);
@@ -114,12 +125,14 @@ function weatherCard(){
 // always know which account the numbers belong to. "PERSONAL"@Bold12 = 132px from x=26 -> 158,
 // clear of the dots, which are right-aligned to end at 232.
 function header(){
- rr(12,12,9,9,2,C.coral);
- const n=nacc(),a=A();
- if(n<2){T("CLAUDE USAGE",26,18,F.b12,C.white,'left');return;}
- T(a.l||"ACCOUNT",26,18,F.b12,C.coral,'left');
+ // provider tint, 1:1 with the device: Claude coral, Codex violet (acc[].p=="x")
+ const n=nacc(),a=A(),cx_=a.p=='x',tint=cx_?C.codex:C.coral;
+ rr(12,12,9,9,2,tint);
+ if(n<2){T(cx_?"CODEX USAGE":"CLAUDE USAGE",26,18,F.b12,C.white,'left');return;}
+ T(a.l||"ACCOUNT",26,18,F.b12,tint,'left');
+ if(n>6){T((ai%n+1)+'/'+n,235,17,F.tiny,C.gray,'right');return;}   // DOTS_MAX: past six the device shows a counter
  for(let i=0;i<n;i++){const cx=232-(n-1-i)*10;
-  x.fillStyle=(i==ai%n)?C.white:C.line;x.beginPath();x.arc(cx,17,3,0,7);x.fill();}
+  x.fillStyle=(i==ai%n)?C.white:((data.acc[i]||{}).p=='x'?C.codexDim:C.line);x.beginPath();x.arc(cx,17,3,0,7);x.fill();}
 }
 function render(){
  try{data=JSON.parse(document.getElementById('d').value);}catch(e){}

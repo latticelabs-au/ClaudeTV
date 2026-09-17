@@ -47,7 +47,7 @@ acclbl.textContent=s.label||'';accn.textContent=(s.nacc>1)?((s.acci+1)+'/'+s.nac
 acccard.style.display=(s.nacc>1)?'':'none';acyc.value=s.acyc;
 updcard.style.display=s.up?'':'none';
 acclist.innerHTML=(s.acc||[]).map((a,i)=>'<div class=row style=margin:2px:0><span>'+((i==s.acci)?'&#9679; ':'&#9675; ')
- +(a.l||('acct'+(i+1)))+(a.auth==2?' <span style=color:#ff4d68>expired</span>':'')+'</span><span>'
+ +(a.p=='x'?'<span style=color:#a98bff>':'<span>')+(a.l||('acct'+(i+1)))+'</span>'+(a.p=='x'?' <span class=muted>codex</span>':'')+(a.auth==2?' <span style=color:#ff4d68>expired</span>':'')+'</span><span>'
  +pc(a.s)+' &middot; '+pc(a.w)+(a.f>=0?(' &middot; '+pc(a.f)):'')+'</span></div>').join('');
 const pc=v=>(v==null||v<0)?'--':v+'%';   // -1 = no reading; never render '-1%'
 sess.textContent=s.haveData?pc(s.s):'--';sessr.textContent=s.sr?('resets '+s.sr):'idle';

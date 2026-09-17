@@ -14,13 +14,18 @@ rotate a token family cswap also owns. `--login` remains only as a one-time ENRO
 helper for a headless box with no Claude Code: it mints a credential that `cswap add`
 then adopts, and plays no part in steady-state operation.
 
+CODEX: an optional second source, under the same rule. OpenAI Codex accounts are read through
+the official `codex app-server` (one CODEX_HOME per account), which owns its own login and
+refresh, so this collector holds no Codex token either. Its I/O runs on a separate thread and
+a failure on either side never blanks the other.
+
 QUOTA: with auto-switching, one account hitting its cap is a non-event — cswap moves to
 another. The state worth alerting on is every account being out at once, judged against
 cswap's own autoswitch.threshold so the two never disagree.
 
 Config is read from environment / a .env beside this file and is editable from the terminal.
 """
-import base64, hashlib, json, os, re, secrets, shutil, subprocess, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
+import base64, hashlib, json, os, re, secrets, shutil, signal, subprocess, tempfile, time, threading, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -36,6 +41,9 @@ START_TS = time.time()
 EDITABLE = ["CITY", "LAT", "LON", "TZ", "USAGE_EVERY", "WEATHER_EVERY", "PORT", "DEVICE_URL",
             # --- accounts: claude-swap is the single source, for one account or many ---
             "CSWAP_BIN", "CSWAP_ACCOUNTS", "UPDATE_EVERY",
+            # --- accounts: codex is the optional second source, one CODEX_HOME per account ---
+            "CODEX_BIN", "CODEX_ACCOUNTS", "CODEX_EVERY", "CODEX_TIMEOUT", "CODEX_SCOPED",
+            "CODEX_MAXED_THRESHOLD",
             "NOTIFY_FLEET_MAXED", "MAXED_THRESHOLD",
             # --- reset notifications (non-secret; secrets live in SECRET_KEYS below) ---
             "NOTIFY_SESSION_RESET", "NOTIFY_SESSION_MAXED", "NOTIFY_WEEK_RESET", "NOTIFY_AUTH",
@@ -51,6 +59,10 @@ DEFAULTS = {"CITY": "Melbourne", "LAT": "-37.8136", "LON": "144.9631", "TZ": "Au
             "USAGE_EVERY": "90", "WEATHER_EVERY": "900", "PORT": "8088",
             "DEVICE_URL": "http://claudetv.local",
             "CSWAP_BIN": "", "CSWAP_ACCOUNTS": "", "UPDATE_EVERY": "21600",
+            # Every Codex read is one live backend request per account, against a private
+            # endpoint, so this is deliberately slow. 300 is also the enforced floor.
+            "CODEX_BIN": "", "CODEX_ACCOUNTS": "", "CODEX_EVERY": "300", "CODEX_TIMEOUT": "20",
+            "CODEX_SCOPED": "", "CODEX_MAXED_THRESHOLD": "100",
             # blank threshold = follow cswap's own autoswitch.threshold
             "NOTIFY_FLEET_MAXED": "true", "MAXED_THRESHOLD": "",
             "NOTIFY_SESSION_RESET": "false", "NOTIFY_SESSION_MAXED": "false",
@@ -110,6 +122,15 @@ _alerted = {}         # per-account: one auth-dead alert per outage episode
 _migrated = False     # legacy single-account notify state re-homed onto the primary account
 _fleet = {}           # last fleet verdict, surfaced in the terminal and the device payload
 _force_poll = False   # dashboards can demand an immediate re-read instead of waiting for the timer
+_src_accts = {"claude": [], "codex": []}   # each source's last-good list; _accounts is their join
+
+def _publish(source, accts):
+    """Swap in ONE source's records. `_accounts` is always Claude first, then Codex, so a source
+    that fails keeps its own last-good list and can never blank the other."""
+    global _accounts
+    with _lock:
+        _src_accts[source] = list(accts)
+        _accounts = _src_accts["claude"] + _src_accts["codex"]
 
 # ---------- one-time login helper (enrollment only; cswap owns all upkeep) ----------
 # Anthropic's public OAuth client (the one Claude Code itself uses). Not a secret: it is a
@@ -251,7 +272,7 @@ def cswap_accounts_from_json(doc, only=""):
         if sd.get("resetsAt"):
             d = _parse(sd["resetsAt"]); u["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
         email, num = a.get("email") or "", a.get("number", "?")
-        recs.append({"key": "%s:%s" % (num, email), "label": _label(a.get("alias"), email, num),
+        recs.append({"provider": "claude", "key": "%s:%s" % (num, email), "label": _label(a.get("alias"), email, num),
                      "email": email, "active": bool(a.get("active")), "u": u, "stale": stale,
                      "disabled": bool(a.get("disabled")),
                      "resets": {"session": fh.get("resetsAt"), "week": sd.get("resetsAt")},
@@ -372,6 +393,8 @@ def fleet_state(accounts, policy):
 _fleet_last = {}          # edge-trigger memory: {"exhausted": bool}
 _FLEET_TITLES = {"exhausted": "\U0001F6D1 ClaudeTV: every Claude account is out of quota",
                  "benched": "\U0001F6D1 ClaudeTV: no Claude account left in rotation",
+                 "codex_exhausted": "\U0001F6D1 ClaudeTV: every Codex account is out of quota",
+                 "codex_recovered": "\U0001F7E2 ClaudeTV: Codex quota available again",
                  "recovered": "\U0001F7E2 ClaudeTV: quota available again"}
 
 def _fleet_alert(event, body):
@@ -432,7 +455,12 @@ def notifiable(rec):
     plunge to 0% and fires a phantom 'gift' reset — which is how an ordinary `cswap` account
     switch ended up alerting as an Anthropic gift. Display keeps showing last-good either way;
     only the notifier is gated, because it is the part that cannot take back a false positive."""
-    return not rec.get("stale") and rec["u"]["s"] >= 0 and rec["u"]["w"] >= 0
+    u = rec["u"]
+    if rec.get("stale"): return False
+    # Codex may legitimately report a single window (weekly only, when OpenAI drops the short
+    # limit). notify_check treats windows independently and skips negatives, so one is enough.
+    if rec.get("provider") == "codex": return u["s"] >= 0 or u["w"] >= 0
+    return u["s"] >= 0 and u["w"] >= 0
 
 def notify_key(rec):
     """Namespace for a account's reset state: the STABLE identity, never the display label.
@@ -462,7 +490,9 @@ def usage_wire(accounts, wx, primary=""):
     if primary:
         p = primary.strip().lower()
         for i, rec in enumerate(accts):
-            if p in (rec["label"].lower(), (rec["email"] or "").lower()):
+            # the key (e.g. codex:work) is the unambiguous pin: a Claude alias and a Codex folder
+            # may share a label, and the label keeps its old first-match meaning
+            if p in (rec["label"].lower(), (rec["email"] or "").lower(), (rec.get("key") or "").lower()):
                 accts.insert(0, accts.pop(i)); break
     lead = accts[0] if accts else None
     if not accts:                                        auth = "pending"
@@ -472,9 +502,428 @@ def usage_wire(accounts, wx, primary=""):
     st = {"ok": 1 if lead else 0, "age": lead["age"] if lead else -1,
           "err": lead["err"] if lead else "no accounts", "auth": auth, "n": len(accts)}
     st.update(lead["u"] if lead else {"s": 0, "w": 0, "f": -1, "fl": "", "sr": "", "wr": ""})
-    st["acc"] = [{"l": a["label"], "auth": a["auth"], **a["u"]} for a in accts]
+    st["acc"] = [{"l": a["label"], "auth": a["auth"],
+                  "p": "x" if a.get("provider") == "codex" else "c", **a["u"]} for a in accts]
     if wx: st.update(wx)
     return st
+
+# ---------- accounts: codex source (OpenAI Codex on a ChatGPT plan) ----------
+# The second provider. Same contract as cswap: the collector holds no token and runs no OAuth.
+# Here the middleware is Codex itself: `codex app-server` speaks JSON-RPC over stdio, and
+# `account/rateLimits/read` returns the live limits without a model call. Codex's own auth
+# manager refreshes the credential on that read, so polling is the keep-alive and exactly one
+# component ever rotates a given login. One CODEX_HOME directory per account.
+#
+# Measured on the production host (codex-cli 0.154.0): a cold read is ~1.1s and ~0.6 CPU-s, so
+# a fresh process per read beats a resident 93MB server. Two facts are load-bearing:
+#   * `--disable plugins` cuts a launch from 7 backend requests to exactly 1
+#   * Codex NEVER times out a hung backend, so the deadline and the kill are ours
+
+CODEX_MAIN_BUCKET = "codex"
+DAY_MINS, WEEK_MINS = 1440, 10080
+CODEX_DEAD_HOLD = 1800                  # a dead login is re-read this often, not every poll
+CODEX_DEFAULT_HOME = os.path.expanduser("~/.codex")
+CODEX_HOMES_ROOT = os.path.expanduser("~/.claudetv/codex")
+
+def _cfg_num(key, default):
+    try: return float(CONFIG.get(key) or default)
+    except (TypeError, ValueError): return float(default)
+
+def codex_bin():
+    """Configured path, else ~/.local/bin/codex (a systemd unit has a bare PATH), else PATH."""
+    explicit = (CONFIG.get("CODEX_BIN") or "").strip()
+    if explicit: return explicit if os.path.exists(explicit) else ""
+    cand = os.path.expanduser("~/.local/bin/codex")
+    if os.path.exists(cand): return cand
+    return shutil.which("codex") or ""
+
+_codex_ver = {"bin": "", "ver": ""}
+def codex_version():
+    """`codex --version`, cached per binary path so the dashboards can show it for free."""
+    exe = codex_bin()
+    if not exe: return ""
+    if _codex_ver["bin"] != exe:
+        v = ""
+        try:
+            p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=15)
+            v = (p.stdout or p.stderr or "").strip().splitlines()[0][:40]
+        except Exception: pass
+        _codex_ver.update({"bin": exe, "ver": v})
+    return _codex_ver["ver"]
+
+def codex_homes(only="", default_home=None, root=None, seen=()):
+    """Ordered [(slot, alias, path)]. `slot` is the STABLE identity ('default' or the directory
+    name) and keys everything downstream; it never depends on a reply, so it is the same on a
+    good poll and a failed one. ~/.codex counts once it holds a login (or has been seen good
+    this run, so a later logout shows LOGIN EXPIRED instead of vanishing); every directory
+    under the root counts, logged in or not. auth.json is only ever stat'ed, never opened.
+    `only` is a comma list of slots: it filters BEFORE polling and sets the order."""
+    default_home = default_home or CODEX_DEFAULT_HOME; root = root or CODEX_HOMES_ROOT
+    found = []
+    if os.path.isfile(os.path.join(default_home, "auth.json")) or "default" in seen:
+        found.append(("default", "", default_home))
+    try: names = sorted(os.listdir(root))
+    except OSError: names = []
+    for n in names:
+        if n.lower() != "default" and os.path.isdir(os.path.join(root, n)):
+            found.append((n.lower(), n, os.path.join(root, n)))
+    want = [w.strip().lower() for w in (only or "").split(",") if w.strip()]
+    if not want: return found
+    by = {h[0]: h for h in found}; picked = []
+    for w in want:
+        if w in by and by[w] not in picked: picked.append(by[w])
+    return picked
+
+# Codex gives no structured HTTP status, only this message shape (codex-rs backend-client):
+#   "failed to fetch codex rate limits: GET <url> failed: 401 Unauthorized; content-type=...; body=..."
+_CODEX_HTTP = re.compile(r"failed: (\d{3}) ")
+
+def codex_status(account_reply, limits_reply, driver_err=""):
+    """-> (auth, err). The project's original rule (56806bc): a login is dead when the USAGE
+    endpoint rejects it, never because a refresh failed, and 429 is never dead. When a refresh
+    fails for good, Codex keeps the stale credential and account/read still reports the account,
+    so a login that needs a human arrives as HTTP 401 inside -32603, not as -32600."""
+    account_reply = account_reply if isinstance(account_reply, dict) else {}
+    limits_reply = limits_reply if isinstance(limits_reply, dict) else {}
+    res = account_reply.get("result"); res = res if isinstance(res, dict) else {}
+    acct = res.get("account")
+    if isinstance(acct, dict) and acct.get("type") != "chatgpt": return "ok", "api_key"   # no subscription quota
+    # The usage endpoint answering IS the verdict: an account/read shape we do not recognise
+    # (app-server is experimental) must never outvote live numbers.
+    if isinstance(limits_reply.get("result"), dict): return "ok", ""
+    # dead needs an EXPLICIT null account, not merely a key we failed to find
+    if "account" in res and acct is None: return "dead", "login_required"
+    if driver_err: return "ok", driver_err
+    e = limits_reply.get("error")
+    if not isinstance(e, dict): return "ok", "unavailable"
+    code, msg = e.get("code"), str(e.get("message") or "")
+    if code == -32600: return "dead", "login_required"
+    if code == -32603:
+        m = _CODEX_HTTP.search(msg); http = int(m.group(1)) if m else 0
+        if http == 401: return "dead", "login_expired"
+        if http == 403:          # an HTML 403 is a Cloudflare challenge, not an auth verdict
+            return ("ok", "blocked_by_edge") if "text/html" in msg.lower() else ("dead", "login_expired")
+        if http == 429: return "ok", "rate_limited"
+        return "ok", "unavailable"
+    return "ok", "unknown"
+
+def _num(v):
+    """A finite number out of whatever the wire carried (int, float, numeric string), else None."""
+    try: f = float(v)
+    except (TypeError, ValueError): return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+def _cpct(w):
+    v = _num(w.get("usedPercent")) if isinstance(w, dict) else None
+    return round(v) if v is not None else -1
+
+def _codex_iso(unix_s):
+    """Codex reports resetsAt in unix seconds; the notifier compares ISO strings."""
+    try: return datetime.fromtimestamp(int(unix_s), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError): return None
+
+def codex_windows(bucket):
+    """(short, long) windows of one bucket, classified by DURATION and never by slot: `primary`
+    and `secondary` are transport positions. When OpenAI drops the 5h limit the weekly window
+    moves into `primary` with `secondary: null` (seen live on a prolite plan)."""
+    bucket = bucket if isinstance(bucket, dict) else {}
+    wins = [w for w in (bucket.get("primary"), bucket.get("secondary")) if _cpct(w) >= 0]
+    dur = lambda w: _num(w.get("windowDurationMins")) or 0      # 0 = duration not given
+    known = [w for w in wins if dur(w) > 0]
+    unknown = [w for w in wins if dur(w) <= 0]
+    long_ = [w for w in known if dur(w) >= DAY_MINS]
+    short_ = [w for w in known if dur(w) < DAY_MINS]
+    wk = min(long_, key=lambda w: abs(dur(w) - WEEK_MINS)) if long_ else None
+    sh = min(short_, key=dur) if short_ else None
+    # durations are nullable. Two unlabelled windows: historic order (short, then weekly). One:
+    # it is the weekly, the window that persists when the short limit is removed.
+    if len(unknown) == 2: sh, wk = unknown[0], unknown[1]
+    elif unknown:
+        if wk is None: wk = unknown[0]
+        elif sh is None: sh = unknown[0]
+    return sh, wk
+
+def _codex_scoped(buckets, want):
+    """The model bucket to put in the device's third column, or (None, ''). Off unless asked.
+    Only its day-or-longer window qualifies: `f` rides in the notifier's WEEK pair (as Claude's
+    7-day scoped limit does), so a 5h model window there would fire a false weekly reset every
+    time it rolled."""
+    want = (want or "").strip().lower()
+    if not want or not isinstance(buckets, dict): return None, ""
+    for bid, b in sorted(buckets.items()):
+        if bid == CODEX_MAIN_BUCKET or not isinstance(b, dict): continue
+        name = str(b.get("limitName") or "")
+        if want in str(bid).lower() or want in name.lower():
+            wk = codex_windows(b)[1]
+            return (wk, (name.split("-")[-1] or str(bid)).strip().upper()[:7]) if wk else (None, "")
+    return None, ""
+
+def codex_account_from_rpc(slot, alias, home, raw, scoped=""):
+    """Map one home's raw read ({account, limits, driver_err}) into the standard account record
+    (the shape cswap_accounts_from_json documents), plus provider/slot/home/blocked/plan/buckets."""
+    account_reply, limits_reply = raw.get("account"), raw.get("limits")
+    auth, err = codex_status(account_reply, limits_reply, raw.get("driver_err") or "")
+    # app-server is labelled experimental: every level is checked for its type, so a shape we
+    # do not recognise degrades THIS account to "no reading" instead of raising.
+    D = lambda v: v if isinstance(v, dict) else {}
+    acct = D(D(D(account_reply).get("result")).get("account"))
+    res = D(D(limits_reply).get("result"))
+    buckets = D(res.get("rateLimitsByLimitId"))
+    main = D(buckets.get(CODEX_MAIN_BUCKET)) or D(res.get("rateLimits"))
+    sh, wk = codex_windows(main)
+    # -1 means "not known", never 0 (the same rule the cswap mapper enforces)
+    u = {"s": _cpct(sh), "w": _cpct(wk), "sr": "", "wr": "", "f": -1, "fl": ""}
+    resets = {"session": _codex_iso(sh.get("resetsAt")) if sh else None,
+              "week": _codex_iso(wk.get("resetsAt")) if wk else None}
+    if resets["session"]: u["sr"] = _clock(_parse(resets["session"]))
+    if resets["week"]:
+        d = _parse(resets["week"]); u["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
+    sw, tag = _codex_scoped(buckets, scoped)
+    if sw: u["f"], u["fl"] = _cpct(sw), tag
+    if auth == "ok" and not err and u["s"] < 0 and u["w"] < 0: err = "no_windows"
+    S = lambda v: v if isinstance(v, str) else ""
+    email = S(acct.get("email"))
+    return {"provider": "codex", "key": "codex:%s" % slot, "slot": slot, "home": home,
+            "label": _label(alias, email, "") if (alias or email) else "CODEX",
+            "email": email, "active": True, "disabled": False, "u": u,
+            "stale": not (auth == "ok" and not err), "resets": resets, "auth": auth,
+            "age": 0, "err": err, "ident": S(res.get("accountId")),
+            "blocked": bool(res.get("ordinaryUsageAllowed") is False or main.get("rateLimitReachedType")),
+            "plan": S(main.get("planType")) or S(acct.get("planType")),
+            "buckets": [{"id": bid, "name": S(b.get("limitName")),
+                         "windows": [{"mins": _num(w.get("windowDurationMins")), "pct": _cpct(w),
+                                      "resets": _codex_iso(w.get("resetsAt"))}
+                                     for w in (b.get("primary"), b.get("secondary")) if isinstance(w, dict)]}
+                        for bid, b in sorted(buckets.items()) if isinstance(b, dict)]}
+
+def codex_with_last_good(rec, good, now):
+    """A failed read keeps SHOWING the last good numbers, as cswap's lastGoodUsage does; only
+    the status fields come from the failed read. `stale` stays set, so nothing downstream
+    (notifier, fleet) mistakes remembered numbers for a fresh reading."""
+    if not rec["stale"]:
+        rec["good_at"] = now; return rec
+    if good:
+        for k in ("u", "resets", "plan", "buckets", "ident", "blocked"): rec[k] = good[k]
+        if not rec["email"]: rec["email"], rec["label"] = good["email"], good["label"]
+        rec["good_at"] = good.get("good_at", now); rec["age"] = int(now - rec["good_at"])
+    return rec
+
+def _codex_reap(p):
+    """Closing stdin makes the app-server exit by itself (30ms, rc 0). The kill is the fallback
+    for a server that is hung on a backend call, which Codex itself never abandons."""
+    try: p.stdin.close()
+    except Exception: pass
+    try: p.wait(2)
+    except Exception:
+        try:
+            if os.name == "nt": p.kill()
+            else: os.killpg(p.pid, signal.SIGKILL)
+        except Exception:
+            try: p.kill()
+            except Exception: pass
+        try: p.wait(5)
+        except Exception: pass
+    try: p.stdout.close()
+    except Exception: pass
+
+def codex_rpc_read(exe, home, deadline_s=20.0):
+    """One short-lived `codex app-server` for one CODEX_HOME. Returns
+    {account: reply|None, limits: reply|None, driver_err: ''|'timeout'|'unavailable'} where a
+    reply is the whole JSON-RPC message. Never raises, always reaps the child. ONE absolute
+    deadline covers spawn, handshake and both reads. `exe` may be a list (tests run a fake)."""
+    out = {"account": None, "limits": None, "driver_err": ""}
+    end = time.monotonic() + deadline_s
+    env = dict(os.environ); env["CODEX_HOME"] = home
+    kw = ({"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)} if os.name == "nt"
+          else {"start_new_session": True})
+    try:
+        p = subprocess.Popen((exe if isinstance(exe, list) else [exe]) + ["app-server", "--disable", "plugins"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
+                             cwd=tempfile.gettempdir(), **kw)
+    except Exception:
+        out["driver_err"] = "unavailable"; return out
+    replies = {}; cv = threading.Condition(); st = {"eof": False}
+    def reader():
+        try:
+            for line in p.stdout:
+                try: o = json.loads(line)
+                except ValueError: continue          # log chatter, partial lines
+                # anything without an id we sent is a notification (remoteControl/status/changed ...)
+                if isinstance(o, dict) and "id" in o and ("result" in o or "error" in o):
+                    with cv: replies[o["id"]] = o; cv.notify_all()
+        except Exception: pass
+        finally:
+            with cv: st["eof"] = True; cv.notify_all()
+    threading.Thread(target=reader, daemon=True).start()
+    def send(o): p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
+    def wait(ids):
+        with cv: cv.wait_for(lambda: all(i in replies for i in ids) or st["eof"],
+                             max(0.0, end - time.monotonic()))
+        return all(i in replies for i in ids)
+    try:
+        send({"method": "initialize", "id": 1, "params": {"clientInfo": {
+              "name": "claudetv", "title": "ClaudeTV collector", "version": "1"}}})
+        if wait([1]):
+            send({"method": "initialized"})
+            send({"method": "account/read", "id": 2, "params": {"refreshToken": False}})
+            # the flag skips a second backend lookup; supportsLunaReserve is deliberately never
+            # sent (Codex source: passive usage readers must not opt in)
+            send({"method": "account/rateLimits/read", "id": 3,
+                  "params": {"excludeResetCreditDetails": True}})
+            wait([2, 3])
+    except Exception: pass
+    out["account"], out["limits"] = replies.get(2), replies.get(3)
+    if out["limits"] is None: out["driver_err"] = "unavailable" if st["eof"] else "timeout"
+    _codex_reap(p)
+    return out
+
+def codex_poll(exe, homes, deadline_s, reader=None):
+    """Read every home CONCURRENTLY: a poll costs the slowest single read, and a hung backend
+    costs one deadline rather than one per account. Results come back in `homes` order."""
+    reader = reader or codex_rpc_read
+    res = [None] * len(homes)
+    def one(i, path):
+        try: res[i] = reader(exe, path, deadline_s)
+        except Exception: res[i] = None
+    ths = [threading.Thread(target=one, args=(i, h[2]), daemon=True) for i, h in enumerate(homes)]
+    for t in ths: t.start()
+    for t in ths: t.join(deadline_s + 10)
+    return [r or {"account": None, "limits": None, "driver_err": "timeout"} for r in res]
+
+# ---- codex fleet: is every Codex account out? There is no auto-switcher for Codex, so this is
+# judged per account from the backend's own verdict first, a threshold second.
+_codex_fleet_last = {}
+
+def codex_fleet_state(accounts, threshold):
+    rows, unknown = [], 0
+    for rec in accounts:
+        if rec.get("auth") == "dead" or rec.get("err") == "api_key": continue   # cannot help you
+        if rec.get("stale"): unknown += 1; continue            # might be the one with room
+        b = max(rec["u"].get("s", -1), rec["u"].get("w", -1))
+        rows.append((rec["label"], b, bool(rec.get("blocked")) or b >= threshold))
+    headroom = [lbl for lbl, _, out in rows if not out]
+    return {"exhausted": bool(rows) and not headroom and not unknown, "headroom": headroom,
+            "binding": {lbl: b for lbl, b, _ in rows}, "usable": len(rows), "unknown": unknown,
+            "threshold": threshold}
+
+def codex_fleet_check(accounts):
+    """Edge-triggered, same rules as the Claude fleet: baseline silently, alert once when every
+    account is out, and recover only on POSITIVE evidence of headroom."""
+    thr = _cfg_num("CODEX_MAXED_THRESHOLD", 100)
+    try:
+        st = codex_fleet_state(accounts, thr)
+        if not st["usable"]: return st
+        was = _codex_fleet_last.get("exhausted")
+        if st["exhausted"] and not was:
+            _codex_fleet_last["exhausted"] = True
+            worst = ", ".join("%s %d%%" % (l, b) for l, b in sorted(st["binding"].items()))
+            _fleet_alert("codex_exhausted", "Every Codex account is out of quota, so Codex is blocked "
+                         "until one resets. Now: %s." % worst)
+            print("[%s] CODEX FLEET blocked (%s)" % (time.strftime("%H:%M:%S"), worst))
+        elif was and st["headroom"]:
+            _codex_fleet_last["exhausted"] = False
+            _fleet_alert("codex_recovered", "%s has room again, so Codex is usable." % st["headroom"][0])
+            print("[%s] CODEX FLEET recovered (%s)" % (time.strftime("%H:%M:%S"), st["headroom"][0]))
+        elif was is None:
+            _codex_fleet_last["exhausted"] = st["exhausted"]
+        return st
+    except Exception as e:
+        print("[codex] fleet check error: %s" % e)
+        return {"exhausted": False, "headroom": [], "binding": {}, "usable": 0, "unknown": 0, "threshold": thr}
+
+_codex = {"accts": [], "ts": 0, "next": 0.0, "fails": 0, "force": False, "last": 0.0,
+          "good": {}, "hold": {}, "ident": {}, "pending": None, "fleet": {}}
+
+def codex_refresh(now, force=False, reader=None):
+    """One I/O pass: discover, read, map, merge last-good. Pure I/O and mapping: it touches no
+    notifier state, which stays on the poller thread (see codex_apply_pending). Never raises
+    for a per-account failure; a missing binary or no homes is simply an empty source."""
+    exe = codex_bin()
+    if not exe: return []
+    homes = codex_homes(CONFIG.get("CODEX_ACCOUNTS", ""), seen=set(_codex["good"]))
+    if not homes: return []
+    prev = {a["slot"]: a for a in _codex["accts"]}
+    # A dead login is re-read only every CODEX_DEAD_HOLD: every read of a dead home makes a fresh
+    # Codex process retry a refresh that cannot succeed, and polling cannot fix a login.
+    due = [h for h in homes if force or h[0] not in prev or now >= _codex["hold"].get(h[0], 0)]
+    raws = dict(zip([h[0] for h in due], codex_poll(exe, due, _cfg_num("CODEX_TIMEOUT", 20), reader)))
+    out = []
+    for slot, alias, path in homes:
+        if slot not in raws: out.append(prev[slot]); continue
+        try: rec = codex_account_from_rpc(slot, alias, path, raws[slot], CONFIG.get("CODEX_SCOPED", ""))
+        except Exception as e:
+            # One account's reply we cannot map must cost THAT account a reading, never the pass:
+            # without this, a stable odd shape froze every Codex card with no reason shown.
+            print("[codex] %s: unmappable reply (%s)" % (slot, str(e)[:80]))
+            rec = codex_account_from_rpc(slot, alias, path,
+                                         {"account": None, "limits": None, "driver_err": "unparseable"})
+        rec = codex_with_last_good(rec, _codex["good"].get(slot), now)
+        if not rec["stale"]: _codex["good"][slot] = rec
+        if rec["auth"] == "dead": _codex["hold"][slot] = now + CODEX_DEAD_HOLD
+        else: _codex["hold"].pop(slot, None)
+        out.append(rec)
+    _codex["accts"] = out
+    return out
+
+def codex_next_delay(accts, fails):
+    """Seconds until the next pass. A failure NEVER makes the source faster than CODEX_EVERY
+    (floor 300): one account failing must not drag the healthy ones below the floor. Failures
+    only slow it down, and only when they are source-wide or the backend said 429."""
+    base = max(300.0, _cfg_num("CODEX_EVERY", 300))
+    live = [a for a in accts if a["auth"] != "dead"]
+    if any(a["err"] == "rate_limited" for a in live): return min(1800.0, 900.0 * (2 ** max(0, fails - 1)))
+    if live and all(a["stale"] for a in live): return min(1800.0, base * (2 ** max(0, fails - 1)))
+    return base
+
+def codex_due(now):
+    """-> (run, force). "Re-read accounts" is honoured at most once a minute so the button cannot
+    hammer the backend, but a click inside that minute STAYS ARMED rather than being dropped:
+    force is the only override for the 30 minute dead hold, so swallowing it would strand a
+    freshly re-logged account on LOGIN EXPIRED. The flag is cleared only when it is honoured."""
+    if _codex["force"] and now - _codex["last"] >= 60:
+        _codex["force"] = False
+        return True, True
+    return now >= _codex["next"], False
+
+def codex_io_loop():
+    """Codex I/O on its own thread, so a hung backend can never delay the Claude poll. It only
+    reads and maps; every stateful pass happens on the poller thread via codex_apply_pending,
+    which keeps notifier state single-threaded."""
+    while True:
+        now = time.time()
+        run, force = codex_due(now)
+        if run:
+            try:
+                accts = codex_refresh(now, force)
+                live = [a for a in accts if a["auth"] != "dead"]
+                troubled = any(a["err"] == "rate_limited" for a in live) or (bool(live) and all(a["stale"] for a in live))
+                _codex["fails"] = _codex["fails"] + 1 if troubled else 0
+                with _lock: _codex["pending"] = accts
+                _codex["next"] = now + codex_next_delay(accts, _codex["fails"])
+            except Exception as e:
+                print("[codex] poll error: %s" % str(e)[:90]); _codex["next"] = now + 300
+            _codex["last"] = now
+        time.sleep(2)
+
+def codex_apply_pending():
+    """Poller thread: publish a finished Codex pass and run the stateful passes on it."""
+    with _lock: accts, _codex["pending"] = _codex["pending"], None
+    if accts is None: return False
+    for rec in accts:
+        was = _codex["ident"].get(rec["slot"])
+        if rec["ident"] and was and was != rec["ident"]:       # home re-logged into another account:
+            _load_notify_state().pop(rec["key"], None); _save_notify_state()   # baseline, no phantom reset
+        if rec["ident"]: _codex["ident"][rec["slot"]] = rec["ident"]
+    _publish("codex", accts)
+    with _lock: _codex["ts"] = int(time.time())
+    _auth_transitions(accts)
+    for rec in accts:
+        if notifiable(rec):
+            notify_check(rec["u"], rec["resets"], acct=notify_key(rec), label=rec["label"], provider="codex")
+    f = codex_fleet_check(accts)
+    with _lock: _codex["fleet"] = f
+    return True
 
 # ---------- in-app firmware updater ----------
 # The collector already reaches both GitHub and the device, and the stock ESP8266HTTPUpdateServer
@@ -815,6 +1264,8 @@ def _dispatch(title, body, channels, event):
 
 _AUTH_TITLES = {"dead": "\U0001F534 ClaudeTV: Claude login dead (action needed)",
                 "standby": "\U0001F7E0 ClaudeTV: failed over to standby login",
+                "codex_dead": "\U0001F534 ClaudeTV: Codex login dead (action needed)",
+                "codex_recovered": "\U0001F7E2 ClaudeTV: Codex auth recovered",
                 "recovered": "\U0001F7E2 ClaudeTV: Claude auth recovered"}
 
 def _auth_alert(event, body):
@@ -827,21 +1278,25 @@ def _auth_alert(event, body):
     except Exception as e:
         print("[notify] auth alert error: %s" % e)
 
-def _reset_message(kind, u, cls="expected", maxed=False):
+_PROVIDER_NAMES = {"claude": ("Claude", "Anthropic"), "codex": ("Codex", "OpenAI")}
+
+def _reset_message(kind, u, cls="expected", maxed=False, provider="claude"):
+    name, vendor = _PROVIDER_NAMES.get(provider, _PROVIDER_NAMES["claude"])
     window = "session (5h)" if kind == "session" else "weekly (7d)"
-    parts = ["S %d%%" % u.get("s", 0), "W %d%%" % u.get("w", 0)]
+    # a window the provider did not report is skipped, never printed as -1%
+    parts = ["%s %d%%" % (k.upper(), u[k]) for k in ("s", "w") if u.get(k, -1) is not None and u.get(k, -1) >= 0]
     if u.get("f", -1) >= 0: parts.append("%s %d%%" % (u.get("fl") or "F", u["f"]))
     now = " · ".join(parts)
     nxt_v = u.get("sr") if kind == "session" else u.get("wr")
     nxt = (" Next reset %s%s." % ("~" if kind == "session" else "", nxt_v)) if nxt_v else ""
     if maxed:                                          # session that had hit its cap
-        return ("%s Maxed session reset — you're unblocked" % ("\U0001F381" if cls == "gift" else "✅"),
+        return ("%s Maxed %s session reset: you're unblocked" % ("\U0001F381" if cls == "gift" else "✅", name),
                 "Your session hit its cap and just reset%s. Now: %s.%s"
-                % (" EARLY — a gift!" if cls == "gift" else "", now, nxt))
+                % (" EARLY, a gift!" if cls == "gift" else "", now, nxt))
     if cls == "gift":
-        return ("\U0001F381 Anthropic gift — %s usage reset early" % window,
-                "Your %s quota was reset ahead of schedule — free capacity. Now: %s.%s" % (window, now, nxt))
-    return ("Claude %s usage reset" % window,
+        return ("\U0001F381 %s gift: %s %s usage reset early" % (vendor, name, window),
+                "Your %s quota was reset ahead of schedule, free capacity. Now: %s.%s" % (window, now, nxt))
+    return ("%s %s usage reset" % (name, window),
             "Your %s quota just refreshed. Now: %s.%s" % (window, now, nxt))
 
 def _was_maxed(prev):
@@ -856,7 +1311,7 @@ def _should_notify(kind, prev):
                 or (_was_maxed(prev) and _truthy(CONFIG.get("NOTIFY_SESSION_MAXED"))))
     return _truthy(CONFIG.get("NOTIFY_WEEK_RESET"))
 
-def notify_check(u, resets, acct="", label=""):
+def notify_check(u, resets, acct="", label="", provider="claude"):
     """Detect + log usage-window resets (see the section header), then notify per the toggles.
     Per window: session=s / resets_at.five_hour; week=(w OR f) / resets_at.seven_day. Baselines
     silently on first sight; fires once per reset. Never breaks the poller.
@@ -896,7 +1351,7 @@ def notify_check(u, resets, acct="", label=""):
                 shown = label or acct                   # humans see the label, state uses the key
                 _log_reset(kind, cls, _reset_detail(kind, prev, u), shown)
                 if _should_notify(kind, prev) and _channels():
-                    title, body = _reset_message(kind, u, cls, kind == "session" and _was_maxed(prev))
+                    title, body = _reset_message(kind, u, cls, kind == "session" and _was_maxed(prev), provider)
                     if shown: title = "[%s] %s" % (shown, title)
                     threading.Thread(target=_dispatch, args=(title, body, _channels(), kind + "_reset"),
                                      daemon=True).start()
@@ -958,29 +1413,38 @@ def _auth_transitions(accts):
     """Edge-triggered per-account dead/recovered alerts: one per account per outage episode."""
     for rec in accts:
         dead, was = rec["auth"] == "dead", _alerted.get(rec["key"], False)
+        codex = rec.get("provider") == "codex"
+        who = "%s%s" % (rec["label"], (" (%s)" % rec["email"]) if rec["email"] else "")
         if dead and not was:
             _alerted[rec["key"]] = True
-            _auth_alert("dead", "Anthropic rejected the Claude login for %s%s. That account shows "
-                        "LOGIN EXPIRED on the display until you log in again (cswap: log in with "
-                        "that account and re-run `cswap add`; native: "
-                        "python3 claude_usage_server.py --login)."
-                        % (rec["label"], (" (%s)" % rec["email"]) if rec["email"] else ""))
+            if codex:
+                _auth_alert("codex_dead", "OpenAI rejected the Codex login for %s. That account shows "
+                            "LOGIN EXPIRED on the display until you log in again. Run this in your own "
+                            "shell on the collector host, as the user the collector runs as: "
+                            "CODEX_HOME=%s codex login --device-auth" % (who, rec.get("home", "~/.codex")))
+            else:
+                _auth_alert("dead", "Anthropic rejected the Claude login for %s. That account shows "
+                            "LOGIN EXPIRED on the display until you log in again (cswap: log in with "
+                            "that account and re-run `cswap add`; native: "
+                            "python3 claude_usage_server.py --login)." % who)
         elif not dead and was:
             _alerted[rec["key"]] = False
-            _auth_alert("recovered", "%s is accepted again; the display is back to live data."
-                        % rec["label"])
+            _auth_alert("codex_recovered" if codex else "recovered",
+                        "%s is accepted again; the display is back to live data." % rec["label"])
 
 def poller():
     global _accounts, _usage_ts, _usage_err, _wx, _wx_err, _migrated, _force_poll, _fleet
     next_u = 0.0; backoff = int(CONFIG["USAGE_EVERY"]); next_w = 0.0; next_upd = 30.0
     while True:
+        try: codex_apply_pending()
+        except Exception as e: print("[codex] apply error: %s" % str(e)[:90])
         now = time.time()
         if now >= next_u or _force_poll:
             _force_poll = False
             try:
                 accts = fetch_accounts()
-                with _lock:
-                    _accounts = accts; _usage_ts = int(now); _usage_err = ""
+                _publish("claude", accts)
+                with _lock: _usage_ts = int(now); _usage_err = ""
                 _auth_transitions(accts)
                 if not _migrated and accts:             # first poll: re-home state onto stable keys
                     _migrated = True
@@ -1019,7 +1483,10 @@ def poller():
         time.sleep(2)
 
 def device_json(primary=""):
-    with _lock: accts, ts, err, wx = list(_accounts), _usage_ts, _usage_err, _wx
+    with _lock:
+        accts, ts, err, wx = list(_accounts), _usage_ts, _usage_err, _wx
+        # a Codex-only host has no Claude source to report on: its clock and errors are Codex's
+        if not _src_accts["claude"] and _src_accts["codex"]: ts, err = _codex["ts"], ""
     st = usage_wire(accts, wx, primary)
     # collector-side staleness (when we last polled) beats a per-account cache age here: it is
     # what the device's "stale Nm" readout has always meant.
@@ -1035,12 +1502,26 @@ def full_state():
     u = accts[0]["u"] if accts else None
     return {"service": {"uptime_s": int(time.time() - START_TS), "port": PORT},
             "fleet": {**_fleet, "policy": switch_policy()},
+            "codex_fleet": dict(_codex["fleet"]),
             "accounts": {"ready": bool(accts), "source_err": _source_err, "cswap": cswap_bin(),
                          "cswap_ver": cswap_version(), "filter": CONFIG.get("CSWAP_ACCOUNTS", ""),
+                         "sources": {
+                             "claude": {"bin": cswap_bin(), "ver": cswap_version(), "err": _source_err,
+                                        "n": len(_src_accts["claude"]),
+                                        "filter": CONFIG.get("CSWAP_ACCOUNTS", "")},
+                             "codex": {"bin": codex_bin(), "ver": codex_version(),
+                                       "n": len(_src_accts["codex"]),
+                                       "age": (int(time.time()) - _codex["ts"]) if _codex["ts"] else -1,
+                                       "next_in": max(0, int(_codex["next"] - time.time())),
+                                       "filter": CONFIG.get("CODEX_ACCOUNTS", "")}},
                          "list": [{"key": a["key"], "label": a["label"], "email": a["email"],
-                                   "active": a["active"], "auth": a["auth"], "age": a["age"],
+                                   "active": a["active"], "auth": a["auth"],
+                                   "age": (int(time.time() - a["good_at"]) if a.get("good_at") else a["age"]),
                                    "err": a["err"], "stale": a.get("stale", False),
-                                   "disabled": a.get("disabled", False), **a["u"]} for a in accts]},
+                                   "disabled": a.get("disabled", False),
+                                   "provider": a.get("provider", "claude"), "plan": a.get("plan", ""),
+                                   "blocked": a.get("blocked", False), "home": a.get("home", ""),
+                                   "buckets": a.get("buckets", []), **a["u"]} for a in accts]},
             "usage": {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err, **(u or {})},
             "update": update_status(),
             "weather": (wx or {}), "weather_err": wxe, "config": {k: CONFIG[k] for k in EDITABLE},
@@ -1098,7 +1579,9 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <div class=muted id=srcerr></div>
 <div class=row id=fleetrow style="display:none"><span>Quota</span><span class=pill id=fleet>--</span></div>
 <div class=muted id=fleetmeta></div>
+<div class=row id=cxfleetrow style="display:none"><span>Codex quota</span><span class=pill id=cxfleet>--</span></div>
 <div id=accts style="margin-top:6px"></div>
+<div class=muted id=maxwarn style="color:#f0ad36"></div>
 <div id=cswapadd class=muted style="display:none;margin-top:8px"></div>
 <div class=grid style=margin-top:8px><button class=ghost onclick=poll()>Re-read accounts</button>
 <button class=ghost onclick="document.getElementById('acchelp').style.display=''">How to add an account</button></div>
@@ -1111,6 +1594,17 @@ The alias becomes the label on the display (first 8 characters).<br><br>
 <b>Log in separately on every machine.</b> Refresh tokens rotate, so if two machines hold the
 same login the first to refresh invalidates the other and that account gets quarantined.
 </div>
+<button class=ghost style="margin-top:8px" onclick="document.getElementById('cxhelp').style.display=''">How to add a Codex account</button>
+<div id=cxhelp class=muted style="display:none;margin-top:8px;line-height:1.6">
+Codex accounts are read through the official <b>codex</b> CLI, one folder per account. The login on this
+host in <code>~/.codex</code> is picked up automatically. For each extra account run, in your own shell:<br>
+<code>python3 ~/.claudetv/claude_usage_server.py --codex-login &lt;name&gt;</code><br>
+The name becomes the label on the display (first 8 characters). ClaudeTV never sees the token.<br><br>
+<b>Log in separately on every machine.</b> Never copy a Codex folder from another box: refresh tokens
+rotate, and the first machine to refresh invalidates the other.
+</div>
+<label style="margin-top:10px" for=CODEX_ACCOUNTS>Show only these Codex accounts (blank = all; comma list of folder names, use default for ~/.codex)</label>
+<input id=CODEX_ACCOUNTS placeholder="e.g. default,work">
 <label style="margin-top:10px" for=CSWAP_ACCOUNTS>Show only these accounts (blank = all; comma list of alias/email, sets order)</label>
 <input id=CSWAP_ACCOUNTS placeholder="e.g. work,personal">
 <div class=row><span class=muted id=uerr></span><span class=muted id=age></span></div>
@@ -1164,11 +1658,15 @@ ownUrl.textContent=location.origin+'/usage';
 function fmtUp(s){let h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h+'h '+m+'m'}
 function fmtAgo(s){if(s<0)return 'never';if(s<60)return s+'s ago';let m=Math.floor(s/60);return m<60?m+'m ago':Math.floor(m/60)+'h ago'}
 function pill(el,cls,txt){el.className='pill '+cls;el.textContent=txt}
+// every value below is written with innerHTML on an unauthenticated LAN page: escape it all
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  up.textContent=fmtUp(s.service.uptime_s);
  const u=s.usage,A=s.accounts||{ready:false,list:[]},cs=!!A.ready;
- pill(src,cs?'ok':'bad',cs?('claude-swap · '+A.list.length+(A.list.length==1?' account':' accounts')):'setup needed');
- srcerr.textContent=cs?((A.cswap_ver||'cswap')+' · '+A.cswap):('⚠ '+(A.source_err||'claude-swap not ready'));
+ const S=A.sources||{claude:{n:A.list.length},codex:{n:0}},nc=(S.claude||{}).n||0,nx=(S.codex||{}).n||0;
+ pill(src,cs?'ok':'bad',cs?((nc?('claude-swap '+nc):'')+(nc&&nx?' + ':'')+(nx?('codex '+nx):'')):'setup needed');
+ srcerr.textContent=(nc?((A.cswap_ver||'cswap')+' at '+A.cswap):((nx?'':'! ')+(A.source_err||'claude-swap not ready')))
+   +(S.codex&&S.codex.bin?(' | '+(S.codex.ver||'codex')+', polled '+fmtAgo(S.codex.age)+', next in '+S.codex.next_in+'s'):'');
  // fleet verdict: one account capping is normal (cswap switches); ALL of them is a block
  const U=s.update||{};
  pill(fwnow,U.device_ver?'ok':'bad',U.device_ver?('v'+U.device_ver):'device unreachable');
@@ -1180,27 +1678,35 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  fwbtn.textContent=busy?'updating…':('Update device'+(U.can_update?(' to '+U.latest):''));
  if(!busy&&fwpoll){clearInterval(fwpoll);fwpoll=null;}
  const F=s.fleet||{},P=F.policy||{},B=F.benched||[];
- fleetrow.style.display=(A.list.length?'':'none');
+ fleetrow.style.display=(nc?'':'none');          // the cswap verdict is about Claude accounts only
  pill(fleet,F.exhausted?'bad':'ok',F.exhausted?(B.length?'NO ACCOUNT IN ROTATION':'ALL ACCOUNTS OUT'):((F.headroom||[]).length+' with room'));
  fleetmeta.textContent=(F.exhausted&&B.length?(B.map(b=>b.label+' has room ('+b.pct+'%) but is '+b.why
    +' - cswap enable '+b.label.toLowerCase()).join('; ')+' · '):'')
    +(P.threshold?('blocked at '+P.threshold+'% binding · cswap '+P.strategy
    +' · hysteresis '+P.hysteresis+'pp · cooldown '+P.cooldown+'s'+(P.model?(' · model '+P.model):'')):'');
+ const CF=s.codex_fleet||{};cxfleetrow.style.display=(nx?'':'none');
+ pill(cxfleet,CF.exhausted?'bad':'ok',CF.exhausted?'ALL CODEX ACCOUNTS OUT':(((CF.headroom||[]).length)+' with room'));
+ maxwarn.textContent=A.list.length>8?('The display cycles at most 8 accounts and '+A.list.length+' are configured. Use the two account filters below to choose which ones reach it.'):'';
  // no cswap on this box -> tell them exactly how to get multi-account, inline
  cswapadd.style.display=cs?'none':'';
  cswapadd.innerHTML=cs?'':'Want more than one account? Install <b>claude-swap</b> on this host, then add each login.';
  accts.innerHTML=(A.list||[]).map(a=>{const dead=a.auth=='dead';
    const pc=v=>(v==null||v<0)?'--':v+'%';   // -1 = no reading this poll
-   const f=a.f>=0?(' · '+(a.fl||'F')+' <b>'+pc(a.f)+'</b>'):'';
+   const f=a.f>=0?(' · '+esc(a.fl||'F')+' <b>'+pc(a.f)+'</b>'):'';
    return '<div style="border-top:1px solid var(--line);padding:8px 0">'
-    +'<div class=row style=margin:0><span><b>'+a.label+'</b>'+(a.active?' <span class=muted>· active</span>':'')
+    +'<div class=row style=margin:0><span><b>'+esc(a.label)+'</b> <span class=muted>'+(a.provider=='codex'?'codex':'claude')+(a.plan?(' '+esc(a.plan)):'')
+      +'</span>'+(a.blocked?' <span style=color:#f0ad36>blocked</span>':'')+(a.provider!='codex'&&a.active?' <span class=muted>active</span>':'')
       +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?'LOGIN EXPIRED':'ok')+'</span></div>'
-    +'<div class=row style="margin:2px 0"><span class=muted>'+(a.email||'')+'</span>'
+    +'<div class=row style="margin:2px 0"><span class=muted>'+esc(a.email||'')+'</span>'
       +'<span>'+(a.stale?'<span style=color:#f0ad36>stale </span>':'')
-        +'S <b>'+pc(a.s)+'</b> · W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
-    +'<div class=row style=margin:0><span class=muted>'+(a.sr?('resets '+a.sr):'idle')+(a.wr?(' · '+a.wr):'')
-      +'</span><span class=muted>'+(a.err||(a.age?a.age+'s':''))+'</span></div></div>';}).join('')
-   ||'<div class=muted>no accounts — run <code>cswap add</code>, or log in with --login</div>';
+        +((a.provider=='codex'&&a.s<0)?'':('S <b>'+pc(a.s)+'</b> · '))+'W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
+    +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+esc(a.home)+' codex login --device-auth</code></div>'):'')
+    +'<div class=row style=margin:0><span class=muted>'+((a.provider=='codex'&&a.s<0)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):'idle')+(a.wr?(' · '+esc(a.wr)):'')))
+      +'</span><span class=muted>'+esc(a.err||(a.age?a.age+'s':''))+'</span></div>'
+    +((a.buckets||[]).length>1?('<div class=muted style="margin-top:2px">'+a.buckets.map(b=>esc(b.name||b.id)+': '
+      +b.windows.map(w=>pc(w.pct)+'/'+(w.mins>=1440?Math.round(w.mins/1440)+'d':(w.mins?Math.round(w.mins/60)+'h':'?'))).join(' ')).join(' | ')+'</div>'):'')
+    +'</div>';}).join('')
+   ||'<div class=muted>no accounts yet: run <code>cswap add</code> for Claude, or log in to <code>codex</code> on this host</div>';
  uerr.textContent=u.err?('⚠ '+u.err):'';age.textContent=u.age>=0?('polled '+u.age+'s ago'):'';
  const w=s.weather;wx.textContent=w.city?(w.city+' '+w.wt+'°C '+w.wc+' · feels '+w.wfl+'° · '+w.wlo+'/'+w.whi+'° · rain '+w.wrain+'%'):'weather --';
  for(const k in s.config){const el=document.getElementById(k);if(el&&document.activeElement!==el){
@@ -1221,7 +1727,7 @@ citySearch.oninput=function(){clearTimeout(geoT);const q=this.value.trim();if(q.
   rs.forEach(h=>{const b=document.createElement('button');b.className='ghost';b.style.marginBottom='4px';b.textContent=h.label;b.onclick=()=>pickCity(h);geoResults.appendChild(b);});});},350);};
 function pickCity(h){geoResults.innerHTML='';citySearch.value='';pill(svc,'warn','applying…');
  fetch('/api/config?CITY='+encodeURIComponent(h.city)+'&LAT='+h.lat+'&LON='+h.lon+'&TZ='+encodeURIComponent(h.tz),{method:'POST'}).then(()=>setTimeout(load,3500));}
-function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','USAGE_EVERY','PORT','MAXED_THRESHOLD','CSWAP_ACCOUNTS',
+function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','USAGE_EVERY','PORT','MAXED_THRESHOLD','CSWAP_ACCOUNTS','CODEX_ACCOUNTS',
   'SMTP_HOST','SMTP_PORT','SMTP_SECURITY','SMTP_FROM','SMTP_USER','NOTIFY_EMAIL_TO'];
  const parts=ks.map(k=>k+'='+encodeURIComponent(document.getElementById(k).value));
  ['NOTIFY_SESSION_RESET','NOTIFY_SESSION_MAXED','NOTIFY_WEEK_RESET','NOTIFY_AUTH','NOTIFY_EMAIL'].forEach(k=>parts.push(k+'='+(document.getElementById(k).checked?'true':'false')));
@@ -1273,6 +1779,7 @@ class H(BaseHTTPRequestHandler):
             self._send(200, "application/json", '{"ok":1}'); restart_later()
         elif path == "/api/service" and q.get("action") == "poll":
             globals()["_force_poll"] = True          # re-read accounts now (dashboard button)
+            _codex["force"] = True
             self._send(200, "application/json", '{"ok":1}')
         elif path == "/api/service" and q.get("action") == "refresh":
             self._send(200, "application/json", '{"ok":1}')
@@ -1320,14 +1827,36 @@ def oauth_login():
     print("    cswap add --alias <name>\n")
     print("Repeat this whole step for each additional account.")
 
+def codex_login(alias):
+    """Convenience wrapper, run BY THE HUMAN in their own shell: make a private CODEX_HOME for
+    one more Codex account and exec the official `codex login` in it. The service never calls
+    this, and no credential ever passes through the collector."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", alias or "") or alias.lower() == "default":
+        print("usage: claude_usage_server.py --codex-login <alias>   (letters, digits, - and _)")
+        raise SystemExit(2)
+    exe = codex_bin()
+    if not exe:
+        print("codex is not installed on this host. Install the Codex CLI, then re-run."); raise SystemExit(1)
+    home = os.path.join(CODEX_HOMES_ROOT, alias)
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    try: os.chmod(home, 0o700)
+    except OSError: pass
+    print("Logging a Codex account into %s\nLog in separately on every machine: never copy this "
+          "directory from another box, refresh tokens rotate.\n" % home)
+    raise SystemExit(subprocess.call([exe, "login", "--device-auth"], env=dict(os.environ, CODEX_HOME=home)))
+
 if __name__ == "__main__":
     import sys
     if "--login" in sys.argv:
         oauth_login(); raise SystemExit(0)
+    if "--codex-login" in sys.argv:
+        i = sys.argv.index("--codex-login")
+        codex_login(sys.argv[i + 1] if i + 1 < len(sys.argv) else "")
     if not cswap_bin():
         print("WARNING: claude-swap (cswap) is not installed — ClaudeTV reads all accounts from\n"
               "         it. Install it and add an account, then this starts serving:\n"
               "           pipx install claude-swap && cswap add --alias <name>")
     threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=codex_io_loop, daemon=True).start()
     print("ClaudeTV collector + terminal on http://0.0.0.0:%d  (device -> /usage, terminal -> /)" % PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

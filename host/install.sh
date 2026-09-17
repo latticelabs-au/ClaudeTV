@@ -77,6 +77,14 @@ else
   c "  one side quarantined." warn
 fi
 
+# Codex is optional: ClaudeTV reads it through the official CLI and never installs it for you.
+CODEX="$(command -v codex || true)"; [ -x "$HOME/.local/bin/codex" ] && CODEX="$HOME/.local/bin/codex"
+if [ -n "$CODEX" ]; then
+  c "OK codex: $("$CODEX" --version 2>/dev/null || echo present)" ok
+  [ -f "$HOME/.codex/auth.json" ] && c "   ~/.codex is logged in and will show on the display" ok
+  c "   add another Codex account:  python3 $DEST/claude_usage_server.py --codex-login <name>" info
+fi
+
 # --- idempotent: stop any existing instance before swapping files ---
 $SUDO systemctl stop "$SERVICE" 2>/dev/null || true
 
