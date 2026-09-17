@@ -581,14 +581,19 @@ def codex_status(account_reply, limits_reply, driver_err=""):
     endpoint rejects it, never because a refresh failed, and 429 is never dead. When a refresh
     fails for good, Codex keeps the stale credential and account/read still reports the account,
     so a login that needs a human arrives as HTTP 401 inside -32603, not as -32600."""
-    res = (account_reply or {}).get("result")
-    acct = res.get("account") if isinstance(res, dict) else None
-    if isinstance(res, dict) and acct is None: return "dead", "login_required"
-    if acct and acct.get("type") != "chatgpt": return "ok", "api_key"   # no subscription quota
+    account_reply = account_reply if isinstance(account_reply, dict) else {}
+    limits_reply = limits_reply if isinstance(limits_reply, dict) else {}
+    res = account_reply.get("result"); res = res if isinstance(res, dict) else {}
+    acct = res.get("account")
+    if isinstance(acct, dict) and acct.get("type") != "chatgpt": return "ok", "api_key"   # no subscription quota
+    # The usage endpoint answering IS the verdict: an account/read shape we do not recognise
+    # (app-server is experimental) must never outvote live numbers.
+    if isinstance(limits_reply.get("result"), dict): return "ok", ""
+    # dead needs an EXPLICIT null account, not merely a key we failed to find
+    if "account" in res and acct is None: return "dead", "login_required"
     if driver_err: return "ok", driver_err
-    e = (limits_reply or {}).get("error")
-    if not e:
-        return ("ok", "") if isinstance((limits_reply or {}).get("result"), dict) else ("ok", "unavailable")
+    e = limits_reply.get("error")
+    if not isinstance(e, dict): return "ok", "unavailable"
     code, msg = e.get("code"), str(e.get("message") or "")
     if code == -32600: return "dead", "login_required"
     if code == -32603:
@@ -600,9 +605,15 @@ def codex_status(account_reply, limits_reply, driver_err=""):
         return "ok", "unavailable"
     return "ok", "unknown"
 
+def _num(v):
+    """A finite number out of whatever the wire carried (int, float, numeric string), else None."""
+    try: f = float(v)
+    except (TypeError, ValueError): return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
 def _cpct(w):
-    v = (w or {}).get("usedPercent")
-    return round(float(v)) if v is not None else -1
+    v = _num(w.get("usedPercent")) if isinstance(w, dict) else None
+    return round(v) if v is not None else -1
 
 def _codex_iso(unix_s):
     """Codex reports resetsAt in unix seconds; the notifier compares ISO strings."""
@@ -613,14 +624,15 @@ def codex_windows(bucket):
     """(short, long) windows of one bucket, classified by DURATION and never by slot: `primary`
     and `secondary` are transport positions. When OpenAI drops the 5h limit the weekly window
     moves into `primary` with `secondary: null` (seen live on a prolite plan)."""
-    wins = [w for w in ((bucket or {}).get("primary"), (bucket or {}).get("secondary"))
-            if isinstance(w, dict) and w.get("usedPercent") is not None]
-    known = [w for w in wins if w.get("windowDurationMins")]
-    unknown = [w for w in wins if not w.get("windowDurationMins")]
-    long_ = [w for w in known if w["windowDurationMins"] >= DAY_MINS]
-    short_ = [w for w in known if w["windowDurationMins"] < DAY_MINS]
-    wk = min(long_, key=lambda w: abs(w["windowDurationMins"] - WEEK_MINS)) if long_ else None
-    sh = min(short_, key=lambda w: w["windowDurationMins"]) if short_ else None
+    bucket = bucket if isinstance(bucket, dict) else {}
+    wins = [w for w in (bucket.get("primary"), bucket.get("secondary")) if _cpct(w) >= 0]
+    dur = lambda w: _num(w.get("windowDurationMins")) or 0      # 0 = duration not given
+    known = [w for w in wins if dur(w) > 0]
+    unknown = [w for w in wins if dur(w) <= 0]
+    long_ = [w for w in known if dur(w) >= DAY_MINS]
+    short_ = [w for w in known if dur(w) < DAY_MINS]
+    wk = min(long_, key=lambda w: abs(dur(w) - WEEK_MINS)) if long_ else None
+    sh = min(short_, key=dur) if short_ else None
     # durations are nullable. Two unlabelled windows: historic order (short, then weekly). One:
     # it is the weekly, the window that persists when the short limit is removed.
     if len(unknown) == 2: sh, wk = unknown[0], unknown[1]
@@ -630,15 +642,18 @@ def codex_windows(bucket):
     return sh, wk
 
 def _codex_scoped(buckets, want):
-    """The model bucket to put in the device's third column, or (None, ''). Off unless asked."""
+    """The model bucket to put in the device's third column, or (None, ''). Off unless asked.
+    Only its day-or-longer window qualifies: `f` rides in the notifier's WEEK pair (as Claude's
+    7-day scoped limit does), so a 5h model window there would fire a false weekly reset every
+    time it rolled."""
     want = (want or "").strip().lower()
-    if not want: return None, ""
-    for bid, b in sorted((buckets or {}).items()):
+    if not want or not isinstance(buckets, dict): return None, ""
+    for bid, b in sorted(buckets.items()):
         if bid == CODEX_MAIN_BUCKET or not isinstance(b, dict): continue
-        name = b.get("limitName") or ""
-        if want in bid.lower() or want in name.lower():
-            sh, wk = codex_windows(b)
-            return (wk or sh), (name.split("-")[-1] or bid).strip().upper()[:7]
+        name = str(b.get("limitName") or "")
+        if want in str(bid).lower() or want in name.lower():
+            wk = codex_windows(b)[1]
+            return (wk, (name.split("-")[-1] or str(bid)).strip().upper()[:7]) if wk else (None, "")
     return None, ""
 
 def codex_account_from_rpc(slot, alias, home, raw, scoped=""):
@@ -646,10 +661,13 @@ def codex_account_from_rpc(slot, alias, home, raw, scoped=""):
     (the shape cswap_accounts_from_json documents), plus provider/slot/home/blocked/plan/buckets."""
     account_reply, limits_reply = raw.get("account"), raw.get("limits")
     auth, err = codex_status(account_reply, limits_reply, raw.get("driver_err") or "")
-    acct = ((account_reply or {}).get("result") or {}).get("account") or {}
-    res = (limits_reply or {}).get("result") or {}
-    buckets = res.get("rateLimitsByLimitId") or {}
-    main = buckets.get(CODEX_MAIN_BUCKET) or res.get("rateLimits") or {}
+    # app-server is labelled experimental: every level is checked for its type, so a shape we
+    # do not recognise degrades THIS account to "no reading" instead of raising.
+    D = lambda v: v if isinstance(v, dict) else {}
+    acct = D(D(D(account_reply).get("result")).get("account"))
+    res = D(D(limits_reply).get("result"))
+    buckets = D(res.get("rateLimitsByLimitId"))
+    main = D(buckets.get(CODEX_MAIN_BUCKET)) or D(res.get("rateLimits"))
     sh, wk = codex_windows(main)
     # -1 means "not known", never 0 (the same rule the cswap mapper enforces)
     u = {"s": _cpct(sh), "w": _cpct(wk), "sr": "", "wr": "", "f": -1, "fl": ""}
@@ -661,16 +679,17 @@ def codex_account_from_rpc(slot, alias, home, raw, scoped=""):
     sw, tag = _codex_scoped(buckets, scoped)
     if sw: u["f"], u["fl"] = _cpct(sw), tag
     if auth == "ok" and not err and u["s"] < 0 and u["w"] < 0: err = "no_windows"
-    email = acct.get("email") or ""
+    S = lambda v: v if isinstance(v, str) else ""
+    email = S(acct.get("email"))
     return {"provider": "codex", "key": "codex:%s" % slot, "slot": slot, "home": home,
             "label": _label(alias, email, "") if (alias or email) else "CODEX",
             "email": email, "active": True, "disabled": False, "u": u,
             "stale": not (auth == "ok" and not err), "resets": resets, "auth": auth,
-            "age": 0, "err": err, "ident": res.get("accountId") or "",
+            "age": 0, "err": err, "ident": S(res.get("accountId")),
             "blocked": bool(res.get("ordinaryUsageAllowed") is False or main.get("rateLimitReachedType")),
-            "plan": main.get("planType") or acct.get("planType") or "",
-            "buckets": [{"id": bid, "name": b.get("limitName") or "",
-                         "windows": [{"mins": w.get("windowDurationMins"), "pct": _cpct(w),
+            "plan": S(main.get("planType")) or S(acct.get("planType")),
+            "buckets": [{"id": bid, "name": S(b.get("limitName")),
+                         "windows": [{"mins": _num(w.get("windowDurationMins")), "pct": _cpct(w),
                                       "resets": _codex_iso(w.get("resetsAt"))}
                                      for w in (b.get("primary"), b.get("secondary")) if isinstance(w, dict)]}
                         for bid, b in sorted(buckets.items()) if isinstance(b, dict)]}
@@ -830,8 +849,14 @@ def codex_refresh(now, force=False, reader=None):
     out = []
     for slot, alias, path in homes:
         if slot not in raws: out.append(prev[slot]); continue
-        rec = codex_with_last_good(codex_account_from_rpc(slot, alias, path, raws[slot],
-                                   CONFIG.get("CODEX_SCOPED", "")), _codex["good"].get(slot), now)
+        try: rec = codex_account_from_rpc(slot, alias, path, raws[slot], CONFIG.get("CODEX_SCOPED", ""))
+        except Exception as e:
+            # One account's reply we cannot map must cost THAT account a reading, never the pass:
+            # without this, a stable odd shape froze every Codex card with no reason shown.
+            print("[codex] %s: unmappable reply (%s)" % (slot, str(e)[:80]))
+            rec = codex_account_from_rpc(slot, alias, path,
+                                         {"account": None, "limits": None, "driver_err": "unparseable"})
+        rec = codex_with_last_good(rec, _codex["good"].get(slot), now)
         if not rec["stale"]: _codex["good"][slot] = rec
         if rec["auth"] == "dead": _codex["hold"][slot] = now + CODEX_DEAD_HOLD
         else: _codex["hold"].pop(slot, None)
@@ -849,15 +874,24 @@ def codex_next_delay(accts, fails):
     if live and all(a["stale"] for a in live): return min(1800.0, base * (2 ** max(0, fails - 1)))
     return base
 
+def codex_due(now):
+    """-> (run, force). "Re-read accounts" is honoured at most once a minute so the button cannot
+    hammer the backend, but a click inside that minute STAYS ARMED rather than being dropped:
+    force is the only override for the 30 minute dead hold, so swallowing it would strand a
+    freshly re-logged account on LOGIN EXPIRED. The flag is cleared only when it is honoured."""
+    if _codex["force"] and now - _codex["last"] >= 60:
+        _codex["force"] = False
+        return True, True
+    return now >= _codex["next"], False
+
 def codex_io_loop():
     """Codex I/O on its own thread, so a hung backend can never delay the Claude poll. It only
     reads and maps; every stateful pass happens on the poller thread via codex_apply_pending,
     which keeps notifier state single-threaded."""
     while True:
         now = time.time()
-        force, _codex["force"] = _codex["force"], False
-        force = force and now - _codex["last"] >= 60          # the button cannot hammer the backend
-        if now >= _codex["next"] or force:
+        run, force = codex_due(now)
+        if run:
             try:
                 accts = codex_refresh(now, force)
                 live = [a for a in accts if a["auth"] != "dead"]
@@ -1543,7 +1577,9 @@ a{color:var(--cyan)}code{background:#0d1119;border:1px solid var(--line);border-
 <div class=muted id=srcerr></div>
 <div class=row id=fleetrow style="display:none"><span>Quota</span><span class=pill id=fleet>--</span></div>
 <div class=muted id=fleetmeta></div>
+<div class=row id=cxfleetrow style="display:none"><span>Codex quota</span><span class=pill id=cxfleet>--</span></div>
 <div id=accts style="margin-top:6px"></div>
+<div class=muted id=maxwarn style="color:#f0ad36"></div>
 <div id=cswapadd class=muted style="display:none;margin-top:8px"></div>
 <div class=grid style=margin-top:8px><button class=ghost onclick=poll()>Re-read accounts</button>
 <button class=ghost onclick="document.getElementById('acchelp').style.display=''">How to add an account</button></div>
@@ -1620,6 +1656,8 @@ ownUrl.textContent=location.origin+'/usage';
 function fmtUp(s){let h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h+'h '+m+'m'}
 function fmtAgo(s){if(s<0)return 'never';if(s<60)return s+'s ago';let m=Math.floor(s/60);return m<60?m+'m ago':Math.floor(m/60)+'h ago'}
 function pill(el,cls,txt){el.className='pill '+cls;el.textContent=txt}
+// every value below is written with innerHTML on an unauthenticated LAN page: escape it all
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  up.textContent=fmtUp(s.service.uptime_s);
  const u=s.usage,A=s.accounts||{ready:false,list:[]},cs=!!A.ready;
@@ -1638,32 +1676,35 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  fwbtn.textContent=busy?'updating…':('Update device'+(U.can_update?(' to '+U.latest):''));
  if(!busy&&fwpoll){clearInterval(fwpoll);fwpoll=null;}
  const F=s.fleet||{},P=F.policy||{},B=F.benched||[];
- fleetrow.style.display=(A.list.length?'':'none');
+ fleetrow.style.display=(nc?'':'none');          // the cswap verdict is about Claude accounts only
  pill(fleet,F.exhausted?'bad':'ok',F.exhausted?(B.length?'NO ACCOUNT IN ROTATION':'ALL ACCOUNTS OUT'):((F.headroom||[]).length+' with room'));
  fleetmeta.textContent=(F.exhausted&&B.length?(B.map(b=>b.label+' has room ('+b.pct+'%) but is '+b.why
    +' - cswap enable '+b.label.toLowerCase()).join('; ')+' · '):'')
    +(P.threshold?('blocked at '+P.threshold+'% binding · cswap '+P.strategy
    +' · hysteresis '+P.hysteresis+'pp · cooldown '+P.cooldown+'s'+(P.model?(' · model '+P.model):'')):'');
+ const CF=s.codex_fleet||{};cxfleetrow.style.display=(nx?'':'none');
+ pill(cxfleet,CF.exhausted?'bad':'ok',CF.exhausted?'ALL CODEX ACCOUNTS OUT':(((CF.headroom||[]).length)+' with room'));
+ maxwarn.textContent=A.list.length>8?('The display cycles at most 8 accounts and '+A.list.length+' are configured. Use the two account filters below to choose which ones reach it.'):'';
  // no cswap on this box -> tell them exactly how to get multi-account, inline
  cswapadd.style.display=cs?'none':'';
  cswapadd.innerHTML=cs?'':'Want more than one account? Install <b>claude-swap</b> on this host, then add each login.';
  accts.innerHTML=(A.list||[]).map(a=>{const dead=a.auth=='dead';
    const pc=v=>(v==null||v<0)?'--':v+'%';   // -1 = no reading this poll
-   const f=a.f>=0?(' · '+(a.fl||'F')+' <b>'+pc(a.f)+'</b>'):'';
+   const f=a.f>=0?(' · '+esc(a.fl||'F')+' <b>'+pc(a.f)+'</b>'):'';
    return '<div style="border-top:1px solid var(--line);padding:8px 0">'
-    +'<div class=row style=margin:0><span><b>'+a.label+'</b> <span class=muted>'+(a.provider=='codex'?'codex':'claude')+(a.plan?(' '+a.plan):'')
+    +'<div class=row style=margin:0><span><b>'+esc(a.label)+'</b> <span class=muted>'+(a.provider=='codex'?'codex':'claude')+(a.plan?(' '+esc(a.plan)):'')
       +'</span>'+(a.blocked?' <span style=color:#f0ad36>blocked</span>':'')+(a.provider!='codex'&&a.active?' <span class=muted>active</span>':'')
       +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?'LOGIN EXPIRED':'ok')+'</span></div>'
-    +'<div class=row style="margin:2px 0"><span class=muted>'+(a.email||'')+'</span>'
+    +'<div class=row style="margin:2px 0"><span class=muted>'+esc(a.email||'')+'</span>'
       +'<span>'+(a.stale?'<span style=color:#f0ad36>stale </span>':'')
         +'S <b>'+pc(a.s)+'</b> · W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
-    +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+a.home+' codex login --device-auth</code></div>'):'')
-    +'<div class=row style=margin:0><span class=muted>'+(a.sr?('resets '+a.sr):'idle')+(a.wr?(' · '+a.wr):'')
-      +'</span><span class=muted>'+(a.err||(a.age?a.age+'s':''))+'</span></div>'
-    +((a.buckets||[]).length>1?('<div class=muted style="margin-top:2px">'+a.buckets.map(b=>(b.name||b.id)+': '
+    +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+esc(a.home)+' codex login --device-auth</code></div>'):'')
+    +'<div class=row style=margin:0><span class=muted>'+(a.sr?('resets '+esc(a.sr)):'idle')+(a.wr?(' · '+esc(a.wr)):'')
+      +'</span><span class=muted>'+esc(a.err||(a.age?a.age+'s':''))+'</span></div>'
+    +((a.buckets||[]).length>1?('<div class=muted style="margin-top:2px">'+a.buckets.map(b=>esc(b.name||b.id)+': '
       +b.windows.map(w=>pc(w.pct)+'/'+(w.mins>=1440?Math.round(w.mins/1440)+'d':(w.mins?Math.round(w.mins/60)+'h':'?'))).join(' ')).join(' | ')+'</div>'):'')
     +'</div>';}).join('')
-   ||'<div class=muted>no accounts — run <code>cswap add</code>, or log in with --login</div>';
+   ||'<div class=muted>no accounts yet: run <code>cswap add</code> for Claude, or log in to <code>codex</code> on this host</div>';
  uerr.textContent=u.err?('⚠ '+u.err):'';age.textContent=u.age>=0?('polled '+u.age+'s ago'):'';
  const w=s.weather;wx.textContent=w.city?(w.city+' '+w.wt+'°C '+w.wc+' · feels '+w.wfl+'° · '+w.wlo+'/'+w.whi+'° · rain '+w.wrain+'%'):'weather --';
  for(const k in s.config){const el=document.getElementById(k);if(el&&document.activeElement!==el){

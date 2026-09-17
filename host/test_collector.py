@@ -1471,5 +1471,103 @@ class TestCodexLiveContract(TzPinned):
         self.assertEqual(srv.codex_status(raw["account"], raw["limits"], raw["driver_err"]),
                          ("dead", "login_required"))
 
+
+class TestCodexHardening(CodexIsolated):
+    """Defects an independent review reproduced after the first cut. app-server is labelled
+    experimental, so an odd reply shape must degrade ONE account, never the whole source."""
+
+    ODD_LIMITS = [
+        ("duration arrives as a string", cx_limits(primary={"usedPercent": 19, "windowDurationMins": "10080", "resetsAt": 1790220250})),
+        ("usedPercent is not a number", cx_limits(primary={"usedPercent": "lots", "windowDurationMins": 10080})),
+        ("usedPercent is a numeric string", cx_limits(primary={"usedPercent": "19", "windowDurationMins": 10080})),
+        ("result is a list", {"id": 3, "result": []}),
+        ("rateLimitsByLimitId is a list", {"id": 3, "result": {"rateLimitsByLimitId": [], "rateLimits": []}}),
+        ("the codex bucket is a string", {"id": 3, "result": {"rateLimitsByLimitId": {"codex": "nope"}}}),
+        ("a window is a list", cx_limits(primary=[1, 2], secondary=None)),
+        ("the reply is not an object", [1, 2, 3]),
+    ]
+
+    def test_no_reply_shape_can_raise_or_invent_a_zero(self):
+        for name, limits in self.ODD_LIMITS:
+            with self.subTest(name):
+                r = srv.codex_account_from_rpc("a", "a", "/h", cx_raw(limits))
+                self.assertNotEqual(r["u"]["s"], 0); self.assertNotEqual(r["u"]["w"], 0)
+                self.assertNotEqual(r["auth"], "dead", "an odd shape is never a dead login")
+
+    def test_numeric_strings_are_read_rather_than_dropped(self):
+        r = srv.codex_account_from_rpc("a", "a", "/h", cx_raw(self.ODD_LIMITS[0][1]))
+        self.assertEqual((r["u"]["w"], r["stale"]), (19, False))
+        self.assertEqual(srv.codex_account_from_rpc("a", "a", "/h", cx_raw(self.ODD_LIMITS[2][1]))["u"]["w"], 19)
+
+    def test_an_odd_account_reply_never_raises_and_never_kills_a_login_the_usage_endpoint_accepts(self):
+        for name, acct in (("empty result", {"id": 2, "result": {}}),
+                           ("renamed field", {"id": 2, "result": {"accounts": [{"type": "chatgpt"}]}}),
+                           ("account is a string", {"id": 2, "result": {"account": "cosmo"}}),
+                           ("result is a list", {"id": 2, "result": []}),
+                           ("explicit null but usage answered", {"id": 2, "result": {"account": None}})):
+            with self.subTest(name):
+                self.assertEqual(srv.codex_status(acct, CODEX_LIMITS, ""), ("ok", ""))
+                r = srv.codex_account_from_rpc("a", "a", "/h", cx_raw(CODEX_LIMITS, acct))
+                self.assertEqual((r["auth"], r["stale"], r["u"]["w"]), ("ok", False, 19))
+
+    def test_an_explicit_null_account_with_no_usage_is_still_dead(self):
+        self.assertEqual(srv.codex_status({"id": 2, "result": {"account": None}},
+                         cx_err(-32600, "codex account authentication required to read rate limits"), ""),
+                         ("dead", "login_required"))
+
+    def test_one_unmappable_account_does_not_discard_the_whole_pass(self):
+        real = srv.codex_account_from_rpc
+        def flaky(slot, alias, home, raw, scoped=""):
+            if slot == "default" and raw.get("limits") is not None: raise TypeError("shape changed")
+            return real(slot, alias, home, raw, scoped)
+        srv.codex_account_from_rpc = flaky
+        try: accts = srv.codex_refresh(1000.0, reader=self.reader({"/h/default": cx_raw(), "/h/work": cx_raw()}))
+        finally: srv.codex_account_from_rpc = real
+        self.assertEqual([(a["slot"], a["stale"], a["err"]) for a in accts],
+                         [("default", True, "unparseable"), ("work", False, "")])
+        self.assertEqual(accts[0]["auth"], "ok")                 # unparseable is never a dead login
+
+    def test_a_scoped_bucket_with_only_a_short_window_stays_out_of_the_weekly_pair(self):
+        """`f` rides in the notifier's WEEK pair. A 5h model window there fires a false weekly
+        reset every time it rolls, so only a day-or-longer scoped window may fill it."""
+        d = json.loads(json.dumps(CODEX_LIMITS))
+        d["result"]["rateLimitsByLimitId"]["codex_bengalfox"]["secondary"] = None     # 300 min only
+        u = srv.codex_account_from_rpc("a", "a", "/h", cx_raw(d), scoped="spark")["u"]
+        self.assertEqual((u["f"], u["fl"]), (-1, ""))
+        u = srv.codex_account_from_rpc("a", "a", "/h", cx_raw(), scoped="spark")["u"]
+        self.assertEqual((u["f"], u["fl"]), (7, "SPARK"))
+
+    def test_a_forced_reread_inside_the_one_minute_guard_stays_armed_instead_of_being_dropped(self):
+        """Force is the ONLY override for the 30 minute dead hold. Dropping a click that lands
+        just after an automatic poll would strand a re-logged account on LOGIN EXPIRED."""
+        srv._codex.update({"last": 1000.0, "next": 1300.0, "force": True})
+        self.assertEqual(srv.codex_due(1010.0), (False, False))
+        self.assertTrue(srv._codex["force"], "the click was swallowed")
+        self.assertEqual(srv.codex_due(1060.0), (True, True))
+        self.assertFalse(srv._codex["force"])
+        self.assertEqual(srv.codex_due(1070.0), (False, False))   # not due, nothing armed
+        self.assertEqual(srv.codex_due(1300.0), (True, False))    # the ordinary timer
+
+    def test_a_relogin_is_picked_up_by_the_next_forced_reread(self):
+        dead = cx_raw(cx_err(-32603, CX_HTTP % ("401 Unauthorized", "application/json")))
+        srv.codex_refresh(1000.0, reader=self.reader({"/h/default": dead, "/h/work": cx_raw()}))
+        srv._codex.update({"last": 1000.0, "next": 1300.0, "force": True})
+        self.assertEqual(srv.codex_due(1010.0), (False, False))                 # too soon, still armed
+        run, force = srv.codex_due(1061.0)
+        accts = srv.codex_refresh(1061.0, force, reader=self.reader({"/h/default": cx_raw(), "/h/work": cx_raw()}))
+        self.assertEqual([a["auth"] for a in accts], ["ok", "ok"])
+        self.assertNotIn("default", srv._codex["hold"])
+
+    def test_every_value_written_into_the_terminal_is_escaped(self):
+        js = srv.TERMINAL
+        self.assertIn("const esc=", js)
+        for value in ("esc(a.label)", "esc(a.email", "esc(a.plan)", "esc(a.home)", "esc(b.name||b.id)"):
+            self.assertIn(value, js)
+
+    def test_the_terminal_shows_the_codex_fleet_and_warns_past_the_device_limit(self):
+        for needle in ("id=cxfleet", "s.codex_fleet", "id=maxwarn", "A.list.length>8"):
+            self.assertIn(needle, srv.TERMINAL)
+
+
 if __name__ == "__main__":
     unittest.main()
