@@ -864,5 +864,99 @@ class TestCodexStatus(unittest.TestCase):
         msg = CX_HTTP % ("500 Internal Server Error", "") + " upstream said 429"
         self.assertEqual(srv.codex_status(CODEX_ACCT, cx_err(-32603, msg), ""), ("ok", "unavailable"))
 
+
+class TestCodexMapping(TzPinned):
+    def rec(self, raw=None, slot="default", alias="", scoped=""):
+        return srv.codex_account_from_rpc(slot, alias, "/homes/x", raw or cx_raw(), scoped)
+
+    def test_weekly_window_in_the_primary_slot_maps_to_week_not_session(self):
+        u = self.rec()["u"]
+        self.assertEqual((u["s"], u["w"]), (-1, 19))
+
+    def test_a_missing_window_is_minus_one_never_zero(self):
+        self.assertEqual(self.rec()["u"]["s"], -1)
+        self.assertEqual(self.rec()["u"]["sr"], "")
+
+    def test_a_good_read_is_fresh_and_ok(self):
+        r = self.rec()
+        self.assertEqual((r["stale"], r["auth"], r["err"], r["provider"]), (False, "ok", "", "codex"))
+
+    def test_key_comes_from_the_slot_so_it_is_identical_on_a_failed_read(self):
+        good, bad = self.rec(), self.rec(cx_raw(None, None, "timeout"))
+        self.assertEqual(good["key"], "codex:default")
+        self.assertEqual(bad["key"], good["key"])
+
+    def test_label_prefers_the_alias_then_the_email_then_a_fixed_word(self):
+        self.assertEqual(self.rec(alias="work", slot="work")["label"], "WORK")
+        self.assertEqual(self.rec()["label"], "COSMO")
+        self.assertEqual(self.rec(cx_raw(None, None, "timeout"))["label"], "CODEX")
+
+    def test_reset_strings_use_the_device_format(self):
+        r = self.rec(cx_raw(cx_limits(primary=cx_win(40, 10080), secondary=cx_win(12, 300, 1789641634))))
+        self.assertEqual(r["u"]["sr"], "10:40am")
+        self.assertEqual(r["u"]["wr"], "Sep 24 3:24am")
+
+    def test_resets_are_iso_strings_for_the_notifier(self):
+        r = self.rec()
+        self.assertEqual(r["resets"], {"session": None, "week": "2026-09-24T03:24:10+00:00"})
+
+    def test_swapped_slots_still_classify_by_duration(self):
+        r = self.rec(cx_raw(cx_limits(primary=cx_win(40, 10080), secondary=cx_win(12, 300))))
+        self.assertEqual((r["u"]["s"], r["u"]["w"]), (12, 40))
+
+    def test_two_windows_without_durations_fall_back_to_slot_order(self):
+        r = self.rec(cx_raw(cx_limits(primary={"usedPercent": 5}, secondary={"usedPercent": 60})))
+        self.assertEqual((r["u"]["s"], r["u"]["w"]), (5, 60))
+
+    def test_a_lone_window_without_a_duration_is_the_weekly(self):
+        r = self.rec(cx_raw(cx_limits(primary={"usedPercent": 33}, secondary=None)))
+        self.assertEqual((r["u"]["s"], r["u"]["w"]), (-1, 33))
+
+    def test_a_three_day_window_is_shown_under_week_rather_than_dropped(self):
+        self.assertEqual(self.rec(cx_raw(cx_limits(primary=cx_win(8, 4320), secondary=None)))["u"]["w"], 8)
+
+    def test_falls_back_to_rate_limits_when_the_codex_bucket_is_absent(self):
+        d = json.loads(json.dumps(CODEX_LIMITS)); del d["result"]["rateLimitsByLimitId"]["codex"]
+        self.assertEqual(self.rec(cx_raw(d))["u"]["w"], 19)
+
+    def test_scoped_bucket_is_off_by_default_and_on_when_named(self):
+        self.assertEqual((self.rec()["u"]["f"], self.rec()["u"]["fl"]), (-1, ""))
+        u = self.rec(scoped="spark")["u"]
+        self.assertEqual((u["f"], u["fl"]), (7, "SPARK"))
+        self.assertEqual(self.rec(scoped="bengalfox")["u"]["f"], 7)
+
+    def test_every_bucket_is_listed_for_the_terminal(self):
+        self.assertEqual([b["id"] for b in self.rec()["buckets"]], ["codex", "codex_bengalfox"])
+
+    def test_blocked_follows_the_backend_verdict(self):
+        self.assertFalse(self.rec()["blocked"])
+        d = json.loads(json.dumps(CODEX_LIMITS)); d["result"]["ordinaryUsageAllowed"] = False
+        self.assertTrue(self.rec(cx_raw(d))["blocked"])
+        self.assertTrue(self.rec(cx_raw(cx_limits(rateLimitReachedType="rate_limit_reached")))["blocked"])
+
+    def test_a_reply_with_no_windows_is_stale_not_zero(self):
+        d = json.loads(json.dumps(CODEX_LIMITS))
+        d["result"]["rateLimitsByLimitId"] = {}; d["result"]["rateLimits"] = {}
+        r = self.rec(cx_raw(d))
+        self.assertEqual((r["stale"], r["err"], r["u"]["w"]), (True, "no_windows", -1))
+
+    def test_dead_and_failed_reads_are_stale(self):
+        dead = self.rec(cx_raw(cx_err(-32603, CX_HTTP % ("401 Unauthorized", "application/json"))))
+        self.assertEqual((dead["auth"], dead["stale"]), ("dead", True))
+
+
+class TestCodexLastGood(TzPinned):
+    def test_a_failed_read_keeps_showing_the_last_good_numbers(self):
+        good = srv.codex_with_last_good(srv.codex_account_from_rpc("default", "", "/h", cx_raw()), None, 1000.0)
+        bad = srv.codex_with_last_good(
+            srv.codex_account_from_rpc("default", "", "/h", cx_raw(None, None, "timeout")), good, 1400.0)
+        self.assertEqual(bad["u"]["w"], 19)
+        self.assertEqual((bad["stale"], bad["err"], bad["age"], bad["label"]), (True, "timeout", 400, "COSMO"))
+
+    def test_a_failed_read_with_no_history_stays_unknown(self):
+        bad = srv.codex_with_last_good(
+            srv.codex_account_from_rpc("default", "", "/h", cx_raw(None, None, "timeout")), None, 1.0)
+        self.assertEqual((bad["u"]["s"], bad["u"]["w"]), (-1, -1))
+
 if __name__ == "__main__":
     unittest.main()

@@ -488,6 +488,9 @@ def usage_wire(accounts, wx, primary=""):
 #   * `--disable plugins` cuts a launch from 7 backend requests to exactly 1
 #   * Codex NEVER times out a hung backend, so the deadline and the kill are ours
 
+CODEX_MAIN_BUCKET = "codex"
+DAY_MINS, WEEK_MINS = 1440, 10080
+
 # Codex gives no structured HTTP status, only this message shape (codex-rs backend-client):
 #   "failed to fetch codex rate limits: GET <url> failed: 401 Unauthorized; content-type=...; body=..."
 _CODEX_HTTP = re.compile(r"failed: (\d{3}) ")
@@ -515,6 +518,93 @@ def codex_status(account_reply, limits_reply, driver_err=""):
         if http == 429: return "ok", "rate_limited"
         return "ok", "unavailable"
     return "ok", "unknown"
+
+def _cpct(w):
+    v = (w or {}).get("usedPercent")
+    return round(float(v)) if v is not None else -1
+
+def _codex_iso(unix_s):
+    """Codex reports resetsAt in unix seconds; the notifier compares ISO strings."""
+    try: return datetime.fromtimestamp(int(unix_s), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError): return None
+
+def codex_windows(bucket):
+    """(short, long) windows of one bucket, classified by DURATION and never by slot: `primary`
+    and `secondary` are transport positions. When OpenAI drops the 5h limit the weekly window
+    moves into `primary` with `secondary: null` (seen live on a prolite plan)."""
+    wins = [w for w in ((bucket or {}).get("primary"), (bucket or {}).get("secondary"))
+            if isinstance(w, dict) and w.get("usedPercent") is not None]
+    known = [w for w in wins if w.get("windowDurationMins")]
+    unknown = [w for w in wins if not w.get("windowDurationMins")]
+    long_ = [w for w in known if w["windowDurationMins"] >= DAY_MINS]
+    short_ = [w for w in known if w["windowDurationMins"] < DAY_MINS]
+    wk = min(long_, key=lambda w: abs(w["windowDurationMins"] - WEEK_MINS)) if long_ else None
+    sh = min(short_, key=lambda w: w["windowDurationMins"]) if short_ else None
+    # durations are nullable. Two unlabelled windows: historic order (short, then weekly). One:
+    # it is the weekly, the window that persists when the short limit is removed.
+    if len(unknown) == 2: sh, wk = unknown[0], unknown[1]
+    elif unknown:
+        if wk is None: wk = unknown[0]
+        elif sh is None: sh = unknown[0]
+    return sh, wk
+
+def _codex_scoped(buckets, want):
+    """The model bucket to put in the device's third column, or (None, ''). Off unless asked."""
+    want = (want or "").strip().lower()
+    if not want: return None, ""
+    for bid, b in sorted((buckets or {}).items()):
+        if bid == CODEX_MAIN_BUCKET or not isinstance(b, dict): continue
+        name = b.get("limitName") or ""
+        if want in bid.lower() or want in name.lower():
+            sh, wk = codex_windows(b)
+            return (wk or sh), (name.split("-")[-1] or bid).strip().upper()[:7]
+    return None, ""
+
+def codex_account_from_rpc(slot, alias, home, raw, scoped=""):
+    """Map one home's raw read ({account, limits, driver_err}) into the standard account record
+    (the shape cswap_accounts_from_json documents), plus provider/slot/home/blocked/plan/buckets."""
+    account_reply, limits_reply = raw.get("account"), raw.get("limits")
+    auth, err = codex_status(account_reply, limits_reply, raw.get("driver_err") or "")
+    acct = ((account_reply or {}).get("result") or {}).get("account") or {}
+    res = (limits_reply or {}).get("result") or {}
+    buckets = res.get("rateLimitsByLimitId") or {}
+    main = buckets.get(CODEX_MAIN_BUCKET) or res.get("rateLimits") or {}
+    sh, wk = codex_windows(main)
+    # -1 means "not known", never 0 (the same rule the cswap mapper enforces)
+    u = {"s": _cpct(sh), "w": _cpct(wk), "sr": "", "wr": "", "f": -1, "fl": ""}
+    resets = {"session": _codex_iso(sh.get("resetsAt")) if sh else None,
+              "week": _codex_iso(wk.get("resetsAt")) if wk else None}
+    if resets["session"]: u["sr"] = _clock(_parse(resets["session"]))
+    if resets["week"]:
+        d = _parse(resets["week"]); u["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
+    sw, tag = _codex_scoped(buckets, scoped)
+    if sw: u["f"], u["fl"] = _cpct(sw), tag
+    if auth == "ok" and not err and u["s"] < 0 and u["w"] < 0: err = "no_windows"
+    email = acct.get("email") or ""
+    return {"provider": "codex", "key": "codex:%s" % slot, "slot": slot, "home": home,
+            "label": _label(alias, email, "") if (alias or email) else "CODEX",
+            "email": email, "active": True, "disabled": False, "u": u,
+            "stale": not (auth == "ok" and not err), "resets": resets, "auth": auth,
+            "age": 0, "err": err, "ident": res.get("accountId") or "",
+            "blocked": bool(res.get("ordinaryUsageAllowed") is False or main.get("rateLimitReachedType")),
+            "plan": main.get("planType") or acct.get("planType") or "",
+            "buckets": [{"id": bid, "name": b.get("limitName") or "",
+                         "windows": [{"mins": w.get("windowDurationMins"), "pct": _cpct(w),
+                                      "resets": _codex_iso(w.get("resetsAt"))}
+                                     for w in (b.get("primary"), b.get("secondary")) if isinstance(w, dict)]}
+                        for bid, b in sorted(buckets.items()) if isinstance(b, dict)]}
+
+def codex_with_last_good(rec, good, now):
+    """A failed read keeps SHOWING the last good numbers, as cswap's lastGoodUsage does; only
+    the status fields come from the failed read. `stale` stays set, so nothing downstream
+    (notifier, fleet) mistakes remembered numbers for a fresh reading."""
+    if not rec["stale"]:
+        rec["good_at"] = now; return rec
+    if good:
+        for k in ("u", "resets", "plan", "buckets", "ident", "blocked"): rec[k] = good[k]
+        if not rec["email"]: rec["email"], rec["label"] = good["email"], good["label"]
+        rec["good_at"] = good.get("good_at", now); rec["age"] = int(now - rec["good_at"])
+    return rec
 
 # ---------- in-app firmware updater ----------
 # The collector already reaches both GitHub and the device, and the stock ESP8266HTTPUpdateServer
