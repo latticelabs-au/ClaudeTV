@@ -11,7 +11,8 @@ reset times, plus a weather turntable and a clock. Optional **email / Discord / 
 when a usage window resets.
 
 Got **more than one Claude account**? The display cycles through all of them, each with its own
-card and label — see [Multiple accounts](#multiple-accounts).
+card and label: see [Multiple accounts](#multiple-accounts). Use **OpenAI Codex** as well? Its
+usage cycles on the same screen: see [Codex accounts](#codex-accounts).
 
 It runs on a **$15 WiFi clock** ([GeekMagic SmallTV‑Ultra on AliExpress](https://www.aliexpress.com/item/1005007937948865.html))
 that you reflash **over WiFi — no soldering, fully reversible.**
@@ -89,6 +90,10 @@ That's it. Two commands and a WiFi prompt.
    ┌─ SINGLE ACCOUNT (fallback, no deps) ────┐        └──────────────┘
    │  credentials file ─► own OAuth keeper   │           cycles acc[]
    │  ─► api.anthropic.com/api/oauth/usage   │
+   └─────────────────────────────────────────┘
+   ┌─ CODEX (optional) ──────────────────────┐
+   │  codex app-server, one CODEX_HOME per   │
+   │  account (codex owns its own login)     │
    └─────────────────────────────────────────┘
         │  + open-meteo.com (weather, no key)
         ▼
@@ -216,6 +221,59 @@ accounts** in the master terminal if you want it immediately.
 - **One device per account instead of cycling?** Point it at `/usage?acct=<label>` — that serves a
   single account, and the header reverts to the classic title.
 - The firmware cycles up to **8** accounts (`MAXACC`); the collector itself has no limit.
+
+---
+
+## Codex accounts
+
+Use OpenAI **Codex** on a ChatGPT plan too? Its usage shows up on the same display: a Codex
+account gets the same card and cycles alongside your Claude accounts, tagged `codex` in the
+master terminal. It is optional, and a Claude-only setup behaves exactly as before.
+
+**What it needs:** the official [`codex` CLI](https://github.com/openai/codex) on the collector
+host, logged in. Nothing else to install. ClaudeTV asks Codex itself for the numbers
+(`codex app-server`, the same interface the Codex IDE extension uses), so **ClaudeTV never holds
+a Codex token**, and Codex keeps its own login fresh.
+
+**Accounts:**
+
+- The login in `~/.codex` on the collector host is picked up automatically.
+- For each extra account, run this in your own shell on that host (it wraps `codex login`
+  in a private folder under `~/.claudetv/codex/<name>`):
+
+  ```bash
+  python3 ~/.claudetv/claude_usage_server.py --codex-login work
+  ```
+
+  The name becomes the label on the display (first 8 characters).
+
+> ⚠️ **Log in separately on every machine.** Never copy a Codex folder from another box.
+> Refresh tokens rotate, so the first machine to refresh invalidates the other's copy.
+
+**Good to know:**
+
+- OpenAI decides which limits a plan has. Some plans currently report only a weekly limit, in
+  which case the session number shows `--` and the week number is the one that matters.
+- **Dead login:** if OpenAI rejects a Codex login, you get one alert on your configured channels
+  with the exact command to run, and only that account's card flips to **LOGIN EXPIRED** while
+  the others keep cycling. One more alert confirms the recovery after you log in again.
+- **Every Codex account out of quota** raises its own alert, judged from OpenAI's own "blocked"
+  verdict first and `CLAUDETV_CODEX_MAXED_THRESHOLD` second. Claude and Codex are judged
+  separately, since one cannot stand in for the other.
+- This reads a private OpenAI endpoint through the official client, politely: one request per
+  account every five minutes (`CLAUDETV_CODEX_EVERY`, 300 s minimum), with plugins disabled so
+  a read is a single request.
+- On a Pi-class host the `codex` binary is large (about 260 MB), so the first read after boot
+  can take a few seconds off an SD card. `CLAUDETV_CODEX_TIMEOUT` (default 20 s) covers it.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `CLAUDETV_CODEX_BIN` | auto | path to `codex` (auto: `~/.local/bin/codex`, else PATH) |
+| `CLAUDETV_CODEX_ACCOUNTS` | all | comma list of folder names that filters and orders (`default` is `~/.codex`) |
+| `CLAUDETV_CODEX_EVERY` | `300` | seconds between polls, 300 minimum |
+| `CLAUDETV_CODEX_TIMEOUT` | `20` | hard deadline for one read |
+| `CLAUDETV_CODEX_SCOPED` | off | part of a model limit's name to show as the third number (for example `spark`) |
+| `CLAUDETV_CODEX_MAXED_THRESHOLD` | `100` | percent at which an account counts as out |
 
 ---
 

@@ -14,6 +14,11 @@ rotate a token family cswap also owns. `--login` remains only as a one-time ENRO
 helper for a headless box with no Claude Code: it mints a credential that `cswap add`
 then adopts, and plays no part in steady-state operation.
 
+CODEX: an optional second source, under the same rule. OpenAI Codex accounts are read through
+the official `codex app-server` (one CODEX_HOME per account), which owns its own login and
+refresh, so this collector holds no Codex token either. Its I/O runs on a separate thread and
+a failure on either side never blanks the other.
+
 QUOTA: with auto-switching, one account hitting its cap is a non-event — cswap moves to
 another. The state worth alerting on is every account being out at once, judged against
 cswap's own autoswitch.threshold so the two never disagree.
@@ -267,7 +272,7 @@ def cswap_accounts_from_json(doc, only=""):
         if sd.get("resetsAt"):
             d = _parse(sd["resetsAt"]); u["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
         email, num = a.get("email") or "", a.get("number", "?")
-        recs.append({"key": "%s:%s" % (num, email), "label": _label(a.get("alias"), email, num),
+        recs.append({"provider": "claude", "key": "%s:%s" % (num, email), "label": _label(a.get("alias"), email, num),
                      "email": email, "active": bool(a.get("active")), "u": u, "stale": stale,
                      "disabled": bool(a.get("disabled")),
                      "resets": {"session": fh.get("resetsAt"), "week": sd.get("resetsAt")},
@@ -495,7 +500,8 @@ def usage_wire(accounts, wx, primary=""):
     st = {"ok": 1 if lead else 0, "age": lead["age"] if lead else -1,
           "err": lead["err"] if lead else "no accounts", "auth": auth, "n": len(accts)}
     st.update(lead["u"] if lead else {"s": 0, "w": 0, "f": -1, "fl": "", "sr": "", "wr": ""})
-    st["acc"] = [{"l": a["label"], "auth": a["auth"], **a["u"]} for a in accts]
+    st["acc"] = [{"l": a["label"], "auth": a["auth"],
+                  "p": "x" if a.get("provider") == "codex" else "c", **a["u"]} for a in accts]
     if wx: st.update(wx)
     return st
 
@@ -1550,6 +1556,17 @@ The alias becomes the label on the display (first 8 characters).<br><br>
 <b>Log in separately on every machine.</b> Refresh tokens rotate, so if two machines hold the
 same login the first to refresh invalidates the other and that account gets quarantined.
 </div>
+<button class=ghost style="margin-top:8px" onclick="document.getElementById('cxhelp').style.display=''">How to add a Codex account</button>
+<div id=cxhelp class=muted style="display:none;margin-top:8px;line-height:1.6">
+Codex accounts are read through the official <b>codex</b> CLI, one folder per account. The login on this
+host in <code>~/.codex</code> is picked up automatically. For each extra account run, in your own shell:<br>
+<code>python3 ~/.claudetv/claude_usage_server.py --codex-login &lt;name&gt;</code><br>
+The name becomes the label on the display (first 8 characters). ClaudeTV never sees the token.<br><br>
+<b>Log in separately on every machine.</b> Never copy a Codex folder from another box: refresh tokens
+rotate, and the first machine to refresh invalidates the other.
+</div>
+<label style="margin-top:10px" for=CODEX_ACCOUNTS>Show only these Codex accounts (blank = all; comma list of folder names, use default for ~/.codex)</label>
+<input id=CODEX_ACCOUNTS placeholder="e.g. default,work">
 <label style="margin-top:10px" for=CSWAP_ACCOUNTS>Show only these accounts (blank = all; comma list of alias/email, sets order)</label>
 <input id=CSWAP_ACCOUNTS placeholder="e.g. work,personal">
 <div class=row><span class=muted id=uerr></span><span class=muted id=age></span></div>
@@ -1606,8 +1623,10 @@ function pill(el,cls,txt){el.className='pill '+cls;el.textContent=txt}
 function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  up.textContent=fmtUp(s.service.uptime_s);
  const u=s.usage,A=s.accounts||{ready:false,list:[]},cs=!!A.ready;
- pill(src,cs?'ok':'bad',cs?('claude-swap · '+A.list.length+(A.list.length==1?' account':' accounts')):'setup needed');
- srcerr.textContent=cs?((A.cswap_ver||'cswap')+' · '+A.cswap):('⚠ '+(A.source_err||'claude-swap not ready'));
+ const S=A.sources||{claude:{n:A.list.length},codex:{n:0}},nc=(S.claude||{}).n||0,nx=(S.codex||{}).n||0;
+ pill(src,cs?'ok':'bad',cs?((nc?('claude-swap '+nc):'')+(nc&&nx?' + ':'')+(nx?('codex '+nx):'')):'setup needed');
+ srcerr.textContent=(nc?((A.cswap_ver||'cswap')+' at '+A.cswap):((nx?'':'! ')+(A.source_err||'claude-swap not ready')))
+   +(S.codex&&S.codex.bin?(' | '+(S.codex.ver||'codex')+', polled '+fmtAgo(S.codex.age)+', next in '+S.codex.next_in+'s'):'');
  // fleet verdict: one account capping is normal (cswap switches); ALL of them is a block
  const U=s.update||{};
  pill(fwnow,U.device_ver?'ok':'bad',U.device_ver?('v'+U.device_ver):'device unreachable');
@@ -1632,13 +1651,18 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
    const pc=v=>(v==null||v<0)?'--':v+'%';   // -1 = no reading this poll
    const f=a.f>=0?(' · '+(a.fl||'F')+' <b>'+pc(a.f)+'</b>'):'';
    return '<div style="border-top:1px solid var(--line);padding:8px 0">'
-    +'<div class=row style=margin:0><span><b>'+a.label+'</b>'+(a.active?' <span class=muted>· active</span>':'')
+    +'<div class=row style=margin:0><span><b>'+a.label+'</b> <span class=muted>'+(a.provider=='codex'?'codex':'claude')+(a.plan?(' '+a.plan):'')
+      +'</span>'+(a.blocked?' <span style=color:#f0ad36>blocked</span>':'')+(a.provider!='codex'&&a.active?' <span class=muted>active</span>':'')
       +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?'LOGIN EXPIRED':'ok')+'</span></div>'
     +'<div class=row style="margin:2px 0"><span class=muted>'+(a.email||'')+'</span>'
       +'<span>'+(a.stale?'<span style=color:#f0ad36>stale </span>':'')
         +'S <b>'+pc(a.s)+'</b> · W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
+    +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+a.home+' codex login --device-auth</code></div>'):'')
     +'<div class=row style=margin:0><span class=muted>'+(a.sr?('resets '+a.sr):'idle')+(a.wr?(' · '+a.wr):'')
-      +'</span><span class=muted>'+(a.err||(a.age?a.age+'s':''))+'</span></div></div>';}).join('')
+      +'</span><span class=muted>'+(a.err||(a.age?a.age+'s':''))+'</span></div>'
+    +((a.buckets||[]).length>1?('<div class=muted style="margin-top:2px">'+a.buckets.map(b=>(b.name||b.id)+': '
+      +b.windows.map(w=>pc(w.pct)+'/'+(w.mins>=1440?Math.round(w.mins/1440)+'d':(w.mins?Math.round(w.mins/60)+'h':'?'))).join(' ')).join(' | ')+'</div>'):'')
+    +'</div>';}).join('')
    ||'<div class=muted>no accounts — run <code>cswap add</code>, or log in with --login</div>';
  uerr.textContent=u.err?('⚠ '+u.err):'';age.textContent=u.age>=0?('polled '+u.age+'s ago'):'';
  const w=s.weather;wx.textContent=w.city?(w.city+' '+w.wt+'°C '+w.wc+' · feels '+w.wfl+'° · '+w.wlo+'/'+w.whi+'° · rain '+w.wrain+'%'):'weather --';
@@ -1660,7 +1684,7 @@ citySearch.oninput=function(){clearTimeout(geoT);const q=this.value.trim();if(q.
   rs.forEach(h=>{const b=document.createElement('button');b.className='ghost';b.style.marginBottom='4px';b.textContent=h.label;b.onclick=()=>pickCity(h);geoResults.appendChild(b);});});},350);};
 function pickCity(h){geoResults.innerHTML='';citySearch.value='';pill(svc,'warn','applying…');
  fetch('/api/config?CITY='+encodeURIComponent(h.city)+'&LAT='+h.lat+'&LON='+h.lon+'&TZ='+encodeURIComponent(h.tz),{method:'POST'}).then(()=>setTimeout(load,3500));}
-function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','USAGE_EVERY','PORT','MAXED_THRESHOLD','CSWAP_ACCOUNTS',
+function saveCfg(){const ks=['CITY','LAT','LON','TZ','WEATHER_EVERY','DEVICE_URL','USAGE_EVERY','PORT','MAXED_THRESHOLD','CSWAP_ACCOUNTS','CODEX_ACCOUNTS',
   'SMTP_HOST','SMTP_PORT','SMTP_SECURITY','SMTP_FROM','SMTP_USER','NOTIFY_EMAIL_TO'];
  const parts=ks.map(k=>k+'='+encodeURIComponent(document.getElementById(k).value));
  ['NOTIFY_SESSION_RESET','NOTIFY_SESSION_MAXED','NOTIFY_WEEK_RESET','NOTIFY_AUTH','NOTIFY_EMAIL'].forEach(k=>parts.push(k+'='+(document.getElementById(k).checked?'true':'false')));
@@ -1760,10 +1784,31 @@ def oauth_login():
     print("    cswap add --alias <name>\n")
     print("Repeat this whole step for each additional account.")
 
+def codex_login(alias):
+    """Convenience wrapper, run BY THE HUMAN in their own shell: make a private CODEX_HOME for
+    one more Codex account and exec the official `codex login` in it. The service never calls
+    this, and no credential ever passes through the collector."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", alias or "") or alias.lower() == "default":
+        print("usage: claude_usage_server.py --codex-login <alias>   (letters, digits, - and _)")
+        raise SystemExit(2)
+    exe = codex_bin()
+    if not exe:
+        print("codex is not installed on this host. Install the Codex CLI, then re-run."); raise SystemExit(1)
+    home = os.path.join(CODEX_HOMES_ROOT, alias)
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    try: os.chmod(home, 0o700)
+    except OSError: pass
+    print("Logging a Codex account into %s\nLog in separately on every machine: never copy this "
+          "directory from another box, refresh tokens rotate.\n" % home)
+    raise SystemExit(subprocess.call([exe, "login", "--device-auth"], env=dict(os.environ, CODEX_HOME=home)))
+
 if __name__ == "__main__":
     import sys
     if "--login" in sys.argv:
         oauth_login(); raise SystemExit(0)
+    if "--codex-login" in sys.argv:
+        i = sys.argv.index("--codex-login")
+        codex_login(sys.argv[i + 1] if i + 1 < len(sys.argv) else "")
     if not cswap_bin():
         print("WARNING: claude-swap (cswap) is not installed — ClaudeTV reads all accounts from\n"
               "         it. Install it and add an account, then this starts serving:\n"

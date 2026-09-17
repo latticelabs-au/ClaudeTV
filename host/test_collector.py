@@ -1397,5 +1397,42 @@ class TestCodexAlerts(CodexIsolated):
         claude = srv.cswap_accounts_from_json(doc())
         self.assertEqual(srv.fleet_state(claude, pol)["usable"], 2)
 
+
+class TestCodexWireAndCli(CodexIsolated):
+    def test_every_account_carries_its_provider_and_the_flat_keys_are_unchanged(self):
+        claude = srv.cswap_accounts_from_json(doc())
+        codex = srv.codex_account_from_rpc("default", "", "/h", cx_raw())
+        w = srv.usage_wire(claude + [codex], {})
+        self.assertEqual([a["p"] for a in w["acc"]], ["c", "c", "x"])
+        self.assertEqual((w["n"], w["s"], w["w"], w["f"], w["fl"]), (3, 27, 6, 2, "FABLE"))
+
+    def test_a_record_without_a_provider_is_claude(self):
+        rec = dict(srv.cswap_accounts_from_json(doc())[0]); rec.pop("provider", None)
+        self.assertEqual(srv.usage_wire([rec], {})["acc"][0]["p"], "c")
+
+    def test_cswap_records_are_tagged_claude(self):
+        self.assertEqual({a["provider"] for a in srv.cswap_accounts_from_json(doc())}, {"claude"})
+
+    def test_the_payload_stays_small_enough_for_the_esp(self):
+        eight = [srv.codex_account_from_rpc("h%d" % i, "account%d" % i, "/h", cx_raw()) for i in range(8)]
+        self.assertLess(len(json.dumps(srv.usage_wire(eight, {}), separators=(",", ":"))), 1400)
+
+    def test_codex_login_makes_a_private_home_and_execs_the_official_login(self):
+        seen = {}; old = (srv.CODEX_HOMES_ROOT, subprocess.call)
+        srv.CODEX_HOMES_ROOT = os.path.join(self.tmp.name, "codex")
+        subprocess.call = lambda argv, env=None: seen.update(argv=argv, home=env["CODEX_HOME"]) or 0
+        try:
+            with self.assertRaises(SystemExit) as cm: srv.codex_login("Work")
+        finally: srv.CODEX_HOMES_ROOT, subprocess.call = old
+        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(seen["argv"], ["codex", "login", "--device-auth"])
+        self.assertTrue(seen["home"].endswith(os.path.join("codex", "Work")))
+        self.assertTrue(os.path.isdir(seen["home"]))
+
+    def test_codex_login_rejects_names_that_could_escape_the_root(self):
+        for bad in ("", "default", "../x", "a/b"):
+            with self.assertRaises(SystemExit) as cm: srv.codex_login(bad)
+            self.assertEqual(cm.exception.code, 2)
+
 if __name__ == "__main__":
     unittest.main()
