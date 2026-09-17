@@ -1434,5 +1434,42 @@ class TestCodexWireAndCli(CodexIsolated):
             with self.assertRaises(SystemExit) as cm: srv.codex_login(bad)
             self.assertEqual(cm.exception.code, 2)
 
+
+@unittest.skipUnless(os.environ.get("CLAUDETV_LIVE_CODEX") == "1" and srv.codex_bin()
+                     and os.path.isfile(os.path.join(srv.CODEX_DEFAULT_HOME, "auth.json")),
+                     "set CLAUDETV_LIVE_CODEX=1 on a host with a logged-in codex")
+class TestCodexLiveContract(TzPinned):
+    """Codex marks app-server experimental. This pins the parts of its contract we depend on,
+    against the INSTALLED binary, so an upgrade that breaks us fails here and not on the desk."""
+
+    def test_the_schema_still_has_the_methods_and_fields_we_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run([srv.codex_bin(), "app-server", "generate-json-schema", "--out", d],
+                           capture_output=True, timeout=60, check=True)
+            blob = ""
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.endswith(".json"):
+                        with open(os.path.join(root, f), encoding="utf-8") as fh: blob += fh.read()
+        for needle in ("account/rateLimits/read", "account/read", "excludeResetCreditDetails",
+                       "rateLimitsByLimitId", "usedPercent", "windowDurationMins", "resetsAt",
+                       "ordinaryUsageAllowed", "rateLimitReachedType", "planType"):
+            self.assertIn(needle, blob, "codex app-server no longer exposes %r" % needle)
+
+    def test_a_real_read_maps_cleanly_inside_the_deadline(self):
+        t0 = time.monotonic()
+        raw = srv.codex_rpc_read(srv.codex_bin(), srv.CODEX_DEFAULT_HOME, 20)
+        wall = time.monotonic() - t0
+        rec = srv.codex_account_from_rpc("default", "", srv.CODEX_DEFAULT_HOME, raw)
+        self.assertEqual((rec["auth"], rec["stale"]), ("ok", False), rec["err"])
+        self.assertTrue(rec["u"]["s"] >= 0 or rec["u"]["w"] >= 0)
+        self.assertLess(wall, 10.0, "a real read took %.1fs" % wall)
+
+    def test_a_home_with_no_login_is_dead_not_transient(self):
+        with tempfile.TemporaryDirectory() as d:
+            raw = srv.codex_rpc_read(srv.codex_bin(), d, 20)
+        self.assertEqual(srv.codex_status(raw["account"], raw["limits"], raw["driver_err"]),
+                         ("dead", "login_required"))
+
 if __name__ == "__main__":
     unittest.main()
