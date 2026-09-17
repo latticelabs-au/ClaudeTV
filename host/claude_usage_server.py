@@ -117,6 +117,15 @@ _alerted = {}         # per-account: one auth-dead alert per outage episode
 _migrated = False     # legacy single-account notify state re-homed onto the primary account
 _fleet = {}           # last fleet verdict, surfaced in the terminal and the device payload
 _force_poll = False   # dashboards can demand an immediate re-read instead of waiting for the timer
+_src_accts = {"claude": [], "codex": []}   # each source's last-good list; _accounts is their join
+
+def _publish(source, accts):
+    """Swap in ONE source's records. `_accounts` is always Claude first, then Codex, so a source
+    that fails keeps its own last-good list and can never blank the other."""
+    global _accounts
+    with _lock:
+        _src_accts[source] = list(accts)
+        _accounts = _src_accts["claude"] + _src_accts["codex"]
 
 # ---------- one-time login helper (enrollment only; cswap owns all upkeep) ----------
 # Anthropic's public OAuth client (the one Claude Code itself uses). Not a secret: it is a
@@ -748,6 +757,86 @@ def codex_poll(exe, homes, deadline_s, reader=None):
     for t in ths: t.join(deadline_s + 10)
     return [r or {"account": None, "limits": None, "driver_err": "timeout"} for r in res]
 
+_codex = {"accts": [], "ts": 0, "next": 0.0, "fails": 0, "force": False, "last": 0.0,
+          "good": {}, "hold": {}, "ident": {}, "pending": None, "fleet": {}}
+
+def codex_refresh(now, force=False, reader=None):
+    """One I/O pass: discover, read, map, merge last-good. Pure I/O and mapping: it touches no
+    notifier state, which stays on the poller thread (see codex_apply_pending). Never raises
+    for a per-account failure; a missing binary or no homes is simply an empty source."""
+    exe = codex_bin()
+    if not exe: return []
+    homes = codex_homes(CONFIG.get("CODEX_ACCOUNTS", ""), seen=set(_codex["good"]))
+    if not homes: return []
+    prev = {a["slot"]: a for a in _codex["accts"]}
+    # A dead login is re-read only every CODEX_DEAD_HOLD: every read of a dead home makes a fresh
+    # Codex process retry a refresh that cannot succeed, and polling cannot fix a login.
+    due = [h for h in homes if force or h[0] not in prev or now >= _codex["hold"].get(h[0], 0)]
+    raws = dict(zip([h[0] for h in due], codex_poll(exe, due, _cfg_num("CODEX_TIMEOUT", 20), reader)))
+    out = []
+    for slot, alias, path in homes:
+        if slot not in raws: out.append(prev[slot]); continue
+        rec = codex_with_last_good(codex_account_from_rpc(slot, alias, path, raws[slot],
+                                   CONFIG.get("CODEX_SCOPED", "")), _codex["good"].get(slot), now)
+        if not rec["stale"]: _codex["good"][slot] = rec
+        if rec["auth"] == "dead": _codex["hold"][slot] = now + CODEX_DEAD_HOLD
+        else: _codex["hold"].pop(slot, None)
+        out.append(rec)
+    _codex["accts"] = out
+    return out
+
+def codex_next_delay(accts, fails):
+    """Seconds until the next pass. A failure NEVER makes the source faster than CODEX_EVERY
+    (floor 300): one account failing must not drag the healthy ones below the floor. Failures
+    only slow it down, and only when they are source-wide or the backend said 429."""
+    base = max(300.0, _cfg_num("CODEX_EVERY", 300))
+    live = [a for a in accts if a["auth"] != "dead"]
+    if any(a["err"] == "rate_limited" for a in live): return min(1800.0, 900.0 * (2 ** max(0, fails - 1)))
+    if live and all(a["stale"] for a in live): return min(1800.0, base * (2 ** max(0, fails - 1)))
+    return base
+
+def codex_io_loop():
+    """Codex I/O on its own thread, so a hung backend can never delay the Claude poll. It only
+    reads and maps; every stateful pass happens on the poller thread via codex_apply_pending,
+    which keeps notifier state single-threaded."""
+    while True:
+        now = time.time()
+        force, _codex["force"] = _codex["force"], False
+        force = force and now - _codex["last"] >= 60          # the button cannot hammer the backend
+        if now >= _codex["next"] or force:
+            try:
+                accts = codex_refresh(now, force)
+                live = [a for a in accts if a["auth"] != "dead"]
+                troubled = any(a["err"] == "rate_limited" for a in live) or (bool(live) and all(a["stale"] for a in live))
+                _codex["fails"] = _codex["fails"] + 1 if troubled else 0
+                with _lock: _codex["pending"] = accts
+                _codex["next"] = now + codex_next_delay(accts, _codex["fails"])
+            except Exception as e:
+                print("[codex] poll error: %s" % str(e)[:90]); _codex["next"] = now + 300
+            _codex["last"] = now
+        time.sleep(2)
+
+def codex_apply_pending():
+    """Poller thread: publish a finished Codex pass and run the stateful passes on it."""
+    with _lock: accts, _codex["pending"] = _codex["pending"], None
+    if accts is None: return False
+    for rec in accts:
+        was = _codex["ident"].get(rec["slot"])
+        if rec["ident"] and was and was != rec["ident"]:       # home re-logged into another account:
+            _load_notify_state().pop(rec["key"], None); _save_notify_state()   # baseline, no phantom reset
+        if rec["ident"]: _codex["ident"][rec["slot"]] = rec["ident"]
+    _publish("codex", accts)
+    with _lock: _codex["ts"] = int(time.time())
+    _auth_transitions(accts)
+    for rec in accts:
+        if notifiable(rec):
+            notify_check(rec["u"], rec["resets"], acct=notify_key(rec), label=rec["label"])
+    check = globals().get("codex_fleet_check")                # arrives in the alerts task
+    if check:
+        f = check(accts)
+        with _lock: _codex["fleet"] = f
+    return True
+
 # ---------- in-app firmware updater ----------
 # The collector already reaches both GitHub and the device, and the stock ESP8266HTTPUpdateServer
 # at /update takes a plain multipart POST — the same thing `curl -F firmware=@...` does. So the
@@ -1246,13 +1335,15 @@ def poller():
     global _accounts, _usage_ts, _usage_err, _wx, _wx_err, _migrated, _force_poll, _fleet
     next_u = 0.0; backoff = int(CONFIG["USAGE_EVERY"]); next_w = 0.0; next_upd = 30.0
     while True:
+        try: codex_apply_pending()
+        except Exception as e: print("[codex] apply error: %s" % str(e)[:90])
         now = time.time()
         if now >= next_u or _force_poll:
             _force_poll = False
             try:
                 accts = fetch_accounts()
-                with _lock:
-                    _accounts = accts; _usage_ts = int(now); _usage_err = ""
+                _publish("claude", accts)
+                with _lock: _usage_ts = int(now); _usage_err = ""
                 _auth_transitions(accts)
                 if not _migrated and accts:             # first poll: re-home state onto stable keys
                     _migrated = True
@@ -1291,7 +1382,10 @@ def poller():
         time.sleep(2)
 
 def device_json(primary=""):
-    with _lock: accts, ts, err, wx = list(_accounts), _usage_ts, _usage_err, _wx
+    with _lock:
+        accts, ts, err, wx = list(_accounts), _usage_ts, _usage_err, _wx
+        # a Codex-only host has no Claude source to report on: its clock and errors are Codex's
+        if not _src_accts["claude"] and _src_accts["codex"]: ts, err = _codex["ts"], ""
     st = usage_wire(accts, wx, primary)
     # collector-side staleness (when we last polled) beats a per-account cache age here: it is
     # what the device's "stale Nm" readout has always meant.
@@ -1307,12 +1401,26 @@ def full_state():
     u = accts[0]["u"] if accts else None
     return {"service": {"uptime_s": int(time.time() - START_TS), "port": PORT},
             "fleet": {**_fleet, "policy": switch_policy()},
+            "codex_fleet": dict(_codex["fleet"]),
             "accounts": {"ready": bool(accts), "source_err": _source_err, "cswap": cswap_bin(),
                          "cswap_ver": cswap_version(), "filter": CONFIG.get("CSWAP_ACCOUNTS", ""),
+                         "sources": {
+                             "claude": {"bin": cswap_bin(), "ver": cswap_version(), "err": _source_err,
+                                        "n": len(_src_accts["claude"]),
+                                        "filter": CONFIG.get("CSWAP_ACCOUNTS", "")},
+                             "codex": {"bin": codex_bin(), "ver": codex_version(),
+                                       "n": len(_src_accts["codex"]),
+                                       "age": (int(time.time()) - _codex["ts"]) if _codex["ts"] else -1,
+                                       "next_in": max(0, int(_codex["next"] - time.time())),
+                                       "filter": CONFIG.get("CODEX_ACCOUNTS", "")}},
                          "list": [{"key": a["key"], "label": a["label"], "email": a["email"],
-                                   "active": a["active"], "auth": a["auth"], "age": a["age"],
+                                   "active": a["active"], "auth": a["auth"],
+                                   "age": (int(time.time() - a["good_at"]) if a.get("good_at") else a["age"]),
                                    "err": a["err"], "stale": a.get("stale", False),
-                                   "disabled": a.get("disabled", False), **a["u"]} for a in accts]},
+                                   "disabled": a.get("disabled", False),
+                                   "provider": a.get("provider", "claude"), "plan": a.get("plan", ""),
+                                   "blocked": a.get("blocked", False), "home": a.get("home", ""),
+                                   "buckets": a.get("buckets", []), **a["u"]} for a in accts]},
             "usage": {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err, **(u or {})},
             "update": update_status(),
             "weather": (wx or {}), "weather_err": wxe, "config": {k: CONFIG[k] for k in EDITABLE},
@@ -1545,6 +1653,7 @@ class H(BaseHTTPRequestHandler):
             self._send(200, "application/json", '{"ok":1}'); restart_later()
         elif path == "/api/service" and q.get("action") == "poll":
             globals()["_force_poll"] = True          # re-read accounts now (dashboard button)
+            _codex["force"] = True
             self._send(200, "application/json", '{"ok":1}')
         elif path == "/api/service" and q.get("action") == "refresh":
             self._send(200, "application/json", '{"ok":1}')
@@ -1601,5 +1710,6 @@ if __name__ == "__main__":
               "         it. Install it and add an account, then this starts serving:\n"
               "           pipx install claude-swap && cswap add --alias <name>")
     threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=codex_io_loop, daemon=True).start()
     print("ClaudeTV collector + terminal on http://0.0.0.0:%d  (device -> /usage, terminal -> /)" % PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

@@ -1134,5 +1134,159 @@ class TestCodexDriver(unittest.TestCase):
         res = srv.codex_poll("x", [("a", "a", "/h")], 1.0, reader=boom)
         self.assertEqual(res, [{"account": None, "limits": None, "driver_err": "timeout"}])
 
+
+class CodexIsolated(TzPinned):
+    """Notifier files in a temp dir, no channels configured, Codex source state reset."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self._paths = (srv.NOTIFY_STATE_PATH, srv.RESET_LOG_PATH)
+        srv.NOTIFY_STATE_PATH = os.path.join(self.tmp.name, "notify_state.json")
+        srv.RESET_LOG_PATH = os.path.join(self.tmp.name, "resets.log")
+        srv._notify_state = None; srv._reset_log = None
+        self._cfg = {k: srv.CONFIG.get(k) for k in ("NOTIFY_DISCORD_WEBHOOK", "NOTIFY_SLACK_WEBHOOK",
+                     "NOTIFY_EMAIL", "CODEX_ACCOUNTS", "CODEX_EVERY", "CODEX_SCOPED")}
+        for k in ("NOTIFY_DISCORD_WEBHOOK", "NOTIFY_SLACK_WEBHOOK", "NOTIFY_EMAIL", "CODEX_ACCOUNTS", "CODEX_SCOPED"):
+            srv.CONFIG[k] = ""
+        srv.CONFIG["CODEX_EVERY"] = "300"
+        self._fn = {k: getattr(srv, k) for k in ("codex_bin", "codex_homes")}
+        srv.codex_bin = lambda: "codex"
+        self.homes = [("default", "", "/h/default"), ("work", "work", "/h/work")]
+        srv.codex_homes = lambda only="", default_home=None, root=None, seen=(): list(self.homes)
+        self._state = (dict(srv._codex), {k: list(v) for k, v in srv._src_accts.items()}, list(srv._accounts),
+                       dict(srv._alerted))
+        srv._codex.update({"accts": [], "ts": 0, "next": 0.0, "fails": 0, "force": False, "last": 0.0,
+                           "good": {}, "hold": {}, "ident": {}, "pending": None, "fleet": {}})
+        srv._src_accts.update({"claude": [], "codex": []}); srv._accounts = []; srv._alerted.clear()
+        self.calls = []
+
+    def tearDown(self):
+        srv._codex.clear(); srv._codex.update(self._state[0])
+        srv._src_accts.update(self._state[1]); srv._accounts = self._state[2]
+        srv._alerted.clear(); srv._alerted.update(self._state[3])
+        for k, v in self._fn.items(): setattr(srv, k, v)
+        srv.NOTIFY_STATE_PATH, srv.RESET_LOG_PATH = self._paths
+        srv._notify_state = None; srv._reset_log = None
+        srv.CONFIG.update(self._cfg); self.tmp.cleanup()
+        super().tearDown()
+
+    def reader(self, by_home):
+        """A stub for codex_rpc_read: `by_home` maps a home path to the raw read it returns."""
+        def read(exe, home, deadline):
+            self.calls.append(home); return by_home[home]
+        return read
+
+
+class TestCodexSource(CodexIsolated):
+    DEAD = cx_raw(cx_err(-32603, CX_HTTP % ("401 Unauthorized", "application/json")))
+
+    def test_publish_orders_claude_first_and_a_source_cannot_blank_the_other(self):
+        srv._publish("codex", [{"label": "X"}]); srv._publish("claude", [{"label": "A"}])
+        self.assertEqual([a["label"] for a in srv._accounts], ["A", "X"])
+        srv._publish("codex", [])
+        self.assertEqual([a["label"] for a in srv._accounts], ["A"])
+        srv._publish("codex", [{"label": "X"}]); srv._publish("claude", [])
+        self.assertEqual([a["label"] for a in srv._accounts], ["X"])
+
+    def test_refresh_maps_every_home_in_order(self):
+        accts = srv.codex_refresh(1000.0, reader=self.reader({"/h/default": cx_raw(), "/h/work": cx_raw()}))
+        self.assertEqual([a["key"] for a in accts], ["codex:default", "codex:work"])
+        self.assertEqual([a["label"] for a in accts], ["COSMO", "WORK"])
+
+    def test_no_binary_or_no_homes_is_an_empty_source_not_an_error(self):
+        srv.codex_bin = lambda: ""
+        self.assertEqual(srv.codex_refresh(1.0, reader=self.reader({})), [])
+        srv.codex_bin = lambda: "codex"; self.homes = []
+        self.assertEqual(srv.codex_refresh(1.0, reader=self.reader({})), [])
+
+    def test_a_dead_login_is_held_for_thirty_minutes_while_the_others_keep_their_cadence(self):
+        rd = self.reader({"/h/default": self.DEAD, "/h/work": cx_raw()})
+        srv.codex_refresh(1000.0, reader=rd)
+        self.calls.clear(); accts = srv.codex_refresh(1300.0, reader=rd)
+        self.assertEqual(self.calls, ["/h/work"])
+        self.assertEqual([a["auth"] for a in accts], ["dead", "ok"])      # the held record is kept
+        self.calls.clear(); srv.codex_refresh(1000.0 + srv.CODEX_DEAD_HOLD, reader=rd)
+        self.assertEqual(sorted(self.calls), ["/h/default", "/h/work"])
+
+    def test_a_forced_read_overrides_the_hold_so_a_relogin_shows_on_demand(self):
+        rd = self.reader({"/h/default": self.DEAD, "/h/work": cx_raw()})
+        srv.codex_refresh(1000.0, reader=rd); self.calls.clear()
+        srv.codex_refresh(1010.0, force=True, reader=rd)
+        self.assertEqual(sorted(self.calls), ["/h/default", "/h/work"])
+
+    def test_a_failed_read_serves_last_good_and_recovers(self):
+        ok = {"/h/default": cx_raw(), "/h/work": cx_raw()}
+        srv.codex_refresh(1000.0, reader=self.reader(ok))
+        bad = dict(ok); bad["/h/work"] = cx_raw(None, None, "timeout")
+        accts = srv.codex_refresh(1300.0, reader=self.reader(bad))
+        self.assertEqual((accts[1]["u"]["w"], accts[1]["stale"], accts[1]["age"]), (19, True, 300))
+        self.assertFalse(srv.codex_refresh(1600.0, reader=self.reader(ok))[1]["stale"])
+
+    def test_delay_never_drops_below_the_floor_and_only_failures_slow_it(self):
+        ok = srv.codex_account_from_rpc("a", "a", "/h", cx_raw())
+        bad = srv.codex_account_from_rpc("b", "b", "/h", cx_raw(None, None, "timeout"))
+        rl = srv.codex_account_from_rpc("c", "c", "/h", cx_raw(cx_err(-32603, CX_HTTP % ("429 Too Many Requests", ""))))
+        dead = srv.codex_account_from_rpc("d", "d", "/h", self.DEAD)
+        srv.CONFIG["CODEX_EVERY"] = "60"                      # below the floor on purpose
+        self.assertEqual(srv.codex_next_delay([ok], 0), 300)
+        self.assertEqual(srv.codex_next_delay([ok, bad], 1), 300)     # one failure: healthy ones keep cadence
+        self.assertEqual(srv.codex_next_delay([bad], 1), 300)
+        self.assertEqual(srv.codex_next_delay([bad], 3), 1200)        # source-wide outage doubles
+        self.assertEqual(srv.codex_next_delay([bad], 9), 1800)        # capped
+        self.assertEqual(srv.codex_next_delay([ok, rl], 1), 900)      # rate limited starts at 15 min
+        self.assertEqual(srv.codex_next_delay([ok, dead], 0), 300)    # a dead login does not slow the rest
+        self.assertEqual(srv.codex_next_delay([], 0), 300)
+
+    # Both windows present: until the alerts task relaxes notifiable() for Codex, a weekly-only
+    # reading is not fed to the notifier, and these two tests would pass without proving anything.
+    BOTH = cx_limits(primary=cx_win(90, 10080), secondary=cx_win(50, 300, 1789641634))
+
+    def test_apply_publishes_and_runs_reset_detection_on_the_poller_thread(self):
+        srv._codex["pending"] = srv.codex_refresh(1000.0, reader=self.reader(
+            {"/h/default": cx_raw(self.BOTH), "/h/work": cx_raw(self.BOTH)}))
+        self.assertTrue(srv.codex_apply_pending())
+        self.assertEqual([a["key"] for a in srv._accounts], ["codex:default", "codex:work"])
+        self.assertIn("codex:default", srv._load_notify_state())
+        self.assertIsNone(srv._codex["pending"])
+        self.assertFalse(srv.codex_apply_pending())               # nothing pending: a no-op
+
+    def test_a_home_relogged_into_another_account_baselines_instead_of_firing_a_reset(self):
+        rd1 = self.reader({"/h/default": cx_raw(self.BOTH), "/h/work": cx_raw(self.BOTH)})
+        srv._codex["pending"] = srv.codex_refresh(1000.0, reader=rd1); srv.codex_apply_pending()
+        other = cx_limits(primary=cx_win(2, 10080), secondary=cx_win(1, 300, 1789641634))
+        other["result"]["accountId"] = "acc-2"
+        rd2 = self.reader({"/h/default": cx_raw(other), "/h/work": cx_raw(self.BOTH)})
+        srv._codex["pending"] = srv.codex_refresh(1300.0, reader=rd2); srv.codex_apply_pending()
+        # 90 -> 2 and 50 -> 1 on the same key would otherwise log two phantom "gift" resets
+        self.assertEqual(srv._load_reset_log(), [])
+        self.assertEqual(srv._load_notify_state()["codex:default"]["week"]["w"], 2)   # re-baselined
+
+    def test_a_codex_only_host_serves_the_device_without_a_claude_error(self):
+        old = (srv._usage_ts, srv._usage_err); srv._usage_ts, srv._usage_err = 0, "claude-swap is not installed on this host"
+        try:
+            srv._codex["pending"] = srv.codex_refresh(time.time(), reader=self.reader({"/h/default": cx_raw(), "/h/work": cx_raw()}))
+            srv.codex_apply_pending()
+            d = srv.device_json()
+            self.assertEqual((d["n"], d["w"], d["err"]), (2, 19, ""))
+            self.assertGreaterEqual(d["age"], 0)
+        finally: srv._usage_ts, srv._usage_err = old
+
+    def test_a_codex_failure_leaves_the_claude_wire_output_byte_identical(self):
+        claude = srv.cswap_accounts_from_json(doc())
+        srv._publish("claude", claude)
+        before = json.dumps(srv.usage_wire(list(srv._src_accts["claude"]), {}), sort_keys=True)
+        srv.codex_bin = lambda: "codex"
+        def boom(exe, home, deadline): raise RuntimeError("codex exploded")
+        srv._codex["pending"] = srv.codex_refresh(1000.0, reader=boom); srv.codex_apply_pending()
+        after = json.dumps(srv.usage_wire(list(srv._src_accts["claude"]), {}), sort_keys=True)
+        self.assertEqual(before, after)
+        self.assertEqual([a["label"] for a in srv._accounts[:2]], ["WORK", "PERSONAL"])
+
+    def test_state_reports_both_sources(self):
+        s = srv.full_state()["accounts"]["sources"]
+        self.assertEqual(sorted(s), ["claude", "codex"])
+        for k in ("bin", "ver", "n", "age", "next_in", "filter"): self.assertIn(k, s["codex"])
+
 if __name__ == "__main__":
     unittest.main()
