@@ -1288,5 +1288,114 @@ class TestCodexSource(CodexIsolated):
         self.assertEqual(sorted(s), ["claude", "codex"])
         for k in ("bin", "ver", "n", "age", "next_in", "filter"): self.assertIn(k, s["codex"])
 
+
+class TestCodexAlerts(CodexIsolated):
+    def setUp(self):
+        super().setUp()
+        self.auth = []; self.fleet = []
+        self._al = (srv._auth_alert, srv._fleet_alert)
+        srv._auth_alert = lambda ev, body: self.auth.append((ev, body))
+        srv._fleet_alert = lambda ev, body: self.fleet.append((ev, body))
+        self._fl = dict(srv._codex_fleet_last); srv._codex_fleet_last.clear()
+
+    def tearDown(self):
+        srv._auth_alert, srv._fleet_alert = self._al
+        srv._codex_fleet_last.clear(); srv._codex_fleet_last.update(self._fl)
+        super().tearDown()
+
+    def acct(self, slot, s=-1, w=-1, **over):
+        r = srv.codex_account_from_rpc(slot, slot, "/h/" + slot, cx_raw(cx_limits(
+            primary=cx_win(w, 10080) if w >= 0 else None, secondary=cx_win(s, 300) if s >= 0 else None)))
+        r.update(over); return r
+
+    # ---- reset detection
+    def test_a_weekly_only_account_is_notifiable_but_a_claude_account_still_needs_both(self):
+        self.assertTrue(srv.notifiable(self.acct("a", w=19)))
+        claude = {"provider": "claude", "stale": False, "u": {"s": -1, "w": 19}}
+        self.assertFalse(srv.notifiable(claude))
+        self.assertFalse(srv.notifiable({"stale": False, "u": {"s": -1, "w": 19}}))   # no provider = claude
+
+    def test_a_stale_codex_account_is_never_fed_to_the_notifier(self):
+        self.assertFalse(srv.notifiable(self.acct("a", w=19, stale=True)))
+
+    def test_a_weekly_only_account_gets_a_week_reset_and_no_phantom_session_reset(self):
+        srv.notify_check({"s": -1, "w": 80, "f": -1, "fl": ""}, {"session": None, "week": "2026-09-24T03:00:00+00:00"},
+                         acct="codex:a", label="A", provider="codex")
+        srv.notify_check({"s": -1, "w": 2, "f": -1, "fl": ""}, {"session": None, "week": "2026-10-01T03:00:00+00:00"},
+                         acct="codex:a", label="A", provider="codex")
+        self.assertEqual([e["window"] for e in srv._load_reset_log()], ["week"])
+
+    def test_a_short_window_that_disappears_is_not_a_reset(self):
+        srv.notify_check({"s": 60, "w": 30, "f": -1, "fl": ""}, {"session": "2026-09-17T10:00:00+00:00",
+                         "week": "2026-09-24T03:00:00+00:00"}, acct="codex:a", provider="codex")
+        srv.notify_check({"s": -1, "w": 31, "f": -1, "fl": ""}, {"session": None,
+                         "week": "2026-09-24T03:00:00+00:00"}, acct="codex:a", provider="codex")
+        self.assertEqual(srv._load_reset_log(), [])
+
+    def test_reset_wording_names_the_provider_and_never_prints_a_negative_percent(self):
+        title, body = srv._reset_message("week", {"s": -1, "w": 2, "f": -1, "wr": "Oct 1 3am"}, provider="codex")
+        self.assertIn("Codex", title); self.assertNotIn("-1", body); self.assertIn("W 2%", body)
+        title, _ = srv._reset_message("week", {"s": 5, "w": 2, "f": -1})
+        self.assertIn("Claude", title)
+        gift, _ = srv._reset_message("week", {"s": -1, "w": 2, "f": -1}, cls="gift", provider="codex")
+        self.assertIn("OpenAI", gift)
+
+    # ---- relogin: alert once per outage, recover once, name the remedy
+    def test_a_dead_codex_login_alerts_once_with_the_exact_remedy(self):
+        dead = self.acct("work", w=19, auth="dead")
+        srv._auth_transitions([dead]); srv._auth_transitions([dead])
+        self.assertEqual([e for e, _ in self.auth], ["codex_dead"])
+        body = self.auth[0][1]
+        self.assertIn("WORK", body); self.assertIn("CODEX_HOME=/h/work codex login --device-auth", body)
+        self.assertIn("LOGIN EXPIRED", body)
+
+    def test_recovery_alerts_once_after_the_relogin(self):
+        srv._auth_transitions([self.acct("work", w=19, auth="dead")])
+        srv._auth_transitions([self.acct("work", w=19)]); srv._auth_transitions([self.acct("work", w=19)])
+        self.assertEqual([e for e, _ in self.auth], ["codex_dead", "codex_recovered"])
+
+    def test_a_dead_claude_login_keeps_its_original_alert(self):
+        rec = {"key": "1:a@e.com", "label": "WORK", "email": "a@e.com", "auth": "dead"}
+        srv._auth_transitions([rec])
+        self.assertEqual(self.auth[0][0], "dead"); self.assertIn("cswap", self.auth[0][1])
+
+    def test_titles_exist_for_every_event_the_code_can_send(self):
+        for k in ("codex_dead", "codex_recovered"): self.assertIn("Codex", srv._AUTH_TITLES[k])
+        for k in ("codex_exhausted", "codex_recovered"): self.assertIn("Codex", srv._FLEET_TITLES[k])
+
+    def test_dead_reaches_the_device_as_a_per_account_takeover(self):
+        w = srv.usage_wire([self.acct("a", w=19), self.acct("b", w=5, auth="dead")], {})
+        self.assertEqual([a["auth"] for a in w["acc"]], ["ok", "dead"])
+        self.assertEqual(w["auth"], "ok")                       # one dead account does not kill the screen
+
+    # ---- fleet
+    def test_codex_is_out_when_the_backend_says_blocked_or_a_window_hits_the_threshold(self):
+        st = srv.codex_fleet_state([self.acct("a", w=100), self.acct("b", w=40, blocked=True)], 100)
+        self.assertTrue(st["exhausted"]); self.assertEqual(st["headroom"], [])
+
+    def test_one_account_with_room_means_not_blocked(self):
+        st = srv.codex_fleet_state([self.acct("a", w=100), self.acct("b", s=10, w=40)], 100)
+        self.assertFalse(st["exhausted"]); self.assertEqual(st["headroom"], ["B"])
+
+    def test_an_unreadable_account_cannot_prove_exhaustion_and_dead_ones_do_not_count(self):
+        self.assertFalse(srv.codex_fleet_state([self.acct("a", w=100), self.acct("b", w=5, stale=True)], 100)["exhausted"])
+        st = srv.codex_fleet_state([self.acct("a", w=100), self.acct("b", w=5, auth="dead", stale=True)], 100)
+        self.assertTrue(st["exhausted"])
+
+    def test_fleet_alerts_are_edge_triggered_and_recovery_needs_positive_headroom(self):
+        out = [self.acct("a", w=100)]
+        srv.codex_fleet_check([self.acct("a", w=10)])             # baseline silently
+        srv.codex_fleet_check(out); srv.codex_fleet_check(out)
+        self.assertEqual([e for e, _ in self.fleet], ["codex_exhausted"])
+        srv.codex_fleet_check([self.acct("a", w=100, stale=True)])   # unreadable: not a recovery
+        self.assertEqual(len(self.fleet), 1)
+        srv.codex_fleet_check([self.acct("a", w=3)])
+        self.assertEqual([e for e, _ in self.fleet], ["codex_exhausted", "codex_recovered"])
+
+    def test_the_claude_fleet_never_sees_codex_accounts(self):
+        pol = {"threshold": 95.0, "hysteresis": 5.0, "cooldown": 300.0, "strategy": "best", "model": None}
+        claude = srv.cswap_accounts_from_json(doc())
+        self.assertEqual(srv.fleet_state(claude, pol)["usable"], 2)
+
 if __name__ == "__main__":
     unittest.main()

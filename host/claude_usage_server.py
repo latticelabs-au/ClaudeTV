@@ -388,6 +388,8 @@ def fleet_state(accounts, policy):
 _fleet_last = {}          # edge-trigger memory: {"exhausted": bool}
 _FLEET_TITLES = {"exhausted": "\U0001F6D1 ClaudeTV: every Claude account is out of quota",
                  "benched": "\U0001F6D1 ClaudeTV: no Claude account left in rotation",
+                 "codex_exhausted": "\U0001F6D1 ClaudeTV: every Codex account is out of quota",
+                 "codex_recovered": "\U0001F7E2 ClaudeTV: Codex quota available again",
                  "recovered": "\U0001F7E2 ClaudeTV: quota available again"}
 
 def _fleet_alert(event, body):
@@ -448,7 +450,12 @@ def notifiable(rec):
     plunge to 0% and fires a phantom 'gift' reset — which is how an ordinary `cswap` account
     switch ended up alerting as an Anthropic gift. Display keeps showing last-good either way;
     only the notifier is gated, because it is the part that cannot take back a false positive."""
-    return not rec.get("stale") and rec["u"]["s"] >= 0 and rec["u"]["w"] >= 0
+    u = rec["u"]
+    if rec.get("stale"): return False
+    # Codex may legitimately report a single window (weekly only, when OpenAI drops the short
+    # limit). notify_check treats windows independently and skips negatives, so one is enough.
+    if rec.get("provider") == "codex": return u["s"] >= 0 or u["w"] >= 0
+    return u["s"] >= 0 and u["w"] >= 0
 
 def notify_key(rec):
     """Namespace for a account's reset state: the STABLE identity, never the display label.
@@ -757,6 +764,47 @@ def codex_poll(exe, homes, deadline_s, reader=None):
     for t in ths: t.join(deadline_s + 10)
     return [r or {"account": None, "limits": None, "driver_err": "timeout"} for r in res]
 
+# ---- codex fleet: is every Codex account out? There is no auto-switcher for Codex, so this is
+# judged per account from the backend's own verdict first, a threshold second.
+_codex_fleet_last = {}
+
+def codex_fleet_state(accounts, threshold):
+    rows, unknown = [], 0
+    for rec in accounts:
+        if rec.get("auth") == "dead" or rec.get("err") == "api_key": continue   # cannot help you
+        if rec.get("stale"): unknown += 1; continue            # might be the one with room
+        b = max(rec["u"].get("s", -1), rec["u"].get("w", -1))
+        rows.append((rec["label"], b, bool(rec.get("blocked")) or b >= threshold))
+    headroom = [lbl for lbl, _, out in rows if not out]
+    return {"exhausted": bool(rows) and not headroom and not unknown, "headroom": headroom,
+            "binding": {lbl: b for lbl, b, _ in rows}, "usable": len(rows), "unknown": unknown,
+            "threshold": threshold}
+
+def codex_fleet_check(accounts):
+    """Edge-triggered, same rules as the Claude fleet: baseline silently, alert once when every
+    account is out, and recover only on POSITIVE evidence of headroom."""
+    thr = _cfg_num("CODEX_MAXED_THRESHOLD", 100)
+    try:
+        st = codex_fleet_state(accounts, thr)
+        if not st["usable"]: return st
+        was = _codex_fleet_last.get("exhausted")
+        if st["exhausted"] and not was:
+            _codex_fleet_last["exhausted"] = True
+            worst = ", ".join("%s %d%%" % (l, b) for l, b in sorted(st["binding"].items()))
+            _fleet_alert("codex_exhausted", "Every Codex account is out of quota, so Codex is blocked "
+                         "until one resets. Now: %s." % worst)
+            print("[%s] CODEX FLEET blocked (%s)" % (time.strftime("%H:%M:%S"), worst))
+        elif was and st["headroom"]:
+            _codex_fleet_last["exhausted"] = False
+            _fleet_alert("codex_recovered", "%s has room again, so Codex is usable." % st["headroom"][0])
+            print("[%s] CODEX FLEET recovered (%s)" % (time.strftime("%H:%M:%S"), st["headroom"][0]))
+        elif was is None:
+            _codex_fleet_last["exhausted"] = st["exhausted"]
+        return st
+    except Exception as e:
+        print("[codex] fleet check error: %s" % e)
+        return {"exhausted": False, "headroom": [], "binding": {}, "usable": 0, "unknown": 0, "threshold": thr}
+
 _codex = {"accts": [], "ts": 0, "next": 0.0, "fails": 0, "force": False, "last": 0.0,
           "good": {}, "hold": {}, "ident": {}, "pending": None, "fleet": {}}
 
@@ -830,11 +878,9 @@ def codex_apply_pending():
     _auth_transitions(accts)
     for rec in accts:
         if notifiable(rec):
-            notify_check(rec["u"], rec["resets"], acct=notify_key(rec), label=rec["label"])
-    check = globals().get("codex_fleet_check")                # arrives in the alerts task
-    if check:
-        f = check(accts)
-        with _lock: _codex["fleet"] = f
+            notify_check(rec["u"], rec["resets"], acct=notify_key(rec), label=rec["label"], provider="codex")
+    f = codex_fleet_check(accts)
+    with _lock: _codex["fleet"] = f
     return True
 
 # ---------- in-app firmware updater ----------
@@ -1176,6 +1222,8 @@ def _dispatch(title, body, channels, event):
 
 _AUTH_TITLES = {"dead": "\U0001F534 ClaudeTV: Claude login dead (action needed)",
                 "standby": "\U0001F7E0 ClaudeTV: failed over to standby login",
+                "codex_dead": "\U0001F534 ClaudeTV: Codex login dead (action needed)",
+                "codex_recovered": "\U0001F7E2 ClaudeTV: Codex auth recovered",
                 "recovered": "\U0001F7E2 ClaudeTV: Claude auth recovered"}
 
 def _auth_alert(event, body):
@@ -1188,21 +1236,25 @@ def _auth_alert(event, body):
     except Exception as e:
         print("[notify] auth alert error: %s" % e)
 
-def _reset_message(kind, u, cls="expected", maxed=False):
+_PROVIDER_NAMES = {"claude": ("Claude", "Anthropic"), "codex": ("Codex", "OpenAI")}
+
+def _reset_message(kind, u, cls="expected", maxed=False, provider="claude"):
+    name, vendor = _PROVIDER_NAMES.get(provider, _PROVIDER_NAMES["claude"])
     window = "session (5h)" if kind == "session" else "weekly (7d)"
-    parts = ["S %d%%" % u.get("s", 0), "W %d%%" % u.get("w", 0)]
+    # a window the provider did not report is skipped, never printed as -1%
+    parts = ["%s %d%%" % (k.upper(), u[k]) for k in ("s", "w") if u.get(k, -1) is not None and u.get(k, -1) >= 0]
     if u.get("f", -1) >= 0: parts.append("%s %d%%" % (u.get("fl") or "F", u["f"]))
     now = " · ".join(parts)
     nxt_v = u.get("sr") if kind == "session" else u.get("wr")
     nxt = (" Next reset %s%s." % ("~" if kind == "session" else "", nxt_v)) if nxt_v else ""
     if maxed:                                          # session that had hit its cap
-        return ("%s Maxed session reset — you're unblocked" % ("\U0001F381" if cls == "gift" else "✅"),
+        return ("%s Maxed %s session reset: you're unblocked" % ("\U0001F381" if cls == "gift" else "✅", name),
                 "Your session hit its cap and just reset%s. Now: %s.%s"
-                % (" EARLY — a gift!" if cls == "gift" else "", now, nxt))
+                % (" EARLY, a gift!" if cls == "gift" else "", now, nxt))
     if cls == "gift":
-        return ("\U0001F381 Anthropic gift — %s usage reset early" % window,
-                "Your %s quota was reset ahead of schedule — free capacity. Now: %s.%s" % (window, now, nxt))
-    return ("Claude %s usage reset" % window,
+        return ("\U0001F381 %s gift: %s %s usage reset early" % (vendor, name, window),
+                "Your %s quota was reset ahead of schedule, free capacity. Now: %s.%s" % (window, now, nxt))
+    return ("%s %s usage reset" % (name, window),
             "Your %s quota just refreshed. Now: %s.%s" % (window, now, nxt))
 
 def _was_maxed(prev):
@@ -1217,7 +1269,7 @@ def _should_notify(kind, prev):
                 or (_was_maxed(prev) and _truthy(CONFIG.get("NOTIFY_SESSION_MAXED"))))
     return _truthy(CONFIG.get("NOTIFY_WEEK_RESET"))
 
-def notify_check(u, resets, acct="", label=""):
+def notify_check(u, resets, acct="", label="", provider="claude"):
     """Detect + log usage-window resets (see the section header), then notify per the toggles.
     Per window: session=s / resets_at.five_hour; week=(w OR f) / resets_at.seven_day. Baselines
     silently on first sight; fires once per reset. Never breaks the poller.
@@ -1257,7 +1309,7 @@ def notify_check(u, resets, acct="", label=""):
                 shown = label or acct                   # humans see the label, state uses the key
                 _log_reset(kind, cls, _reset_detail(kind, prev, u), shown)
                 if _should_notify(kind, prev) and _channels():
-                    title, body = _reset_message(kind, u, cls, kind == "session" and _was_maxed(prev))
+                    title, body = _reset_message(kind, u, cls, kind == "session" and _was_maxed(prev), provider)
                     if shown: title = "[%s] %s" % (shown, title)
                     threading.Thread(target=_dispatch, args=(title, body, _channels(), kind + "_reset"),
                                      daemon=True).start()
@@ -1319,17 +1371,24 @@ def _auth_transitions(accts):
     """Edge-triggered per-account dead/recovered alerts: one per account per outage episode."""
     for rec in accts:
         dead, was = rec["auth"] == "dead", _alerted.get(rec["key"], False)
+        codex = rec.get("provider") == "codex"
+        who = "%s%s" % (rec["label"], (" (%s)" % rec["email"]) if rec["email"] else "")
         if dead and not was:
             _alerted[rec["key"]] = True
-            _auth_alert("dead", "Anthropic rejected the Claude login for %s%s. That account shows "
-                        "LOGIN EXPIRED on the display until you log in again (cswap: log in with "
-                        "that account and re-run `cswap add`; native: "
-                        "python3 claude_usage_server.py --login)."
-                        % (rec["label"], (" (%s)" % rec["email"]) if rec["email"] else ""))
+            if codex:
+                _auth_alert("codex_dead", "OpenAI rejected the Codex login for %s. That account shows "
+                            "LOGIN EXPIRED on the display until you log in again. Run this in your own "
+                            "shell on the collector host, as the user the collector runs as: "
+                            "CODEX_HOME=%s codex login --device-auth" % (who, rec.get("home", "~/.codex")))
+            else:
+                _auth_alert("dead", "Anthropic rejected the Claude login for %s. That account shows "
+                            "LOGIN EXPIRED on the display until you log in again (cswap: log in with "
+                            "that account and re-run `cswap add`; native: "
+                            "python3 claude_usage_server.py --login)." % who)
         elif not dead and was:
             _alerted[rec["key"]] = False
-            _auth_alert("recovered", "%s is accepted again; the display is back to live data."
-                        % rec["label"])
+            _auth_alert("codex_recovered" if codex else "recovered",
+                        "%s is accepted again; the display is back to live data." % rec["label"])
 
 def poller():
     global _accounts, _usage_ts, _usage_err, _wx, _wx_err, _migrated, _force_poll, _fleet
