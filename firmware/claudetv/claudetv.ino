@@ -23,7 +23,7 @@
 #include "panel.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "5.1"
+#define FW_VER  "5.2"
 // However many accounts cswap manages, the cycle shows up to this many. Raise freely: the cost
 // is 4 Strings + 4 ints of heap each, and the header switches from page dots to an "i/N"
 // counter past DOTS_MAX so the indicator never grows into the label.
@@ -38,16 +38,20 @@ ESP8266WebServer        server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 uint16_t C_BG, C_PANEL, C_LINE, C_CORAL, C_CYAN, C_WHITE, C_GRAY, C_DIM, C_GREEN, C_AMBER, C_RED, C_SKY;
+// Provider tint. Claude accounts keep the coral header; Codex accounts get violet, the one hue
+// nothing else on this screen uses (numbers are green/amber/red, the update mark is cyan, the
+// weather is sky), so a glance at the header tells you whose numbers these are.
+uint16_t C_CODEX, C_CODEX_DIM;
 unsigned long lastFetch=0, lastClock=0, lastWx=0, lastAcc=0;
 int connOK=-1, wxIdx=0; bool haveData=false, nightActive=false, updAvail=false, pUpd=false;
 int dataAge=-1, pAuth=-1;
 // One account's usage. The card renders ONE account at a time and the display cycles through
 // them (the same turntable the weather metrics use), so every account keeps the full three
 // Bold18 heroes instead of six numbers fighting over one 79px card.
-struct Acct { int s=0, w=0, f=-1, auth=0; String sr, wr, fl, label; };   // auth: 0 ok, 1 pending, 2 dead
+struct Acct { int s=0, w=0, f=-1, auth=0; bool codex=false; String sr, wr, fl, label; };   // auth: 0 ok, 1 pending, 2 dead; codex: acc[].p=="x"
 Acct AC[MAXACC]; int nAcc=1, accIdx=0;
 struct { int wt=-999, wfl=-999, whi=-999, wlo=-999, wrain=-999, whum=-999; String wc, city; } U;
-int pS=-99, pW=-99, pF=-99, pConn=-1, pAcc=-1, pNAcc=-1; String pSR="\x01", pWR="\x01", pFL="\x01", pLBL="\x01", pDate="\x01";
+int pS=-99, pW=-99, pF=-99, pConn=-1, pAcc=-1, pNAcc=-1; bool pCodex=false; String pSR="\x01", pWR="\x01", pFL="\x01", pLBL="\x01", pDate="\x01";
 Acct& A(){ return AC[(accIdx < nAcc && accIdx < MAXACC) ? accIdx : 0]; }   // the account on screen
 
 // accCycle was appended AFTER usageUrl, so a 4.7 EEPROM image reads a stale byte there. MAGIC is
@@ -107,6 +111,19 @@ void drawUpdateMark(){
 void drawUsageCard(){
   Acct& a=A();
   tft.fillRoundRect(UCX,UCY,UCW,UCH,10,C_PANEL);
+  if(a.codex&&a.s<0&&a.f<0){      // Codex plan with a weekly limit only (no 5h window, no model
+    // limit): ONE hero, not a classic card with a dead "SESSION --" column beside the number that
+    // matters. Same three rows as the other layouts, so cycling accounts does not jump around.
+    // Worst case "resets Dec 30 12:59pm"@Bold9 = 192px centred -> 24..216, clear of the card edge,
+    // and a lone "100%"@18 = 88px fits, so this layout keeps its percent sign.
+    str("WEEK",120,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
+    char b[8]; if(haveData&&a.w>=0)snprintf(b,sizeof b,"%d%%",a.w); else strcpy(b,"--");
+    str(b,120,UCY+43,&FreeSansBold18pt7b,lvl(haveData?a.w:-1),MC_DATUM,C_PANEL);
+    char r[32]; if(a.wr.length())snprintf(r,sizeof r,"resets %s",a.wr.c_str()); else strcpy(r,"--");
+    str(r,120,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
+    drawUpdateMark();
+    return;
+  }
   if(a.f>=0){                     // S (5h) | W + F (7d) — one shared reset, three Bold18 heroes
     tft.drawFastVLine(FDIV,UCY+14,UCH-28,C_LINE);   // divider = the 5h | 7d window boundary
     drawMetric(FSCX,"S",a.s,&FreeSansBold18pt7b);
@@ -130,7 +147,16 @@ void drawUsageCard(){
   str("WEEK",RCX,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
   if(haveData&&a.w>=0)snprintf(b,sizeof b,"%d%%",a.w); else strcpy(b,"--");
   str(b,RCX,UCY+43,&FreeSansBold18pt7b,lvl(haveData?a.w:-1),MC_DATUM,C_PANEL);
-  str(a.wr.length()?a.wr.c_str():"--",UCX+UCW-12,UCY+67,&FreeSansBold9pt7b,C_DIM,MR_DATUM,C_PANEL);
+  // The two resets share one row: session from the left edge, week from the right. At their widest
+  // ("12:39pm" 71px + "Dec 30 12:59pm" 134px) they meet in the middle of the 200px row. Claude resets
+  // land on round hours so it was rare; Codex resets carry odd minutes, so it is not. When they would
+  // touch, the WEEK reset drops its minutes ("Dec 30 12pm"): days away, the hour is what matters.
+  String wr=a.wr;
+  tft.setFreeFont(&FreeSansBold9pt7b);
+  if(a.sr.length()&&wr.length()&&tft.textWidth(a.sr)+tft.textWidth(wr)>UCW-24-8){
+    int c=wr.lastIndexOf(':'); if(c>0) wr.remove(c,3);
+  }
+  str(wr.length()?wr.c_str():"--",UCX+UCW-12,UCY+67,&FreeSansBold9pt7b,C_DIM,MR_DATUM,C_PANEL);
   drawUpdateMark();
 }
 void drawWeatherCard(){
@@ -178,13 +204,16 @@ void header(){
   // Bold12 glyphs at TL_DATUM y=9 reach ~y=32, so a tight clear leaves the previous label's
   // bottom rows stranded in the 26..32 gap that neither the header nor the card repaints.
   tft.fillRect(0,0,240,UCY,C_BG);
-  tft.fillRoundRect(12,12,9,9,2,C_CORAL);
-  if(nAcc<2){ str("CLAUDE USAGE",26,9,&FreeSansBold12pt7b,C_WHITE,TL_DATUM,C_BG); return; }
-  String lb=A().label; if(!lb.length()) lb="ACCOUNT";
-  str(lb.c_str(),26,9,&FreeSansBold12pt7b,C_CORAL,TL_DATUM,C_BG);
+  Acct& a=A(); uint16_t tint=a.codex?C_CODEX:C_CORAL;
+  tft.fillRoundRect(12,12,9,9,2,tint);
+  if(nAcc<2){ str(a.codex?"CODEX USAGE":"CLAUDE USAGE",26,9,&FreeSansBold12pt7b,C_WHITE,TL_DATUM,C_BG); return; }
+  String lb=a.label; if(!lb.length()) lb="ACCOUNT";
+  str(lb.c_str(),26,9,&FreeSansBold12pt7b,tint,TL_DATUM,C_BG);
   if(nAcc<=DOTS_MAX){                              // page dots, right-aligned to end at x=232
+    // Codex pages are dim violet, so a mixed fleet reads at a glance (which dots are Codex) and a
+    // Claude-only display looks exactly as it always has.
     for(int i=0;i<nAcc;i++)
-      tft.fillCircle(232-(nAcc-1-i)*10,17,3,(i==accIdx)?C_WHITE:C_LINE);
+      tft.fillCircle(232-(nAcc-1-i)*10,17,3,(i==accIdx)?C_WHITE:(AC[i].codex?C_CODEX_DIM:C_LINE));
   }else{                                           // too many to dot -> compact "3/8" counter
     char c[8]; snprintf(c,sizeof c,"%d/%d",accIdx+1,nAcc);
     str(c,235,17,&FreeSansBold9pt7b,C_GRAY,MR_DATUM,C_BG);
@@ -192,11 +221,11 @@ void header(){
 }
 void render(bool force){
   Acct& a=A();
-  bool cardChg=force||a.auth!=pAuth||accIdx!=pAcc||updAvail!=pUpd||a.s!=pS||a.w!=pW||a.f!=pF||a.sr!=pSR||a.wr!=pWR||a.fl!=pFL;
+  bool cardChg=force||a.codex!=pCodex||a.auth!=pAuth||accIdx!=pAcc||updAvail!=pUpd||a.s!=pS||a.w!=pW||a.f!=pF||a.sr!=pSR||a.wr!=pWR||a.fl!=pFL;
   // nAcc matters on its own: dropping to one account must repaint the title and clear the dots
-  bool hdrChg =force||accIdx!=pAcc||nAcc!=pNAcc||a.label!=pLBL;
+  bool hdrChg =force||accIdx!=pAcc||nAcc!=pNAcc||a.label!=pLBL||a.codex!=pCodex;
   bool dotChg =force||connOK!=pConn||a.auth!=pAuth;
-  if(hdrChg){ header(); pLBL=a.label; pNAcc=nAcc; }
+  if(hdrChg){ header(); pLBL=a.label; pNAcc=nAcc; pCodex=a.codex; }
   if(cardChg){ if(a.auth==2)drawUsageError(); else drawUsageCard(); pS=a.s;pW=a.w;pF=a.f;pSR=a.sr;pWR=a.wr;pFL=a.fl;pUpd=updAvail; }
   if(dotChg){ drawDot(); pConn=connOK; }
   pAuth=a.auth; pAcc=accIdx;
@@ -241,6 +270,8 @@ void fetchUsage(){
             t.fl=String((const char*)(o["fl"]|"")); t.label=String((const char*)(o["l"]|""));
             const char* oa=o["auth"]|"ok";
             t.auth=(!strcmp(oa,"dead"))?2:(!strcmp(oa,"pending"))?1:0;
+            const char* op=o["p"]|"c";                 // provider: "c" Claude (or absent), "x" Codex
+            t.codex=(op[0]=='x');
             n++;
           }
           nAcc=n;
@@ -248,7 +279,7 @@ void fetchUsage(){
           Acct& t=AC[0];
           t.s=doc["s"]|0; t.w=doc["w"]|0; t.sr=String((const char*)(doc["sr"]|"")); t.wr=String((const char*)(doc["wr"]|""));
           t.f=doc["f"]|-1; t.fl=String((const char*)(doc["fl"]|""));   // model-scoped weekly (e.g. Fable); -1 = none
-          t.label=""; t.auth=topAuth; nAcc=1;
+          t.label=""; t.auth=topAuth; t.codex=false; nAcc=1;
         }
         if(accIdx>=nAcc) accIdx=0;
       }
@@ -272,7 +303,7 @@ void handleState(){
   d["nacc"]=nAcc; d["acci"]=accIdx; d["label"]=a.label; d["up"]=updAvail;
   JsonArray ar=d["acc"].to<JsonArray>();
   for(int i=0;i<nAcc&&i<MAXACC;i++){ JsonObject o=ar.add<JsonObject>();
-    o["l"]=AC[i].label; o["s"]=AC[i].s; o["w"]=AC[i].w; o["f"]=AC[i].f; o["auth"]=AC[i].auth; }
+    o["l"]=AC[i].label; o["s"]=AC[i].s; o["w"]=AC[i].w; o["f"]=AC[i].f; o["auth"]=AC[i].auth; o["p"]=AC[i].codex?"x":"c"; }
   d["city"]=U.city; d["wt"]=U.wt; d["wc"]=U.wc; d["time"]=hms;
   d["bri"]=S.bri; d["ne"]=S.nEn; d["ns"]=S.nStart; d["nf"]=S.nEnd; d["nb"]=S.nBri; d["rot"]=S.rot; d["refresh"]=S.refresh; d["acyc"]=S.accCycle;
   d["usage"]=S.usageUrl;
@@ -313,6 +344,7 @@ void setup(){
   C_CORAL=tft.color565(0xff,0x7a,0x55); C_CYAN=tft.color565(0x3f,0xd2,0xdd); C_WHITE=TFT_WHITE;
   C_GRAY=tft.color565(0xa4,0xb0,0xc2); C_DIM=tft.color565(0x74,0x85,0x9b);
   C_GREEN=tft.color565(0x54,0xd3,0x6e); C_AMBER=tft.color565(0xf0,0xad,0x36); C_RED=tft.color565(0xff,0x4d,0x68); C_SKY=tft.color565(0x84,0xcd,0xf2);
+  C_CODEX=tft.color565(0xa9,0x8b,0xff); C_CODEX_DIM=tft.color565(0x4a,0x3d,0x80);
   splash();
 
   WiFi.mode(WIFI_STA);

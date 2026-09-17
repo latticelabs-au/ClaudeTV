@@ -250,10 +250,20 @@ a Codex token**, and Codex keeps its own login fresh.
 > ⚠️ **Log in separately on every machine.** Never copy a Codex folder from another box.
 > Refresh tokens rotate, so the first machine to refresh invalidates the other's copy.
 
+**On the display:** Codex accounts are **violet** where Claude accounts are coral (header, label
+and their page dots), so a mixed fleet reads at a glance. A single Codex-only setup gets a
+`CODEX USAGE` title. This needs firmware **v5.2**; an older device still cycles Codex accounts,
+just in coral and with the classic card.
+
 **Good to know:**
 
-- OpenAI decides which limits a plan has. Some plans currently report only a weekly limit, in
-  which case the session number shows `--` and the week number is the one that matters.
+- OpenAI decides which limits a plan has. Some plans currently report only a weekly limit. Those
+  accounts get a single-number **WEEK** card instead of a dead `SESSION --` column. If your plan
+  has a 5-hour limit too, you get the usual two columns.
+- **Several Codex accounts** work the same way as several Claude accounts: one folder each, they
+  cycle after the Claude ones in folder order, each with its own reset history and alerts, up to
+  8 accounts in total on the screen. To pin a second device to one of them use its key, which
+  stays unambiguous even if a Claude alias shares the name: `/usage?acct=codex:work`.
 - **Dead login:** if OpenAI rejects a Codex login, you get one alert on your configured channels
   with the exact command to run, and only that account's card flips to **LOGIN EXPIRED** while
   the others keep cycling. One more alert confirms the recovery after you log in again.

@@ -18,6 +18,7 @@ build/
 *.d.o
 
 # editor / OS
+.playwright-mcp/
 .vscode/
 .idea/
 .DS_Store

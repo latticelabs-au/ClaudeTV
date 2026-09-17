@@ -490,7 +490,9 @@ def usage_wire(accounts, wx, primary=""):
     if primary:
         p = primary.strip().lower()
         for i, rec in enumerate(accts):
-            if p in (rec["label"].lower(), (rec["email"] or "").lower()):
+            # the key (e.g. codex:work) is the unambiguous pin: a Claude alias and a Codex folder
+            # may share a label, and the label keeps its old first-match meaning
+            if p in (rec["label"].lower(), (rec["email"] or "").lower(), (rec.get("key") or "").lower()):
                 accts.insert(0, accts.pop(i)); break
     lead = accts[0] if accts else None
     if not accts:                                        auth = "pending"
@@ -1697,9 +1699,9 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
       +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?'LOGIN EXPIRED':'ok')+'</span></div>'
     +'<div class=row style="margin:2px 0"><span class=muted>'+esc(a.email||'')+'</span>'
       +'<span>'+(a.stale?'<span style=color:#f0ad36>stale </span>':'')
-        +'S <b>'+pc(a.s)+'</b> · W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
+        +((a.provider=='codex'&&a.s<0)?'':('S <b>'+pc(a.s)+'</b> · '))+'W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
     +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+esc(a.home)+' codex login --device-auth</code></div>'):'')
-    +'<div class=row style=margin:0><span class=muted>'+(a.sr?('resets '+esc(a.sr)):'idle')+(a.wr?(' · '+esc(a.wr)):'')
+    +'<div class=row style=margin:0><span class=muted>'+((a.provider=='codex'&&a.s<0)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):'idle')+(a.wr?(' · '+esc(a.wr)):'')))
       +'</span><span class=muted>'+esc(a.err||(a.age?a.age+'s':''))+'</span></div>'
     +((a.buckets||[]).length>1?('<div class=muted style="margin-top:2px">'+a.buckets.map(b=>esc(b.name||b.id)+': '
       +b.windows.map(w=>pc(w.pct)+'/'+(w.mins>=1440?Math.round(w.mins/1440)+'d':(w.mins?Math.round(w.mins/60)+'h':'?'))).join(' ')).join(' | ')+'</div>'):'')

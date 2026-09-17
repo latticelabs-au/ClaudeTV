@@ -1564,6 +1564,32 @@ class TestCodexHardening(CodexIsolated):
         for value in ("esc(a.label)", "esc(a.email", "esc(a.plan)", "esc(a.home)", "esc(b.name||b.id)"):
             self.assertIn(value, js)
 
+    def test_several_codex_accounts_cycle_after_claude_in_folder_order(self):
+        self.homes = [("default", "", "/h/default"), ("personal", "personal", "/h/personal"), ("work", "work", "/h/work")]
+        rd = self.reader({h[2]: cx_raw() for h in self.homes})
+        srv._publish("claude", srv.cswap_accounts_from_json(doc()))
+        srv._codex["pending"] = srv.codex_refresh(1000.0, reader=rd); srv.codex_apply_pending()
+        w = srv.usage_wire(list(srv._accounts), {})
+        self.assertEqual([(a["l"], a["p"]) for a in w["acc"]],
+                         [("WORK", "c"), ("PERSONAL", "c"), ("COSMO", "x"), ("PERSONAL", "x"), ("WORK", "x")])
+        self.assertEqual(w["n"], 5)
+
+    def test_an_account_can_be_pinned_by_key_when_two_providers_share_a_label(self):
+        """A Claude alias and a Codex folder can both be called 'work'. The label pin keeps its
+        old meaning (first match, so Claude), and the key is the unambiguous way to get Codex."""
+        claude = srv.cswap_accounts_from_json(doc())
+        codex = srv.codex_account_from_rpc("work", "work", "/h/work", cx_raw())
+        accts = claude + [codex]
+        self.assertEqual(srv.usage_wire(accts, {}, primary="work")["acc"][0]["p"], "c")
+        by_key = srv.usage_wire(accts, {}, primary="codex:work")
+        self.assertEqual((by_key["acc"][0]["p"], by_key["w"], by_key["s"]), ("x", 19, -1))
+        self.assertEqual(srv.usage_wire(accts, {}, primary="CODEX:WORK")["acc"][0]["p"], "x")
+
+    def test_each_codex_account_has_its_own_reset_and_alert_namespace(self):
+        recs = [srv.codex_account_from_rpc(s, s, "/h/" + s, cx_raw()) for s in ("work", "personal")]
+        self.assertEqual([srv.notify_key(r) for r in recs], ["codex:work", "codex:personal"])
+        self.assertEqual(len({r["key"] for r in recs + srv.cswap_accounts_from_json(doc())}), 4)
+
     def test_the_terminal_shows_the_codex_fleet_and_warns_past_the_device_limit(self):
         for needle in ("id=cxfleet", "s.codex_fleet", "id=maxwarn", "A.list.length>8"):
             self.assertIn(needle, srv.TERMINAL)

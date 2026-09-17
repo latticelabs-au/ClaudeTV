@@ -1,6 +1,6 @@
 # Codex as a second usage provider: design
 
-Date: 2026-09-17. Status: draft for review. Scope: collector (`host/`) only; firmware is a follow-up.
+Date: 2026-09-17. Status: approved and implemented on `feat/codex-provider`. Scope: collector (`host/`), plus firmware v5.2 and the emulator for the provider tint and the weekly-only card.
 
 ## Goal
 
@@ -15,7 +15,7 @@ for one or several Codex accounts, without weakening any guarantee the Claude pa
 
 Non-goals for this version: switching Codex accounts (there is no `cswap auto` equivalent and
 we are not building one), API-key Codex logins (they have no subscription limits), token or
-cost accounting from logs, any firmware change.
+cost accounting from logs.
 
 ## Decision: two sources, and the Codex source is Codex itself
 
@@ -292,8 +292,12 @@ part of this design, so it has its own tests and the contract-drift test covers 
 `acc[]` entries gain `"p": "c" | "x"`. Nothing else changes: flat keys still mirror the lead
 account, `n` counts all accounts, `?acct=<label>` still pins one. A v5.1 device ignores `p`
 and cycles a Codex account by its label with the classic two-column card (`SESSION --` when
-there is no short window). Firmware follow-up, out of scope here: provider tint in the
-header, a `CODEX USAGE` single-account title, and a single-hero layout when only `w` exists.
+there is no short window). Firmware v5.2, added on the same branch at the owner's request: Codex accounts are violet (header
+square, label, page dots), a lone Codex account is titled `CODEX USAGE`, and a Codex account with
+a weekly limit only gets a single-hero WEEK card instead of a dead `SESSION --` column. The
+classic two-column card also drops the minutes from the week reset when the two reset times
+would touch, which Codex's odd-minute resets made likely. `?acct=` additionally matches the
+record key (`codex:work`), the unambiguous pin when two providers share a label.
 `MAXACC` stays 8 across both providers; the terminal warns when the merged list exceeds it.
 
 ### 10. Master terminal, config, installer, docs
