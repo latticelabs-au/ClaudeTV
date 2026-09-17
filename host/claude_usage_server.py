@@ -476,6 +476,46 @@ def usage_wire(accounts, wx, primary=""):
     if wx: st.update(wx)
     return st
 
+# ---------- accounts: codex source (OpenAI Codex on a ChatGPT plan) ----------
+# The second provider. Same contract as cswap: the collector holds no token and runs no OAuth.
+# Here the middleware is Codex itself: `codex app-server` speaks JSON-RPC over stdio, and
+# `account/rateLimits/read` returns the live limits without a model call. Codex's own auth
+# manager refreshes the credential on that read, so polling is the keep-alive and exactly one
+# component ever rotates a given login. One CODEX_HOME directory per account.
+#
+# Measured on the production host (codex-cli 0.154.0): a cold read is ~1.1s and ~0.6 CPU-s, so
+# a fresh process per read beats a resident 93MB server. Two facts are load-bearing:
+#   * `--disable plugins` cuts a launch from 7 backend requests to exactly 1
+#   * Codex NEVER times out a hung backend, so the deadline and the kill are ours
+
+# Codex gives no structured HTTP status, only this message shape (codex-rs backend-client):
+#   "failed to fetch codex rate limits: GET <url> failed: 401 Unauthorized; content-type=...; body=..."
+_CODEX_HTTP = re.compile(r"failed: (\d{3}) ")
+
+def codex_status(account_reply, limits_reply, driver_err=""):
+    """-> (auth, err). The project's original rule (56806bc): a login is dead when the USAGE
+    endpoint rejects it, never because a refresh failed, and 429 is never dead. When a refresh
+    fails for good, Codex keeps the stale credential and account/read still reports the account,
+    so a login that needs a human arrives as HTTP 401 inside -32603, not as -32600."""
+    res = (account_reply or {}).get("result")
+    acct = res.get("account") if isinstance(res, dict) else None
+    if isinstance(res, dict) and acct is None: return "dead", "login_required"
+    if acct and acct.get("type") != "chatgpt": return "ok", "api_key"   # no subscription quota
+    if driver_err: return "ok", driver_err
+    e = (limits_reply or {}).get("error")
+    if not e:
+        return ("ok", "") if isinstance((limits_reply or {}).get("result"), dict) else ("ok", "unavailable")
+    code, msg = e.get("code"), str(e.get("message") or "")
+    if code == -32600: return "dead", "login_required"
+    if code == -32603:
+        m = _CODEX_HTTP.search(msg); http = int(m.group(1)) if m else 0
+        if http == 401: return "dead", "login_expired"
+        if http == 403:          # an HTML 403 is a Cloudflare challenge, not an auth verdict
+            return ("ok", "blocked_by_edge") if "text/html" in msg.lower() else ("dead", "login_expired")
+        if http == 429: return "ok", "rate_limited"
+        return "ok", "unavailable"
+    return "ok", "unknown"
+
 # ---------- in-app firmware updater ----------
 # The collector already reaches both GitHub and the device, and the stock ESP8266HTTPUpdateServer
 # at /update takes a plain multipart POST — the same thing `curl -F firmware=@...` does. So the

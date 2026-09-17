@@ -786,5 +786,83 @@ class TestCswapIsRequired(TzPinned):
         self.assertTrue(hasattr(srv, "oauth_login"))
 
 
+# ---------------------------------------------------------------- codex provider
+def cx_win(pct, mins, at=1790220250):
+    return {"usedPercent": pct, "windowDurationMins": mins, "resetsAt": at}
+
+
+# Captured from a live `account/rateLimits/read` on 2026-09-17 (prolite plan). The weekly window
+# sits in the PRIMARY slot and there is no short window at all: slots are not meanings.
+CODEX_LIMITS = {"id": 3, "result": {
+    "ordinaryUsageAllowed": True, "accountId": "acc-1",
+    "rateLimits": {"limitId": "codex", "limitName": None, "primary": cx_win(19, 10080),
+                   "secondary": None, "planType": "prolite", "rateLimitReachedType": None},
+    "rateLimitsByLimitId": {
+        "codex": {"limitId": "codex", "limitName": None, "primary": cx_win(19, 10080),
+                  "secondary": None, "planType": "prolite", "rateLimitReachedType": None},
+        "codex_bengalfox": {"limitId": "codex_bengalfox", "limitName": "GPT-5.3-Codex-Spark",
+                            "primary": cx_win(3, 300, 1789641634), "secondary": cx_win(7, 10080),
+                            "planType": "prolite"}}}}
+CODEX_ACCT = {"id": 2, "result": {"account": {"type": "chatgpt", "email": "cosmo@example.com",
+                                              "planType": "prolite"}, "requiresOpenaiAuth": True}}
+
+
+def cx_raw(limits=CODEX_LIMITS, account=CODEX_ACCT, driver_err=""):
+    return {"account": account, "limits": limits, "driver_err": driver_err}
+
+
+def cx_limits(**main):
+    """CODEX_LIMITS with the main bucket's fields overridden."""
+    d = json.loads(json.dumps(CODEX_LIMITS))
+    d["result"]["rateLimitsByLimitId"]["codex"].update(main)
+    return d
+
+
+def cx_err(code, message):
+    return {"id": 3, "error": {"code": code, "message": message}}
+
+
+CX_HTTP = ("failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage "
+           "failed: %s; content-type=%s; body=x")
+
+
+class TestCodexStatus(unittest.TestCase):
+    """Only a login that needs a human is dead. Everything else keeps last-good and retries."""
+
+    ROWS = [
+        ("good reply", (CODEX_ACCT, CODEX_LIMITS, ""), ("ok", "")),
+        ("no login in this home", ({"id": 2, "result": {"account": None}},
+            cx_err(-32600, "codex account authentication required to read rate limits"), ""),
+            ("dead", "login_required")),
+        ("-32600 without an account reply", (None, cx_err(-32600, "x"), ""), ("dead", "login_required")),
+        ("usage endpoint says 401", (CODEX_ACCT, cx_err(-32603, CX_HTTP % ("401 Unauthorized", "application/json")), ""),
+            ("dead", "login_expired")),
+        ("403 with a json body", (CODEX_ACCT, cx_err(-32603, CX_HTTP % ("403 Forbidden", "application/json")), ""),
+            ("dead", "login_expired")),
+        ("403 html is a cloudflare challenge", (CODEX_ACCT, cx_err(-32603, CX_HTTP % ("403 Forbidden", "text/html; charset=UTF-8")), ""),
+            ("ok", "blocked_by_edge")),
+        ("429 is never dead", (CODEX_ACCT, cx_err(-32603, CX_HTTP % ("429 Too Many Requests", "")), ""),
+            ("ok", "rate_limited")),
+        ("500", (CODEX_ACCT, cx_err(-32603, CX_HTTP % ("500 Internal Server Error", "")), ""), ("ok", "unavailable")),
+        ("connection refused", (CODEX_ACCT, cx_err(-32603,
+            "failed to fetch codex rate limits: error sending request for url (x)"), ""), ("ok", "unavailable")),
+        ("undecodable body", (CODEX_ACCT, cx_err(-32603,
+            "failed to fetch codex rate limits: Decode error for x: expected value"), ""), ("ok", "unavailable")),
+        ("driver timeout", (CODEX_ACCT, None, "timeout"), ("ok", "timeout")),
+        ("an error code we have never seen", (CODEX_ACCT, cx_err(-32099, "new thing"), ""), ("ok", "unknown")),
+        ("api key login has no subscription quota", ({"id": 2, "result": {"account": {"type": "apiKey"}}},
+            cx_err(-32600, "chatgpt authentication required to read rate limits"), ""), ("ok", "api_key")),
+        ("nothing came back at all", (None, None, "unavailable"), ("ok", "unavailable")),
+    ]
+
+    def test_status_table(self):
+        for name, args, want in self.ROWS:
+            with self.subTest(name):
+                self.assertEqual(srv.codex_status(*args), want)
+
+    def test_a_429_in_the_body_text_of_a_500_is_not_rate_limiting(self):
+        msg = CX_HTTP % ("500 Internal Server Error", "") + " upstream said 429"
+        self.assertEqual(srv.codex_status(CODEX_ACCT, cx_err(-32603, msg), ""), ("ok", "unavailable"))
+
 if __name__ == "__main__":
     unittest.main()
