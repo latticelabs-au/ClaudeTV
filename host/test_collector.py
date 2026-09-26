@@ -8,6 +8,7 @@ backwards-compatible /usage wire contract, and per-account reset detection (incl
 account-switch-is-not-a-reset case that produced a phantom 'gift' in the single-account build).
 """
 import json, os, subprocess, sys, tempfile, time, unittest
+from datetime import datetime, timezone
 
 import claude_usage_server as srv
 
@@ -1331,6 +1332,52 @@ class TestCodexAlerts(CodexIsolated):
         srv.notify_check({"s": -1, "w": 31, "f": -1, "fl": ""}, {"session": None,
                          "week": "2026-09-24T03:00:00+00:00"}, acct="codex:a", provider="codex")
         self.assertEqual(srv._load_reset_log(), [])
+
+    # ---- a window nobody has used yet reports its reset as "now + its length"
+    WEEK_S = 7 * 86400
+
+    def _poll_at(self, when, pct, resets_at):
+        """One weekly-only Codex poll, mapped from the wire, with the notifier's clock at `when`."""
+        rec = srv.codex_account_from_rpc("a", "a", "/h/a", cx_raw(cx_limits(
+            primary=cx_win(pct, 10080, resets_at), secondary=None)))
+        saved = srv._now_utc
+        srv._now_utc = lambda: datetime.fromtimestamp(when, tz=timezone.utc)
+        try: srv.notify_check(rec["u"], rec["resets"], acct=rec["key"], label=rec["label"], provider="codex")
+        finally: srv._now_utc = saved
+
+    def test_an_unused_window_whose_reset_slides_with_the_clock_is_not_a_reset(self):
+        """Regression, 2026-09-27: at 0% OpenAI has not started the weekly window, so it reports
+        resetsAt = now + 7 days. Every 5-minute poll moved it 5 minutes on, the notifier read that
+        as the scheduled reset arriving, and alerted a Codex 'gift' 64 times overnight. A full idle
+        week of polls is the largest input the notifier sees for one window."""
+        t0, started = 1790000000, time.monotonic()
+        for i in range(self.WEEK_S // 300):
+            t = t0 + i * 300
+            self._poll_at(t, 0, t + self.WEEK_S)
+        self.assertEqual(srv._load_reset_log(), [])
+        self.assertLess(time.monotonic() - started, 10.0)
+
+    def test_the_real_reset_fires_once_then_the_idle_window_stays_quiet(self):
+        """The live sequence: blocked at 100% until the scheduled reset, then hours idle at 0%."""
+        T = 1790000000
+        self._poll_at(T - 600, 100, T)
+        for i in range(1, 13):
+            t = T + i * 300
+            self._poll_at(t, 0, t + self.WEEK_S)
+        self.assertEqual([(e["window"], e["class"]) for e in srv._load_reset_log()], [("week", "expected")])
+
+    def test_a_light_usage_scheduled_reset_still_fires_on_the_roll_alone(self):
+        T = 1790000000
+        self._poll_at(T - 600, 3, T)
+        self._poll_at(T + 300, 0, T + 300 + self.WEEK_S)     # 3 -> 0 is no drop: only the roll says so
+        self.assertEqual([e["class"] for e in srv._load_reset_log()], ["expected"])
+
+    def test_an_early_reset_fires_once_as_a_gift_and_the_idle_slide_after_it_stays_quiet(self):
+        T, t = 1790000000, 1790000000 - 2 * 86400
+        self._poll_at(t - 300, 80, T)
+        self._poll_at(t, 0, t + self.WEEK_S)
+        self._poll_at(t + 300, 0, t + 300 + self.WEEK_S)
+        self.assertEqual([e["class"] for e in srv._load_reset_log()], ["gift"])
 
     def test_reset_wording_names_the_provider_and_never_prints_a_negative_percent(self):
         title, body = srv._reset_message("week", {"s": -1, "w": 2, "f": -1, "wr": "Oct 1 3am"}, provider="codex")
