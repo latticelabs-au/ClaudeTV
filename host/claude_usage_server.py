@@ -1133,7 +1133,8 @@ def fetch_weather():
 # Logs + notifies (email / Discord / Slack) when a usage window (5h session, 7d week) resets.
 # resets_at is the NEXT *scheduled* reset on a FIXED schedule — a surprise Anthropic reset ('gift')
 # zeroes your usage but does NOT move it. So a reset is detected from EITHER:
-#   - resets_at rolling forward  (the scheduled reset arrived), OR
+#   - resets_at rolling forward once the old one is due  (the scheduled reset arrived; an unused
+#     window's resets_at slides forward with the clock, and that is not a reset), OR
 #   - utilisation dropping >= RESET_DROP  (a gift, or a scheduled reset whose resets_at lags),
 # then classified by TIMING: at/after the scheduled reset time (prev resets_at) -> 'expected';
 # before it -> 'gift'. Every reset (expected + gifts) is appended to resets.log; cold start baselines
@@ -1386,9 +1387,12 @@ def notify_check(u, resets, acct="", label="", provider="claude"):
                 v = u.get(k)
                 if v is not None and v >= 0: cur[k] = v; usable[k] = v
             reset = False
+            due = bool(prev_ra and now >= prev_ra - timedelta(minutes=5))   # scheduled reset time reached
             if prev:                                    # not first sight
                 new_ra = _iso_dt(ra_iso)
-                rolled = bool(new_ra and prev_ra and (new_ra - prev_ra).total_seconds() > 60)
+                # a roll counts only once it is due: a window nobody has used yet (Codex at 0%)
+                # reports resets_at = now + its length, which slides forward on every poll
+                rolled = bool(due and new_ra and (new_ra - prev_ra).total_seconds() > 60)
                 dropped = any(prev.get(k) is not None and (prev[k] - v) >= RESET_DROP
                               for k, v in usable.items())
                 reset = rolled or dropped
@@ -1397,7 +1401,7 @@ def notify_check(u, resets, acct="", label="", provider="claude"):
             # SAME reset — fire once per ended window.
             if reset and ended is not None and prev.get("fired_for") == ended: reset = False
             if reset:
-                cls = "expected" if (prev_ra and now >= prev_ra - timedelta(minutes=5)) else "gift"
+                cls = "expected" if due else "gift"
                 cur["fired_for"] = ended
             if cur != prev: st[kind] = cur; changed = True
             if reset:
