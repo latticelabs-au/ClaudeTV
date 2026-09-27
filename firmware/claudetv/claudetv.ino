@@ -23,7 +23,7 @@
 #include "panel.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "5.2"
+#define FW_VER  "5.2.1"
 // However many accounts cswap manages, the cycle shows up to this many. Raise freely: the cost
 // is 4 Strings + 4 ints of heap each, and the header switches from page dots to an "i/N"
 // counter past DOTS_MAX so the indicator never grows into the label.
