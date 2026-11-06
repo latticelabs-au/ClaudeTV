@@ -3,6 +3,7 @@
  * Dashboard: Claude session(5h) | week(7d) + the model-scoped weekly limit (e.g. Fable) as
  * usage % + reset times — week and the scoped limit share one 7d reset line; falls back to the
  * classic two-column card when the account has no scoped limit.
+ * An account with no session limit (a verified Ultra plan) shows only its weekly windows.
  * Cycling weather turntable, big clock, Lattice Labs logo. Web control panel + OTA.
  * Silent: TFT_eSPI with ONE held-open SPI transaction (CS low). Settings persist in EEPROM.
  * Full rounded-card redraws (no partial-clear seams). Secrets in config.h (gitignored).
@@ -23,7 +24,7 @@
 #include "panel.h"
 
 #define FW_NAME "ClaudeTV"
-#define FW_VER  "5.2.1"
+#define FW_VER  "5.3.0"
 // However many accounts cswap manages, the cycle shows up to this many. Raise freely: the cost
 // is 4 Strings + 4 ints of heap each, and the header switches from page dots to an "i/N"
 // counter past DOTS_MAX so the indicator never grows into the label.
@@ -48,10 +49,10 @@ int dataAge=-1, pAuth=-1;
 // One account's usage. The card renders ONE account at a time and the display cycles through
 // them (the same turntable the weather metrics use), so every account keeps the full three
 // Bold18 heroes instead of six numbers fighting over one 79px card.
-struct Acct { int s=0, w=0, f=-1, auth=0; bool codex=false; String sr, wr, fl, label; };   // auth: 0 ok, 1 pending, 2 dead; codex: acc[].p=="x"
+struct Acct { int s=0, w=0, f=-1, auth=0; bool codex=false, nos=false; String sr, wr, fl, label; };   // auth: 0 ok, 1 pending, 2 dead; codex: acc[].p=="x"; nos: no session limit (verified Ultra)
 Acct AC[MAXACC]; int nAcc=1, accIdx=0;
 struct { int wt=-999, wfl=-999, whi=-999, wlo=-999, wrain=-999, whum=-999; String wc, city; } U;
-int pS=-99, pW=-99, pF=-99, pConn=-1, pAcc=-1, pNAcc=-1; bool pCodex=false; String pSR="\x01", pWR="\x01", pFL="\x01", pLBL="\x01", pDate="\x01";
+int pS=-99, pW=-99, pF=-99, pConn=-1, pAcc=-1, pNAcc=-1; bool pCodex=false, pNos=false; String pSR="\x01", pWR="\x01", pFL="\x01", pLBL="\x01", pDate="\x01";
 Acct& A(){ return AC[(accIdx < nAcc && accIdx < MAXACC) ? accIdx : 0]; }   // the account on screen
 
 // accCycle was appended AFTER usageUrl, so a 4.7 EEPROM image reads a stale byte there. MAGIC is
@@ -99,10 +100,17 @@ void drawMetric(int cx,const char* label,int pct,const GFXfont* f){
   else snprintf(b,sizeof b,"%d%%",pct);
   str(b,cx,UCY+43,f,lvl(haveData?pct:-1),MC_DATUM,C_PANEL);
 }
+// A Bold18 hero that keeps its '%' even at 100 ("100%"@18 = 88px). Only for a column at least
+// that wide: the two 112px columns of the WEEK | model card. drawMetric drops it for 74px ones.
+void drawPct(int cx,int pct){
+  char b[8]; if(haveData&&pct>=0)snprintf(b,sizeof b,"%d%%",pct); else strcpy(b,"--");
+  str(b,cx,UCY+43,&FreeSansBold18pt7b,lvl(haveData?pct:-1),MC_DATUM,C_PANEL);
+}
 void drawUpdateMark(){
-  // small cyan up-arrow in the card's top-right corner. That corner is deliberately empty in
-  // both layouts (the F column is centred at 195, its number sits at y=76), so this marker
-  // never collides with a metric no matter how wide the numbers get.
+  // small cyan up-arrow in the card's top-right corner (x 211..221). That corner is deliberately
+  // empty in every layout (the F column is centred at 195, its number sits at y=76; the WEEK |
+  // model card ends its label by x=208), so this marker never collides with a metric no matter
+  // how wide the numbers get.
   if(!updAvail) return;
   int x=UCX+UCW-16, y=UCY+8;
   tft.fillTriangle(x,y, x-5,y+7, x+5,y+7, C_CYAN);
@@ -111,9 +119,32 @@ void drawUpdateMark(){
 void drawUsageCard(){
   Acct& a=A();
   tft.fillRoundRect(UCX,UCY,UCW,UCH,10,C_PANEL);
-  if(a.codex&&a.s<0&&a.f<0){      // Codex plan with a weekly limit only (no 5h window, no model
-    // limit): ONE hero, not a classic card with a dead "SESSION --" column beside the number that
-    // matters. Same three rows as the other layouts, so cycling accounts does not jump around.
+  // An account with no session window at all: a Codex plan with a weekly limit only, or a verified
+  // Claude Ultra account (Anthropic dropped its 5h limit; the collector says so with nos=1).
+  bool noSess=a.nos||(a.codex&&a.s<0);
+  if(noSess&&a.f>=0){             // WEEK | model-scoped weekly (e.g. FABLE): two heroes, one shared
+    // 7d reset centred below, since both windows roll together. No dead "SESSION --" column.
+    tft.drawFastVLine(120,UCY+14,UCH-36,C_LINE);
+    str("WEEK",LCX,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
+    drawPct(LCX,a.w);
+    // The model name (up to 7 chars) is the one label here wide enough to reach the update
+    // marker: "SONNET"@9 = 74px centred on RCX would span 139..213. So the label ends by x=208
+    // and starts no further left than 124 (clear of the divider): it shifts left when it has to,
+    // and loses trailing characters only past 84px.
+    String fl=a.fl.length()?a.fl:String("MODEL");
+    tft.setFreeFont(&FreeSans9pt7b);
+    while(fl.length()>1&&tft.textWidth(fl)>84) fl.remove(fl.length()-1);
+    int lw=tft.textWidth(fl), lx=RCX-lw/2; if(lx+lw>208) lx=208-lw;
+    str(fl.c_str(),lx,UCY+15,&FreeSans9pt7b,C_GRAY,ML_DATUM,C_PANEL);
+    drawPct(RCX,a.f);
+    char r[32]; if(a.wr.length())snprintf(r,sizeof r,"resets %s",a.wr.c_str()); else strcpy(r,"--");
+    str(r,120,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
+    drawUpdateMark();
+    return;
+  }
+  if(noSess){                     // weekly limit only (no 5h window, no model limit): ONE hero, not
+    // a classic card with a dead "SESSION --" column beside the number that matters.
+    // Same three rows as the other layouts, so cycling accounts does not jump around.
     // Worst case "resets Dec 30 12:59pm"@Bold9 = 192px centred -> 24..216, clear of the card edge,
     // and a lone "100%"@18 = 88px fits, so this layout keeps its percent sign.
     str("WEEK",120,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
@@ -221,12 +252,12 @@ void header(){
 }
 void render(bool force){
   Acct& a=A();
-  bool cardChg=force||a.codex!=pCodex||a.auth!=pAuth||accIdx!=pAcc||updAvail!=pUpd||a.s!=pS||a.w!=pW||a.f!=pF||a.sr!=pSR||a.wr!=pWR||a.fl!=pFL;
+  bool cardChg=force||a.codex!=pCodex||a.nos!=pNos||a.auth!=pAuth||accIdx!=pAcc||updAvail!=pUpd||a.s!=pS||a.w!=pW||a.f!=pF||a.sr!=pSR||a.wr!=pWR||a.fl!=pFL;
   // nAcc matters on its own: dropping to one account must repaint the title and clear the dots
   bool hdrChg =force||accIdx!=pAcc||nAcc!=pNAcc||a.label!=pLBL||a.codex!=pCodex;
   bool dotChg =force||connOK!=pConn||a.auth!=pAuth;
   if(hdrChg){ header(); pLBL=a.label; pNAcc=nAcc; pCodex=a.codex; }
-  if(cardChg){ if(a.auth==2)drawUsageError(); else drawUsageCard(); pS=a.s;pW=a.w;pF=a.f;pSR=a.sr;pWR=a.wr;pFL=a.fl;pUpd=updAvail; }
+  if(cardChg){ if(a.auth==2)drawUsageError(); else drawUsageCard(); pS=a.s;pW=a.w;pF=a.f;pNos=a.nos;pSR=a.sr;pWR=a.wr;pFL=a.fl;pUpd=updAvail; }
   if(dotChg){ drawDot(); pConn=connOK; }
   pAuth=a.auth; pAcc=accIdx;
 }
@@ -265,7 +296,7 @@ void fetchUsage(){
           for(JsonObject o:ar){
             if(n>=MAXACC) break;
             Acct& t=AC[n];
-            t.s=o["s"]|0; t.w=o["w"]|0; t.f=o["f"]|-1;
+            t.s=o["s"]|0; t.w=o["w"]|0; t.f=o["f"]|-1; t.nos=(o["nos"]|0)==1;
             t.sr=String((const char*)(o["sr"]|"")); t.wr=String((const char*)(o["wr"]|""));
             t.fl=String((const char*)(o["fl"]|"")); t.label=String((const char*)(o["l"]|""));
             const char* oa=o["auth"]|"ok";
@@ -279,6 +310,7 @@ void fetchUsage(){
           Acct& t=AC[0];
           t.s=doc["s"]|0; t.w=doc["w"]|0; t.sr=String((const char*)(doc["sr"]|"")); t.wr=String((const char*)(doc["wr"]|""));
           t.f=doc["f"]|-1; t.fl=String((const char*)(doc["fl"]|""));   // model-scoped weekly (e.g. Fable); -1 = none
+          t.nos=(doc["nos"]|0)==1;
           t.label=""; t.auth=topAuth; t.codex=false; nAcc=1;
         }
         if(accIdx>=nAcc) accIdx=0;
@@ -299,11 +331,11 @@ void handleState(){
   JsonDocument d;
   Acct& a=A();
   d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["auth"]=a.auth; d["age"]=dataAge;
-  d["s"]=a.s; d["w"]=a.w; d["f"]=a.f; d["fl"]=a.fl; d["sr"]=a.sr; d["wr"]=a.wr;
+  d["s"]=a.s; d["w"]=a.w; d["f"]=a.f; d["fl"]=a.fl; d["sr"]=a.sr; d["wr"]=a.wr; d["nos"]=a.nos?1:0;
   d["nacc"]=nAcc; d["acci"]=accIdx; d["label"]=a.label; d["up"]=updAvail;
   JsonArray ar=d["acc"].to<JsonArray>();
   for(int i=0;i<nAcc&&i<MAXACC;i++){ JsonObject o=ar.add<JsonObject>();
-    o["l"]=AC[i].label; o["s"]=AC[i].s; o["w"]=AC[i].w; o["f"]=AC[i].f; o["auth"]=AC[i].auth; o["p"]=AC[i].codex?"x":"c"; }
+    o["l"]=AC[i].label; o["s"]=AC[i].s; o["w"]=AC[i].w; o["f"]=AC[i].f; o["auth"]=AC[i].auth; o["p"]=AC[i].codex?"x":"c"; o["nos"]=AC[i].nos?1:0; }
   d["city"]=U.city; d["wt"]=U.wt; d["wc"]=U.wc; d["time"]=hms;
   d["bri"]=S.bri; d["ne"]=S.nEn; d["ns"]=S.nStart; d["nf"]=S.nEnd; d["nb"]=S.nBri; d["rot"]=S.rot; d["refresh"]=S.refresh; d["acyc"]=S.accCycle;
   d["usage"]=S.usageUrl;

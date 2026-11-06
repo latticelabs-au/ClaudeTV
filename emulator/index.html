@@ -28,7 +28,8 @@ const FDIV=82,FSCX=45,FWCX=119,FFCX=195,FRSTX=157;
 let data={s:7,w:2,sr:"6:30pm",wr:"Jun 15 10am",haveData:true,city:"Melbourne",wc:"Overcast",
  wt:16,wfl:14,whi:16,wlo:13,wrain:100,whum:82,time:"13:48:50",date:"Sat 13 Jun",conn:1,auth:"ok",age:120,
  acc:[{l:"WORK",auth:"ok",s:74,w:30,sr:"6:29pm",wr:"Aug 27 10:59am",f:16,fl:"FABLE"},
-      {l:"PERSONAL",auth:"ok",s:1,w:76,sr:"8:49pm",wr:"Aug 31 9:59am",f:51,fl:"FABLE"}]};
+      {l:"PERSONAL",auth:"ok",s:1,w:76,sr:"8:49pm",wr:"Aug 31 9:59am",f:51,fl:"FABLE"},
+      {l:"ULTRA",auth:"ok",s:-1,nos:1,w:37,sr:"",wr:"Nov 9 10:59am",f:3,fl:"FABLE"}]};
 let mi=0,ai=0;
 // The card renders ONE account at a time and the display cycles through them (same turntable
 // the weather metrics use). acc[] is the multi-account payload; the flat keys are the
@@ -37,7 +38,7 @@ function nacc(){return (data.acc&&data.acc.length)?data.acc.length:1;}
 function A(){
  const a=(data.acc&&data.acc.length)?data.acc[ai%data.acc.length]:data;
  return {s:a.s,w:a.w,f:(a.f==null?-1:a.f),fl:a.fl||'',sr:a.sr||'',wr:a.wr||'',
-         auth:a.auth||data.auth||'ok',l:a.l||'',p:a.p||'c'};
+         auth:a.auth||data.auth||'ok',l:a.l||'',p:a.p||'c',nos:!!a.nos};
 }
 function stepAcct(){ai=(ai+1)%nacc();render();}
 function acclbl(){const e=document.getElementById('acclbl');if(e)e.textContent=(A().l||'single')+' ('+(ai%nacc()+1)+'/'+nacc()+')';}
@@ -68,9 +69,23 @@ function step(){mi=(mi+1)%6;document.getElementById('mi').textContent=mi;render(
 function usageCard(){
  rr(UCX,UCY,UCW,UCH,10,C.panel);
  const a=A();
- if(a.p=='x'&&a.s<0&&a.f<0) usageCard1(); else if(a.f>=0) usageCard3(); else usageCard2();
+ // no session window at all: Codex weekly-only, or a verified Claude Ultra account (nos=1)
+ const noSess=a.nos||(a.p=='x'&&a.s<0);
+ if(noSess&&a.f>=0) usageCardWF(); else if(noSess) usageCard1(); else if(a.f>=0) usageCard3(); else usageCard2();
 }
-function usageCard1(){   // Codex plan with a weekly limit only: one hero, no dead SESSION column (1:1 with firmware)
+function usageCardWF(){   // no session limit + a model-scoped weekly: WEEK | FABLE, one shared reset (1:1 with firmware)
+ const a=A(),w=data.haveData?a.w:-1,f=data.haveData?a.f:-1;
+ x.strokeStyle=C.line;x.lineWidth=1;x.beginPath();x.moveTo(120.5,UCY+14);x.lineTo(120.5,UCY+UCH-22);x.stroke();
+ // 112px columns, so a "100%" hero (88px) keeps its percent sign here
+ T("WEEK",LCX,UCY+18,F.s9,C.gray,'center'); T(w<0?"--":w+"%",LCX,UCY+47,F.b18,lvl(w),'center');
+ // the model label ends by x=208, clear of the device's update marker (211..221), and starts no
+ // further left than 124: it shifts left when it has to, and loses trailing chars only past 84px
+ let fl=a.fl||"MODEL"; while(fl.length>1&&mw(fl,F.s9)>84) fl=fl.slice(0,-1);
+ const lw=mw(fl,F.s9); T(fl,Math.min(RCX-Math.floor(lw/2),208-lw),UCY+18,F.s9,C.gray,'left');
+ T(f<0?"--":f+"%",RCX,UCY+47,F.b18,lvl(f),'center');
+ T(a.wr?("resets "+a.wr):"--",120,UCY+72,F.tiny,C.dim,'center');
+}
+function usageCard1(){   // weekly limit only (Codex, or Ultra with no model limit): one hero, no dead SESSION column (1:1 with firmware)
  const a=A(),p=data.haveData?a.w:-1;
  T("WEEK",120,UCY+18,F.s9,C.gray,'center');
  T(p<0?"--":p+"%",120,UCY+47,F.b18,lvl(p),'center');   // a lone 100% = 88px fits, so it keeps its %
@@ -150,7 +165,7 @@ const COLLECTOR=(new URLSearchParams(location.search)).get('c')||'http://10.0.0.
 function pull(){fetch(COLLECTOR+'/usage').then(r=>r.json()).then(s=>{const d=new Date();
  data=Object.assign(data,{s:s.s,w:s.w,f:(s.f==null?-1:s.f),fl:s.fl||'',sr:s.sr,wr:s.wr,haveData:!!s.ok,auth:s.auth||'ok',age:s.age,city:s.city,wc:s.wc,wt:s.wt,wfl:s.wfl,whi:s.whi,wlo:s.wlo,wrain:s.wrain,whum:s.whum,
   // acc[] is the multi-account array; fall back to a single synthetic account off the flat keys
-  acc:(s.acc&&s.acc.length)?s.acc:[{l:'',auth:s.auth||'ok',s:s.s,w:s.w,sr:s.sr,wr:s.wr,f:(s.f==null?-1:s.f),fl:s.fl||''}],
+  acc:(s.acc&&s.acc.length)?s.acc:[{l:'',auth:s.auth||'ok',s:s.s,w:s.w,sr:s.sr,wr:s.wr,f:(s.f==null?-1:s.f),fl:s.fl||'',nos:s.nos}],
   time:d.toTimeString().slice(0,8),date:d.toLocaleDateString('en-AU',{weekday:'short',day:'2-digit',month:'short'})});
  if(ai>=nacc())ai=0;
  document.getElementById('d').value=JSON.stringify(data,null,1);render();}).catch(e=>render())}

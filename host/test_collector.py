@@ -177,6 +177,160 @@ class TestManyAccounts(TzPinned):
         self.assertEqual(len({a["key"] for a in accts}), 5)
 
 
+# The row `cswap list --json` returned for a verified Ultra account on 2026-11-06: status ok,
+# no fiveHour key at all, a normal sevenDay and the Fable-scoped weekly.
+ULTRA_ROW = {
+    "number": 3, "email": "ultra@example.com", "alias": "ultra",
+    "active": True, "usageStatus": "ok", "usageAgeSeconds": 40.0,
+    "usage": {
+        "sevenDay": {"pct": 37.0, "resetsAt": "2026-11-08T23:59:59.916241+00:00"},
+        "scoped": [{"pct": 3.0, "name": "Fable", "resetsAt": "2026-11-08T23:59:59.916401+00:00"}],
+    },
+}
+
+
+def ultra_doc(**row):
+    d = doc()
+    r = json.loads(json.dumps(ULTRA_ROW)); r.update(row)
+    d["accounts"].append(r)
+    return d
+
+
+class TestUltraNoSessionLimit(TzPinned):
+    """Anthropic dropped the 5h limit for verified Ultra accounts (30 Oct 2026). Such an account
+    must read as a complete, live account with no session window: never stale, never a 0%
+    session, never a phantom session reset, and still judged on its weekly windows."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self._paths = (srv.NOTIFY_STATE_PATH, srv.RESET_LOG_PATH)
+        srv.NOTIFY_STATE_PATH = os.path.join(self.tmp.name, "notify_state.json")
+        srv.RESET_LOG_PATH = os.path.join(self.tmp.name, "resets.log")
+        srv._notify_state = None
+        srv._reset_log = None
+        self._notify_cfg = {k: srv.CONFIG.get(k) for k in
+                            ("NOTIFY_DISCORD_WEBHOOK", "NOTIFY_SLACK_WEBHOOK", "NOTIFY_EMAIL")}
+        for k in self._notify_cfg:
+            srv.CONFIG[k] = ""
+
+    def tearDown(self):
+        srv.NOTIFY_STATE_PATH, srv.RESET_LOG_PATH = self._paths
+        srv._notify_state = None
+        srv._reset_log = None
+        srv.CONFIG.update(self._notify_cfg)
+        self.tmp.cleanup()
+        super().tearDown()
+
+    def ultra(self, **row):
+        return srv.cswap_accounts_from_json(ultra_doc(**row))[2]
+
+    def test_maps_as_live_with_no_session_window(self):
+        u = self.ultra()
+        self.assertFalse(u["stale"])
+        self.assertEqual(u["auth"], "ok")
+        self.assertEqual(u["u"]["nos"], 1)
+        self.assertEqual(u["u"]["s"], -1)          # none, never an invented 0
+        self.assertEqual(u["u"]["sr"], "")
+        self.assertEqual(u["u"]["w"], 37)
+        self.assertEqual(u["u"]["f"], 3)
+        self.assertEqual(u["u"]["fl"], "FABLE")
+        self.assertEqual(u["u"]["wr"], "Nov 8 11:59pm")
+        self.assertIsNone(u["resets"]["session"])
+
+    def test_accounts_with_a_session_window_carry_no_flag(self):
+        work, personal, _ = srv.cswap_accounts_from_json(ultra_doc())
+        self.assertNotIn("nos", work["u"])
+        self.assertNotIn("nos", personal["u"])
+
+    def test_a_non_ok_ultra_row_is_stale_but_keeps_its_shape(self):
+        u = self.ultra(usageStatus="unavailable", usage=None,
+                       lastGoodUsage=ULTRA_ROW["usage"])
+        self.assertTrue(u["stale"])
+        self.assertEqual(u["u"]["nos"], 1)
+        self.assertEqual(u["u"]["w"], 37)
+        self.assertFalse(srv.notifiable(u))
+
+    def test_a_header_probe_reading_without_a_5h_window_stays_stale(self):
+        # cswap's header probe (source: headers) can omit a window the endpoint always reports.
+        # relevant_windows treats such a reading as incomplete, so it is NOT an Ultra account.
+        probe = {"sevenDay": {"pct": 20.0, "resetsAt": "2026-11-08T23:59:59+00:00"},
+                 "source": "headers"}
+        for usage in (probe, dict(probe, rejected={"retryAfterS": 600, "resetsAt": None})):
+            u = self.ultra(usage=usage)
+            self.assertTrue(u["stale"])
+            self.assertNotIn("nos", u["u"])
+            self.assertEqual(u["u"]["s"], -1)
+            self.assertEqual(u["u"]["w"], 20)
+            self.assertFalse(srv.notifiable(u))
+            policy = {"threshold": 90.0, "model": None}
+            st = srv.fleet_state([u], policy)
+            self.assertEqual((st["unknown"], st["headroom"]), (1, []))
+        # the same probe kept as cswap's last good reading of a non-ok row: still no flag
+        u = self.ultra(usageStatus="unavailable", usage=None, lastGoodUsage=probe)
+        self.assertTrue(u["stale"])
+        self.assertNotIn("nos", u["u"])
+
+    def test_a_complete_header_probe_reading_is_live(self):
+        u = self.ultra(usage={"fiveHour": {"pct": 4.0, "resetsAt": "2026-11-06T09:00:00+00:00"},
+                              "sevenDay": {"pct": 20.0, "resetsAt": "2026-11-08T23:59:59+00:00"},
+                              "source": "headers"})
+        self.assertFalse(u["stale"])
+        self.assertNotIn("nos", u["u"])
+        self.assertEqual((u["u"]["s"], u["u"]["w"]), (4, 20))
+        self.assertTrue(srv.notifiable(u))
+
+    def test_is_notifiable_on_its_week_alone(self):
+        self.assertTrue(srv.notifiable(self.ultra()))
+        # without the flag a missing session is still an incomplete Claude reading
+        self.assertFalse(srv.notifiable({"stale": False, "u": {"s": -1, "w": 19}}))
+
+    def test_week_reset_still_fires(self):
+        u = self.ultra()
+        srv.notify_check(u["u"], u["resets"], acct=u["key"], label=u["label"])
+        later = self.ultra(usage={"sevenDay": {"pct": 1.0, "resetsAt": "2026-11-15T23:59:59+00:00"},
+                                  "scoped": [{"pct": 0.0, "name": "Fable",
+                                              "resetsAt": "2026-11-15T23:59:59+00:00"}]})
+        srv.notify_check(later["u"], later["resets"], acct=later["key"], label=later["label"])
+        self.assertEqual([e["window"] for e in srv._load_reset_log()], ["week"])
+
+    def test_becoming_verified_is_not_a_session_reset_and_forgets_the_old_baseline(self):
+        key = "3:ultra@example.com"
+        srv.notify_check({"s": 90, "w": 30, "f": -1, "fl": ""},
+                         {"session": "2026-11-06T05:00:00+00:00",
+                          "week": "2026-11-08T23:59:59+00:00"}, acct=key)
+        u = self.ultra()
+        srv.notify_check(u["u"], u["resets"], acct=key, label=u["label"])
+        self.assertEqual(srv._load_reset_log(), [])
+        self.assertNotIn("session", srv._load_notify_state()[key])
+        # if Anthropic ever puts the window back, it baselines quietly instead of reading 90 -> 5
+        srv.notify_check({"s": 5, "w": 37, "f": -1, "fl": ""},
+                         {"session": "2026-11-20T05:00:00+00:00",
+                          "week": "2026-11-08T23:59:59+00:00"}, acct=key)
+        self.assertEqual(srv._load_reset_log(), [])
+
+    def test_fleet_judges_it_on_the_week(self):
+        policy = {"threshold": 90.0, "hysteresis": 5.0, "cooldown": 300.0,
+                  "strategy": "best", "model": None}
+        u = self.ultra()
+        self.assertEqual(srv.binding_pct(u, policy), 37)
+        st = srv.fleet_state([u], policy)
+        self.assertEqual(st["unknown"], 0)
+        self.assertEqual(st["headroom"], ["ULTRA"])
+        maxed = self.ultra(usage={"sevenDay": {"pct": 96.0, "resetsAt": "2026-11-08T23:59:59+00:00"}})
+        self.assertTrue(srv.fleet_state([maxed], policy)["exhausted"])
+
+    def test_wire_carries_the_flag_per_account_and_on_the_flat_keys(self):
+        accts = srv.cswap_accounts_from_json(ultra_doc())
+        w = srv.usage_wire(accts, {})
+        self.assertEqual(w["acc"][2]["nos"], 1)
+        self.assertNotIn("nos", w["acc"][0])
+        self.assertNotIn("nos", w)                 # lead account has a session window
+        pinned = srv.usage_wire(accts, {}, primary="ultra")
+        self.assertEqual(pinned["nos"], 1)
+        self.assertEqual(pinned["s"], -1)
+
+
 class TestUnavailableUsage(TzPinned):
     """cswap sets usage=None for EVERY non-ok status, and usage_to_json emits fiveHour /
     sevenDay / scoped only when present. Absent data must never become 0%: the notifier reads
@@ -213,11 +367,23 @@ class TestUnavailableUsage(TzPinned):
         self.assertTrue(rec["stale"])
         self.assertNotEqual(rec["u"]["w"], 0)
 
-    def test_missing_five_hour_inside_ok_is_stale(self):
+    def test_missing_five_hour_beside_a_week_is_an_ultra_account_not_stale(self):
+        # A verified Ultra account has no 5h limit, so cswap omits fiveHour (claude-swap #535).
         d = doc()
         d["accounts"] = [d["accounts"][1]]
         del d["accounts"][0]["usage"]["fiveHour"]
-        self.assertTrue(srv.cswap_accounts_from_json(d)[0]["stale"])
+        rec = srv.cswap_accounts_from_json(d)[0]
+        self.assertFalse(rec["stale"])
+        self.assertEqual(rec["u"]["nos"], 1)
+
+    def test_missing_both_windows_inside_ok_is_stale(self):
+        d = doc()
+        d["accounts"] = [d["accounts"][1]]
+        del d["accounts"][0]["usage"]["fiveHour"]
+        del d["accounts"][0]["usage"]["sevenDay"]
+        rec = srv.cswap_accounts_from_json(d)[0]
+        self.assertTrue(rec["stale"])
+        self.assertNotIn("nos", rec["u"])
 
     def test_complete_ok_usage_is_not_stale(self):
         self.assertFalse(self._one()["stale"])
@@ -475,6 +641,20 @@ class TestFleetAlerts(TzPinned):
         srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 97, 20)], self.POLICY)
         srv.fleet_check([self.acct("work", 99, 40),
                          self.acct("personal", -1, -1, stale=True)], self.POLICY)
+        self.assertEqual(self.sent, ["exhausted"])
+
+    def test_a_header_probe_row_without_a_5h_window_is_not_a_recovery(self):
+        """A header-probe reading missing its 5h window is incomplete to cswap, so its weekly
+        headroom must not sound the all-clear on a block that is still in force."""
+        d = doc()
+        d["accounts"] = [d["accounts"][0]]
+        d["accounts"][0]["usage"]["fiveHour"]["pct"] = 99.0
+        srv.fleet_check(srv.cswap_accounts_from_json(d), self.POLICY)
+        probe = json.loads(json.dumps(ULTRA_ROW))
+        probe["usage"] = {"sevenDay": {"pct": 20.0, "resetsAt": "2026-11-08T23:59:59+00:00"},
+                          "source": "headers", "rejected": {"retryAfterS": 600, "resetsAt": None}}
+        d["accounts"].append(probe)
+        srv.fleet_check(srv.cswap_accounts_from_json(d), self.POLICY)
         self.assertEqual(self.sent, ["exhausted"])
 
     def test_recovery_needs_an_account_with_actual_headroom(self):
