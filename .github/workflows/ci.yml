@@ -67,7 +67,7 @@ jobs:
             --warnings default --output-dir build firmware/claudetv
 
       - name: Upload firmware image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: claudetv-generic-bin
           path: build/claudetv.ino.bin
