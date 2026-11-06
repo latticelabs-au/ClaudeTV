@@ -100,10 +100,17 @@ void drawMetric(int cx,const char* label,int pct,const GFXfont* f){
   else snprintf(b,sizeof b,"%d%%",pct);
   str(b,cx,UCY+43,f,lvl(haveData?pct:-1),MC_DATUM,C_PANEL);
 }
+// A Bold18 hero that keeps its '%' even at 100 ("100%"@18 = 88px). Only for a column at least
+// that wide: the two 112px columns of the WEEK | model card. drawMetric drops it for 74px ones.
+void drawPct(int cx,int pct){
+  char b[8]; if(haveData&&pct>=0)snprintf(b,sizeof b,"%d%%",pct); else strcpy(b,"--");
+  str(b,cx,UCY+43,&FreeSansBold18pt7b,lvl(haveData?pct:-1),MC_DATUM,C_PANEL);
+}
 void drawUpdateMark(){
-  // small cyan up-arrow in the card's top-right corner. That corner is deliberately empty in
-  // both layouts (the F column is centred at 195, its number sits at y=76), so this marker
-  // never collides with a metric no matter how wide the numbers get.
+  // small cyan up-arrow in the card's top-right corner (x 211..221). That corner is deliberately
+  // empty in every layout (the F column is centred at 195, its number sits at y=76; the WEEK |
+  // model card ends its label by x=208), so this marker never collides with a metric no matter
+  // how wide the numbers get.
   if(!updAvail) return;
   int x=UCX+UCW-16, y=UCY+8;
   tft.fillTriangle(x,y, x-5,y+7, x+5,y+7, C_CYAN);
@@ -118,9 +125,18 @@ void drawUsageCard(){
   if(noSess&&a.f>=0){             // WEEK | model-scoped weekly (e.g. FABLE): two heroes, one shared
     // 7d reset centred below, since both windows roll together. No dead "SESSION --" column.
     tft.drawFastVLine(120,UCY+14,UCH-36,C_LINE);
-    drawMetric(LCX,"WEEK",a.w,&FreeSansBold18pt7b);
+    str("WEEK",LCX,UCY+15,&FreeSans9pt7b,C_GRAY,MC_DATUM,C_PANEL);
+    drawPct(LCX,a.w);
+    // The model name (up to 7 chars) is the one label here wide enough to reach the update
+    // marker: "SONNET"@9 = 74px centred on RCX would span 139..213. So the label ends by x=208
+    // and starts no further left than 124 (clear of the divider): it shifts left when it has to,
+    // and loses trailing characters only past 84px.
     String fl=a.fl.length()?a.fl:String("MODEL");
-    drawMetric(RCX,fl.c_str(),a.f,&FreeSansBold18pt7b);
+    tft.setFreeFont(&FreeSans9pt7b);
+    while(fl.length()>1&&tft.textWidth(fl)>84) fl.remove(fl.length()-1);
+    int lw=tft.textWidth(fl), lx=RCX-lw/2; if(lx+lw>208) lx=208-lw;
+    str(fl.c_str(),lx,UCY+15,&FreeSans9pt7b,C_GRAY,ML_DATUM,C_PANEL);
+    drawPct(RCX,a.f);
     char r[32]; if(a.wr.length())snprintf(r,sizeof r,"resets %s",a.wr.c_str()); else strcpy(r,"--");
     str(r,120,UCY+67,&FreeSansBold9pt7b,C_DIM,MC_DATUM,C_PANEL);
     drawUpdateMark();
@@ -315,7 +331,7 @@ void handleState(){
   JsonDocument d;
   Acct& a=A();
   d["ver"]=FW_VER; d["haveData"]=haveData; d["conn"]=connOK; d["auth"]=a.auth; d["age"]=dataAge;
-  d["s"]=a.s; d["w"]=a.w; d["f"]=a.f; d["fl"]=a.fl; d["sr"]=a.sr; d["wr"]=a.wr;
+  d["s"]=a.s; d["w"]=a.w; d["f"]=a.f; d["fl"]=a.fl; d["sr"]=a.sr; d["wr"]=a.wr; d["nos"]=a.nos?1:0;
   d["nacc"]=nAcc; d["acci"]=accIdx; d["label"]=a.label; d["up"]=updAvail;
   JsonArray ar=d["acc"].to<JsonArray>();
   for(int i=0;i<nAcc&&i<MAXACC;i++){ JsonObject o=ar.add<JsonObject>();

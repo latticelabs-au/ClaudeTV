@@ -251,6 +251,35 @@ class TestUltraNoSessionLimit(TzPinned):
         self.assertEqual(u["u"]["w"], 37)
         self.assertFalse(srv.notifiable(u))
 
+    def test_a_header_probe_reading_without_a_5h_window_stays_stale(self):
+        # cswap's header probe (source: headers) can omit a window the endpoint always reports.
+        # relevant_windows treats such a reading as incomplete, so it is NOT an Ultra account.
+        probe = {"sevenDay": {"pct": 20.0, "resetsAt": "2026-11-08T23:59:59+00:00"},
+                 "source": "headers"}
+        for usage in (probe, dict(probe, rejected={"retryAfterS": 600, "resetsAt": None})):
+            u = self.ultra(usage=usage)
+            self.assertTrue(u["stale"])
+            self.assertNotIn("nos", u["u"])
+            self.assertEqual(u["u"]["s"], -1)
+            self.assertEqual(u["u"]["w"], 20)
+            self.assertFalse(srv.notifiable(u))
+            policy = {"threshold": 90.0, "model": None}
+            st = srv.fleet_state([u], policy)
+            self.assertEqual((st["unknown"], st["headroom"]), (1, []))
+        # the same probe kept as cswap's last good reading of a non-ok row: still no flag
+        u = self.ultra(usageStatus="unavailable", usage=None, lastGoodUsage=probe)
+        self.assertTrue(u["stale"])
+        self.assertNotIn("nos", u["u"])
+
+    def test_a_complete_header_probe_reading_is_live(self):
+        u = self.ultra(usage={"fiveHour": {"pct": 4.0, "resetsAt": "2026-11-06T09:00:00+00:00"},
+                              "sevenDay": {"pct": 20.0, "resetsAt": "2026-11-08T23:59:59+00:00"},
+                              "source": "headers"})
+        self.assertFalse(u["stale"])
+        self.assertNotIn("nos", u["u"])
+        self.assertEqual((u["u"]["s"], u["u"]["w"]), (4, 20))
+        self.assertTrue(srv.notifiable(u))
+
     def test_is_notifiable_on_its_week_alone(self):
         self.assertTrue(srv.notifiable(self.ultra()))
         # without the flag a missing session is still an incomplete Claude reading
@@ -612,6 +641,20 @@ class TestFleetAlerts(TzPinned):
         srv.fleet_check([self.acct("work", 99, 40), self.acct("personal", 97, 20)], self.POLICY)
         srv.fleet_check([self.acct("work", 99, 40),
                          self.acct("personal", -1, -1, stale=True)], self.POLICY)
+        self.assertEqual(self.sent, ["exhausted"])
+
+    def test_a_header_probe_row_without_a_5h_window_is_not_a_recovery(self):
+        """A header-probe reading missing its 5h window is incomplete to cswap, so its weekly
+        headroom must not sound the all-clear on a block that is still in force."""
+        d = doc()
+        d["accounts"] = [d["accounts"][0]]
+        d["accounts"][0]["usage"]["fiveHour"]["pct"] = 99.0
+        srv.fleet_check(srv.cswap_accounts_from_json(d), self.POLICY)
+        probe = json.loads(json.dumps(ULTRA_ROW))
+        probe["usage"] = {"sevenDay": {"pct": 20.0, "resetsAt": "2026-11-08T23:59:59+00:00"},
+                          "source": "headers", "rejected": {"retryAfterS": 600, "resetsAt": None}}
+        d["accounts"].append(probe)
+        srv.fleet_check(srv.cswap_accounts_from_json(d), self.POLICY)
         self.assertEqual(self.sent, ["exhausted"])
 
     def test_recovery_needs_an_account_with_actual_headroom(self):

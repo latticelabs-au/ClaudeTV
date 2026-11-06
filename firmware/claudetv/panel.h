@@ -46,11 +46,14 @@ function load(){fetch('/state').then(r=>r.json()).then(s=>{ver.textContent='v'+s
 acclbl.textContent=s.label||'';accn.textContent=(s.nacc>1)?((s.acci+1)+'/'+s.nacc):'';
 acccard.style.display=(s.nacc>1)?'':'none';acyc.value=s.acyc;
 updcard.style.display=s.up?'':'none';
+// pc is declared before the account list uses it: a const read before its line throws, which
+// the .catch below swallowed, so no field after the list was ever filled in
+const pc=v=>(v==null||v<0)?'--':v+'%';   // -1 = no reading; never render '-1%'
 acclist.innerHTML=(s.acc||[]).map((a,i)=>'<div class=row style=margin:2px:0><span>'+((i==s.acci)?'&#9679; ':'&#9675; ')
  +(a.p=='x'?'<span style=color:#a98bff>':'<span>')+(a.l||('acct'+(i+1)))+'</span>'+(a.p=='x'?' <span class=muted>codex</span>':'')+(a.auth==2?' <span style=color:#ff4d68>expired</span>':'')+'</span><span>'
- +pc(a.s)+' &middot; '+pc(a.w)+(a.f>=0?(' &middot; '+pc(a.f)):'')+'</span></div>').join('');
-const pc=v=>(v==null||v<0)?'--':v+'%';   // -1 = no reading; never render '-1%'
-sess.textContent=s.haveData?pc(s.s):'--';sessr.textContent=s.sr?('resets '+s.sr):'idle';
+ +(a.nos?'no 5h':pc(a.s))+' &middot; '+pc(a.w)+(a.f>=0?(' &middot; '+pc(a.f)):'')+'</span></div>').join('');
+// nos: the account has no session limit at all (a verified Ultra plan), so say so instead of "idle"
+sess.textContent=s.nos?'none':(s.haveData?pc(s.s):'--');sessr.textContent=s.nos?'no 5h limit on this account':(s.sr?('resets '+s.sr):'idle');
 week.textContent=s.haveData?pc(s.w):'--';weekr.textContent=s.wr?('resets '+s.wr):'';
 if(s.f>=0){fablerow.style.display='';fablelbl.textContent=(s.fl||'Fable')+' (7d)';fable.textContent=s.haveData?pc(s.f):'--';}else fablerow.style.display='none';
 wx.textContent=s.city+' '+s.wt+'°C '+s.wc;clock.textContent=s.time;

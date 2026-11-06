@@ -308,16 +308,25 @@ omits `fiveHour`. From v5.3 ClaudeTV reads that as **an account with no session 
 partial reading:
 
 - **Display:** the card shows **WEEK | FABLE** with one shared reset line (or a single WEEK hero
-  when there is no model limit). The master terminal shows *no 5h limit* in place of `S`.
+  when there is no model limit). The master terminal shows *no 5h limit* in place of `S`, and the
+  device's own web panel shows the session as `none`.
 - **Alerts:** weekly resets still alert as before; there is no session window to alert on. If the
   5‑hour window ever comes back, it starts fresh rather than being compared with an old reading.
 - **Fleet:** "every account is out of quota" judges the account on its weekly window, the same
   way cswap's auto‑switch does.
 - **Wire:** the account carries `"nos": 1` (no session) with `s: -1`. A v5.2 device keeps working
-  against a v5.3 collector and shows `SESSION --` for that account; flash v5.3 for the new card.
+  against a v5.3 collector: it ignores `nos` and keeps the session column for that account, drawn
+  as `--` with `idle` under it. Flash v5.3 for the new card.
 
-Before v5.3 a verified Ultra account was treated as a stale reading: its numbers froze, it never
-alerted, and it held back the fleet verdict. Updating the collector fixes all three.
+Only a reading from the usage endpoint counts. When cswap read an account through its rate‑limit
+header probe (`"source": "headers"` in `cswap list --json`), a missing `fiveHour` only means the
+headers did not carry that window, and cswap treats the reading as incomplete; so does ClaudeTV,
+which keeps it stale. An account that reports a 5‑hour window but no weekly one (claude‑swap names
+Team and Enterprise seats) is also still stale, as before.
+
+Before v5.3 the collector treated a verified Ultra account as a partial reading. Its numbers kept
+updating, but the master terminal tagged it stale, it never sent a reset alert, and it counted as
+unknown, which held back the fleet verdict. Updating the collector fixes all three.
 
 ---
 
@@ -327,7 +336,8 @@ alerted, and it held back the fleet verdict. Updating the collector fixes all th
   green/amber/red by level. Week and the scoped limit share one reset line (same 7‑day window);
   accounts without a scoped limit automatically get the classic two‑column card.
 - **Ultra accounts (no 5‑hour limit)**: a verified Ultra account shows **WEEK | FABLE** with one
-  reset line, or WEEK alone, instead of a dead `SESSION --` column. See below.
+  reset line, or WEEK alone, instead of a dead session column. See
+  [Ultra accounts](#ultra-accounts-no-5-hour-limit) above.
 - **Reset alerts** — get pinged by **email, Discord, and Slack** the moment a usage window
   (5‑hour session and/or 7‑day week) rolls over to a fresh quota — the reset Anthropic only posts
   on X. Configure it in the master terminal's Notifications card; secrets are write‑only and each

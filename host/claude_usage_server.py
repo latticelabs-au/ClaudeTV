@@ -260,13 +260,18 @@ def cswap_accounts_from_json(doc, only=""):
         fh, sd = usage.get("fiveHour"), usage.get("sevenDay")
         # A verified Ultra account has NO five-hour limit: the usage API answers five_hour: null
         # beside a normal seven_day, and cswap omits fiveHour for it (claude-swap PR #535 makes
-        # that a stated contract). So a weekly window with no 5h window is a complete reading of
-        # an account without a session limit, not a partial poll.
-        no_session = isinstance(sd, dict) and not isinstance(fh, dict)
+        # that a stated contract). So a weekly window with no 5h window, read from the usage
+        # endpoint, is a complete reading of an account without a session limit. A header-probe
+        # reading (source "headers") is different: the headers can omit a window the account
+        # has, and cswap's relevant_windows treats such a reading as incomplete, so it stays stale.
+        no_session = (isinstance(sd, dict) and not isinstance(fh, dict)
+                      and usage.get("source") != "headers")
         # usage_to_json emits fiveHour/sevenDay/scoped ONLY when present, so an ok row can still
-        # be partial. A missing WEEK is treated as stale: coercing an absent window to 0% is exactly
-        # what made a routine `cswap` account switch look like a 100%-to-0% Anthropic "gift" reset.
-        if not isinstance(sd, dict): stale = True
+        # be partial. Treat that as stale too: coercing an absent window to 0% is exactly what
+        # made a routine `cswap` account switch look like a 100%-to-0% Anthropic "gift" reset.
+        # That covers a missing WEEK (claude-swap names Team/Enterprise seats, which report no
+        # seven_day) and a missing 5h window on anything but the Ultra shape above.
+        if not isinstance(sd, dict) or not (isinstance(fh, dict) or no_session): stale = True
         fh, sd = fh if isinstance(fh, dict) else {}, sd or {}
         scoped = next((x for x in (usage.get("scoped") or []) if _pct(x) is not None), None)
         s_pct, w_pct = _pct(fh), _pct(sd)
@@ -276,7 +281,8 @@ def cswap_accounts_from_json(doc, only=""):
              "f": _pct(scoped) if scoped else -1,
              "fl": (scoped.get("name") or "").strip().upper()[:7] if scoped else ""}
         # nos=1: this account has no session limit at all, so s=-1 means "none", not "unknown".
-        # Older firmware ignores the key and shows "--" for the session, which is still honest.
+        # Firmware before 5.3 ignores the key and keeps a session column for this account,
+        # labelled "S" when there is a model limit and "SESSION" otherwise: "--" over "idle".
         if no_session: u["nos"] = 1
         if fh.get("resetsAt"): u["sr"] = _clock(_parse(fh["resetsAt"]))
         if sd.get("resetsAt"):
