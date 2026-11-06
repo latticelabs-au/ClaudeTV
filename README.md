@@ -266,8 +266,9 @@ a blank name puts the default back, and a rename never touches reset history or 
 **Good to know:**
 
 - OpenAI decides which limits a plan has. Some plans currently report only a weekly limit. Those
-  accounts get a single-number **WEEK** card instead of a dead `SESSION --` column. If your plan
-  has a 5-hour limit too, you get the usual two columns.
+  accounts get a **WEEK** card instead of a dead session column: a single number, or
+  **WEEK | MODEL** with one shared reset line when `CLAUDETV_CODEX_SCOPED` picks a model limit.
+  If your plan has a 5-hour limit too, you get the usual columns.
 - **Several Codex accounts** work the same way as several Claude accounts: one folder each, they
   cycle after the Claude ones in folder order, each with its own reset history and alerts, up to
   8 accounts in total on the screen. To pin a second device to one of them use its key, which
@@ -290,7 +291,7 @@ a blank name puts the default back, and a rename never touches reset history or 
 | `CLAUDETV_CODEX_ACCOUNTS` | all | comma list of folder names that filters and orders (`default` is `~/.codex`) |
 | `CLAUDETV_CODEX_EVERY` | `300` | seconds between polls, 300 minimum |
 | `CLAUDETV_CODEX_TIMEOUT` | `20` | hard deadline for one read |
-| `CLAUDETV_CODEX_SCOPED` | off | part of a model limit's name to show as the third number (for example `spark`) |
+| `CLAUDETV_CODEX_SCOPED` | off | part of a model limit's name to show as an extra number (for example `spark`): the third on a plan with a 5-hour limit, the second on a weekly-only plan |
 | `CLAUDETV_CODEX_MAXED_THRESHOLD` | `100` | percent at which an account counts as out |
 | `CLAUDETV_CODEX_LABELS` | none | display names set from the terminal, `folder=Name` pairs (`default=Astra,work=Team`) |
 
@@ -310,7 +311,7 @@ partial reading:
 - **Display:** the card shows **WEEK | FABLE** with one shared reset line (or a single WEEK hero
   when there is no model limit). The master terminal shows *no 5h limit* in place of `S`, and the
   device's own web panel shows the session as `none`.
-- **Alerts:** weekly resets still alert as before; there is no session window to alert on. If the
+- **Alerts:** weekly resets alert (before v5.3 this account sent none); there is no session window to alert on. If the
   5‑hour window ever comes back, it starts fresh rather than being compared with an old reading.
 - **Fleet:** "every account is out of quota" judges the account on its weekly window, the same
   way cswap's auto‑switch does.
