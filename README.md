@@ -10,6 +10,9 @@ week %, **and your model‑scoped weekly limit (e.g. Fable)** from Claude Code's
 reset times, plus a weather turntable and a clock. Optional **email / Discord / Slack alerts**
 when a usage window resets.
 
+On **Ultra**? Anthropic dropped the 5‑hour limit for verified Ultra accounts on 30 Oct 2026, so
+an account without a session limit shows just its weekly numbers: see [Ultra accounts](#ultra-accounts-no-5-hour-limit).
+
 Got **more than one Claude account**? The display cycles through all of them, each with its own
 card and label: see [Multiple accounts](#multiple-accounts). Use **OpenAI Codex** as well? Its
 usage cycles on the same screen: see [Codex accounts](#codex-accounts).
@@ -67,7 +70,7 @@ Grab the prebuilt image from the [latest release](https://github.com/latticelabs
 and flash it over the clock's stock web updater (find its IP on your router):
 
 ```bash
-curl -F "firmware=@claudetv-v5.2.1-generic.bin" http://<device-ip>/update
+curl -F "firmware=@claudetv-v5.3.0-generic.bin" http://<device-ip>/update
 ```
 
 On first boot the device opens a **`ClaudeTV-Setup`** WiFi hotspot. Join it, pick your WiFi, and
@@ -293,11 +296,38 @@ a blank name puts the default back, and a rename never touches reset history or 
 
 ---
 
+## Ultra accounts (no 5-hour limit)
+
+On 30 Oct 2026 Anthropic renamed Max 20x to **Ultra** and removed the 5‑hour session limit for
+**verified** Ultra accounts ([what is the Ultra plan?](https://support.claude.com/en/articles/17728952-what-is-the-ultra-plan)).
+Anthropic verifies accounts automatically; newer ones keep the 5‑hour limit until it does. The
+weekly limit and the model‑scoped weekly (Fable) still apply.
+
+For such an account the usage API reports no `five_hour` window, and `cswap list --json` simply
+omits `fiveHour`. From v5.3 ClaudeTV reads that as **an account with no session limit**, not as a
+partial reading:
+
+- **Display:** the card shows **WEEK | FABLE** with one shared reset line (or a single WEEK hero
+  when there is no model limit). The master terminal shows *no 5h limit* in place of `S`.
+- **Alerts:** weekly resets still alert as before; there is no session window to alert on. If the
+  5‑hour window ever comes back, it starts fresh rather than being compared with an old reading.
+- **Fleet:** "every account is out of quota" judges the account on its weekly window, the same
+  way cswap's auto‑switch does.
+- **Wire:** the account carries `"nos": 1` (no session) with `s: -1`. A v5.2 device keeps working
+  against a v5.3 collector and shows `SESSION --` for that account; flash v5.3 for the new card.
+
+Before v5.3 a verified Ultra account was treated as a stale reading: its numbers froze, it never
+alerted, and it held back the fleet verdict. Updating the collector fixes all three.
+
+---
+
 ## Features
 
 - **Three hero numbers** — S (5h session) | W (7d week) + F (model‑scoped weekly, e.g. **Fable**),
   green/amber/red by level. Week and the scoped limit share one reset line (same 7‑day window);
   accounts without a scoped limit automatically get the classic two‑column card.
+- **Ultra accounts (no 5‑hour limit)**: a verified Ultra account shows **WEEK | FABLE** with one
+  reset line, or WEEK alone, instead of a dead `SESSION --` column. See below.
 - **Reset alerts** — get pinged by **email, Discord, and Slack** the moment a usage window
   (5‑hour session and/or 7‑day week) rolls over to a fresh quota — the reset Anthropic only posts
   on X. Configure it in the master terminal's Notifications card; secrets are write‑only and each

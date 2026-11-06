@@ -1,0 +1,29 @@
+version: 2
+
+# Weekly on Monday, matching the org's Monday freshness cadence.
+#
+# The collector is stdlib-only and the firmware pins its Arduino core and
+# libraries in ci.yml, so the only thing Dependabot can keep fresh is the set of
+# workflow actions. Minor and patch updates are grouped into one pull request;
+# major updates stay separate, since each is a behaviour change that deserves
+# its own CI run and its own decision.
+
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Australia/Melbourne
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

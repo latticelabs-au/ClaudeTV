@@ -258,11 +258,16 @@ def cswap_accounts_from_json(doc, only=""):
         stale = not isinstance(usage, dict)
         if stale: usage = a.get("lastGoodUsage") or {}
         fh, sd = usage.get("fiveHour"), usage.get("sevenDay")
+        # A verified Ultra account has NO five-hour limit: the usage API answers five_hour: null
+        # beside a normal seven_day, and cswap omits fiveHour for it (claude-swap PR #535 makes
+        # that a stated contract). So a weekly window with no 5h window is a complete reading of
+        # an account without a session limit, not a partial poll.
+        no_session = isinstance(sd, dict) and not isinstance(fh, dict)
         # usage_to_json emits fiveHour/sevenDay/scoped ONLY when present, so an ok row can still
-        # be partial. Treat that as stale too: coercing an absent window to 0% is exactly what
-        # made a routine `cswap` account switch look like a 100%-to-0% Anthropic "gift" reset.
-        if not isinstance(fh, dict) or not isinstance(sd, dict): stale = True
-        fh, sd = fh or {}, sd or {}
+        # be partial. A missing WEEK is treated as stale: coercing an absent window to 0% is exactly
+        # what made a routine `cswap` account switch look like a 100%-to-0% Anthropic "gift" reset.
+        if not isinstance(sd, dict): stale = True
+        fh, sd = fh if isinstance(fh, dict) else {}, sd or {}
         scoped = next((x for x in (usage.get("scoped") or []) if _pct(x) is not None), None)
         s_pct, w_pct = _pct(fh), _pct(sd)
         # -1 means "not known", never 0. Nothing downstream may invent a number it was not given.
@@ -270,6 +275,9 @@ def cswap_accounts_from_json(doc, only=""):
              "w": w_pct if w_pct is not None else -1, "sr": "", "wr": "",
              "f": _pct(scoped) if scoped else -1,
              "fl": (scoped.get("name") or "").strip().upper()[:7] if scoped else ""}
+        # nos=1: this account has no session limit at all, so s=-1 means "none", not "unknown".
+        # Older firmware ignores the key and shows "--" for the session, which is still honest.
+        if no_session: u["nos"] = 1
         if fh.get("resetsAt"): u["sr"] = _clock(_parse(fh["resetsAt"]))
         if sd.get("resetsAt"):
             d = _parse(sd["resetsAt"]); u["wr"] = "%s %d %s" % (d.strftime("%b"), d.day, _clock_short(d))
@@ -462,7 +470,9 @@ def notifiable(rec):
     # Codex may legitimately report a single window (weekly only, when OpenAI drops the short
     # limit). notify_check treats windows independently and skips negatives, so one is enough.
     if rec.get("provider") == "codex": return u["s"] >= 0 or u["w"] >= 0
-    return u["s"] >= 0 and u["w"] >= 0
+    # A Claude account needs both windows, unless it has no session limit at all (verified
+    # Ultra): then the week is the whole reading.
+    return u["w"] >= 0 and (u["s"] >= 0 or bool(u.get("nos")))
 
 def notify_key(rec):
     """Namespace for a account's reset state: the STABLE identity, never the display label.
@@ -1378,6 +1388,12 @@ def notify_check(u, resets, acct="", label="", provider="claude"):
         root = _load_notify_state()
         st = root.setdefault(acct, {}); changed = False; now = _now_utc()
         for kind, keys in (("session", ("s",)), ("week", ("w", "f"))):
+            if kind == "session" and u.get("nos"):
+                # The account has no session limit (verified Ultra). Forget any 5h baseline from
+                # before it was verified: if the window ever comes back, comparing it with a
+                # reading weeks old would fire a reset that never happened. First sight again.
+                if "session" in st: del st["session"]; changed = True
+                continue
             ra_iso = resets.get(kind)
             prev = st.get(kind) if isinstance(st.get(kind), dict) else {}   # migrate old formats
             cur = dict(prev); prev_ra = _iso_dt(prev.get("ra"))
@@ -1757,9 +1773,9 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
       +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?'LOGIN EXPIRED':'ok')+'</span></div>'
     +'<div class=row style="margin:2px 0"><span class=muted>'+esc(a.email||'')+'</span>'
       +'<span>'+(a.stale?'<span style=color:#f0ad36>stale </span>':'')
-        +((a.provider=='codex'&&a.s<0)?'':('S <b>'+pc(a.s)+'</b> · '))+'W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
+        +((a.provider=='codex'&&a.s<0)?'':a.nos?'<span class=muted>no 5h limit</span> · ':('S <b>'+pc(a.s)+'</b> · '))+'W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
     +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+esc(a.home)+' codex login --device-auth</code></div>'):'')
-    +'<div class=row style=margin:0><span class=muted>'+((a.provider=='codex'&&a.s<0)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):'idle')+(a.wr?(' · '+esc(a.wr)):'')))
+    +'<div class=row style=margin:0><span class=muted>'+(((a.provider=='codex'&&a.s<0)||a.nos)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):'idle')+(a.wr?(' · '+esc(a.wr)):'')))
       +'</span><span class=muted>'+esc(a.err||(a.age?a.age+'s':''))+'</span></div>'
     +((a.buckets||[]).length>1?('<div class=muted style="margin-top:2px">'+a.buckets.map(b=>esc(b.name||b.id)+': '
       +b.windows.map(w=>pc(w.pct)+'/'+(w.mins>=1440?Math.round(w.mins/1440)+'d':(w.mins?Math.round(w.mins/60)+'h':'?'))).join(' ')).join(' | ')+'</div>'):'')
