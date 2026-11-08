@@ -552,12 +552,11 @@ TOKEN_FLOOR = 120                  # seconds: TOKEN_EVERY below this is raised t
 TOKEN_FORCE_GAP = 60               # "Re-read accounts" re-probes a seat at most once a minute
 TOKEN_TIMEOUT = 15                 # one probe; all due seats run concurrently under this
 _UNIFIED = "anthropic-ratelimit-unified-"
-_tok = {}                          # seat -> {"at": last probe, "read": last reading, "good": last complete}
+TOKEN_HOLD = 3600                  # seconds a failed probe may keep showing the last complete reading
+TOKEN_REJECTS = 2                  # rejections in a row before a token is dead (a blip is not a verdict)
+_tok = {}                          # seat -> {"at": last probe, "read": last reading, "good": last complete,
+                                   #          "rejects": rejections in a row}
 _probe_model = {}                  # TOKEN_MODEL -> the model that replaced it after it answered 404
-# Which cswap account each seat last read: {seat name: record key}. Host state beside .env, so a
-# seat follows its account through a rename even across a restart. Names and keys only.
-TOKEN_BIND_PATH = os.path.join(os.path.dirname(ENV_PATH), "token_seats.json")
-_tok_bind = None
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """urllib re-sends a request to wherever a 3xx points, Authorization header included. A token
@@ -751,6 +750,11 @@ def token_refresh(seats, now, force=False, prober=None, lister=None, no_session=
     for name, _ in due:
         st = _tok[name]
         r = res.get(name) or _token_unread("timeout")
+        # One rejection is not a verdict: a passing authentication fault at Anthropic answers every
+        # seat 401 once, and would flip them all to LOGIN EXPIRED and alert, then recover a probe
+        # later. Until TOKEN_REJECTS come in a row the seat is unread (stale, err token_rejected).
+        st["rejects"] = st.get("rejects", 0) + 1 if r["auth"] == "dead" else 0
+        if r["auth"] == "dead" and st["rejects"] < TOKEN_REJECTS: r["auth"] = "ok"
         if r["err"] != ((st.get("read") or {}).get("err")):
             print("[%s] token seat %s: %s" % (time.strftime("%H:%M:%S"), name, r["err"] or "reading"))
         r["at"] = st["at"] = now
@@ -760,12 +764,21 @@ def token_refresh(seats, now, force=False, prober=None, lister=None, no_session=
 
 def token_view(name, path, now):
     """The fields a seat's token supplies to its record. A failed probe keeps SHOWING the last
-    complete reading, as cswap's lastGoodUsage does, with `stale` set so the notifier and the
-    fleet never mistake remembered numbers for a fresh reading."""
+    complete reading, with `stale` set so the notifier and the fleet never mistake remembered
+    numbers for a fresh reading. The device gets no per-account stale flag, so there a held
+    reading looks live: it is held for TOKEN_HOLD at most, and a window whose reset time has
+    passed is dropped from it at once, because that window is over and its number no longer the
+    account's. A dropped window reads -1 (unknown), never 0."""
     st = _tok.get(name) or {}
     r, good = st.get("read") or _token_unread("pending"), st.get("good")
-    shown = good if (r["stale"] and good) else r
-    return {"u": dict(shown["u"]), "resets": dict(shown["resets"]), "stale": r["stale"],
+    held = bool(r["stale"] and good and now - good["good_at"] <= TOKEN_HOLD)
+    shown = good if held else r
+    u, resets = dict(shown["u"]), dict(shown["resets"])
+    if held and resets["session"] and _parse(resets["session"]).timestamp() <= now:
+        u.update(s=-1, sr=""); resets["session"] = None
+    if held and resets["week"] and _parse(resets["week"]).timestamp() <= now:
+        u.update(w=-1, wr="", f=-1, fl=""); resets["week"] = None       # Fable rides on the week
+    return {"u": u, "resets": resets, "stale": r["stale"],
             "auth": r["auth"], "err": r["err"], "blocked": r["blocked"], "via": "token",
             "token_file": path, "good_at": good["good_at"] if good else None,
             "age": int(now - good["good_at"]) if good else 0}
@@ -775,56 +788,25 @@ def _match_keys(rec):
     return {str(rec.get("key", "")).split(":", 1)[0], (rec.get("alias") or "").lower(),
             (rec.get("email") or "").lower(), rec["label"].lower()} - {""}
 
-def _load_bind():
-    global _tok_bind
-    if _tok_bind is None:
-        try:
-            with open(TOKEN_BIND_PATH, encoding="utf-8") as f: d = json.load(f)
-            _tok_bind = {str(k): str(v) for k, v in d.items()} if isinstance(d, dict) else {}
-        except Exception: _tok_bind = {}
-    return _tok_bind
-
-def _save_bind(bind):
-    """Atomically (tmp+rename): a torn file would forget every seat's account at the next start."""
-    global _tok_bind
-    _tok_bind, tmp = bind, None
-    try:
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(TOKEN_BIND_PATH) or ".")
-        with os.fdopen(fd, "w", encoding="utf-8") as f: json.dump(bind, f, sort_keys=True)
-        os.replace(tmp, TOKEN_BIND_PATH); tmp = None
-    except Exception as e: print("[token] seat memory not saved: %s" % str(e)[:80])
-    finally:
-        if tmp:
-            try: os.unlink(tmp)
-            except OSError: pass
-
 def _token_matches(seats, recs):
-    """{seat: index of the cswap record it reads}. A seat's name picks its account (slot, alias,
-    email or label). A name that answers to no account any more, because the account was renamed
-    (`cswap alias`, or rename in the terminal), stays on the account it read last. Otherwise a
-    rename would drop the seat back to cswap's view of a lapsed login (LOGIN EXPIRED and a relogin
-    alert) beside a duplicate token-only seat. The memory is on disk, so a restart keeps it."""
-    bind = _load_bind()
+    """{seat: index of the cswap record it reads}: the account its name answers to NOW (slot,
+    alias, email or label). A name that answers to no account is a seat of its own. Nothing is
+    remembered across a rename: ClaudeTV cannot tell whose token it is, so following a renamed
+    account would keep another person's numbers on it whenever the line named the wrong account
+    (the issue's TEAM5, set as team5= and then renamed away), with its dead login hidden. An email
+    or a slot never changes in a rename, so a seat named by one follows its account anyway."""
     claude = [j for j, r in enumerate(recs) if r.get("provider", "claude") == "claude"]
     at, taken = {}, set()
-    def take(name, hit):
-        i = next((j for j in claude if j not in taken and hit(recs[j])), None)
+    for name, _ in seats:
+        i = next((j for j in claude if j not in taken and name in _match_keys(recs[j])), None)
         if i is not None: at[name] = i; taken.add(i)
-    for name, _ in seats:
-        take(name, lambda r: name in _match_keys(r))
-    for name, _ in seats:
-        if name not in at and bind.get(name): take(name, lambda r: r.get("key") == bind[name])
-    names = {name for name, _ in seats}
-    keep = {n: k for n, k in bind.items() if n in names}
-    keep.update({name: recs[i]["key"] for name, i in at.items()})
-    if keep != bind: _save_bind(keep)
     return at
 
 def apply_token_seats(recs, now, force=False, prober=None, lister=None):
     """Overlay every configured setup-token seat onto the cswap records.
 
-    A seat that names a cswap account (or named it before a rename, see _token_matches) takes
-    over that account's reading and auth, because the token is the account's working credential.
+    A seat that names a cswap account (see _token_matches) takes over that account's reading and
+    auth, because the token is the account's working credential.
     cswap's own view is kept beside it, its login verdict as `login` and its reading as `cs`,
     because the fleet verdict is cswap's alone (fleet_state): a token cannot make cswap able to
     switch onto the account. An account cswap read as having no 5h limit keeps that reading
@@ -855,12 +837,12 @@ def apply_token_seats(recs, now, force=False, prober=None, lister=None):
 def _wire_u(rec):
     """An account's numbers as the device gets them. Firmware and the emulator draw "idle" under
     the session column whenever `sr` is empty, which says the 5h window is empty. That is true only
-    of a session that was READ: one nobody could read (s=-1: a seat not read yet, an unreadable
-    token, an unavailable account) gets "--" there instead, on every firmware already in the
-    field. No 5h limit (nos) and Codex's weekly-only accounts have their own card and keep ""."""
+    of a session that was READ: a token seat's session nobody could read (s=-1: not read yet, an
+    unreadable token, a failed probe past its hold) gets "--" there instead, on every firmware
+    already in the field. Only token seats: every other account is sent exactly as before, and a
+    token seat with no 5h limit (nos) has its own card and keeps ""."""
     u = rec["u"]
-    if (rec.get("provider") != "codex" and u.get("s", -1) < 0 and not u.get("nos")
-            and not u.get("sr")):
+    if rec.get("via") == "token" and u.get("s", -1) < 0 and not u.get("nos") and not u.get("sr"):
         u = dict(u, sr="--")
     return u
 
@@ -1996,8 +1978,11 @@ def full_state():
             "accounts": {"ready": bool(accts), "source_err": _source_err, "cswap": cswap_bin(),
                          "cswap_ver": cswap_version(), "filter": CONFIG.get("CSWAP_ACCOUNTS", ""),
                          "sources": {
+                             # n: cswap's accounts (a token seat on one included); tokens: seats
+                             # cswap does not have, so no cswap never reads as "claude-swap N"
                              "claude": {"bin": cswap_bin(), "ver": cswap_version(), "err": _source_err,
-                                        "n": len(_src_accts["claude"]),
+                                        "n": sum(1 for a in _src_accts["claude"] if not a.get("token_only")),
+                                        "tokens": sum(1 for a in _src_accts["claude"] if a.get("token_only")),
                                         "filter": CONFIG.get("CSWAP_ACCOUNTS", "")},
                              "codex": {"bin": codex_bin(), "ver": codex_version(),
                                        "n": len(_src_accts["codex"]),
@@ -2155,8 +2140,9 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
  up.textContent=fmtUp(s.service.uptime_s);
  const u=s.usage,A=s.accounts||{ready:false,list:[]},cs=!!A.ready;
  const S=A.sources||{claude:{n:A.list.length},codex:{n:0}},nc=(S.claude||{}).n||0,nx=(S.codex||{}).n||0;
- pill(src,cs?'ok':'bad',cs?((nc?('claude-swap '+nc):'')+(nc&&nx?' + ':'')+(nx?('codex '+nx):'')):'setup needed');
- srcerr.textContent=(nc?((A.cswap_ver||'cswap')+' at '+A.cswap):((nx?'':'! ')+(A.source_err||'claude-swap not ready')))
+ const nt=(S.claude||{}).tokens||0;   // setup-token seats cswap does not have: never counted as cswap's
+ pill(src,cs?'ok':'bad',cs?[nc?'claude-swap '+nc:'',nt?'setup-token '+nt:'',nx?'codex '+nx:''].filter(x=>x).join(' + '):'setup needed');
+ srcerr.textContent=(nc?((A.cswap_ver||'cswap')+' at '+A.cswap):((nx||nt?'':'! ')+(A.source_err||'claude-swap not ready')))
    +(S.codex&&S.codex.bin?(' | '+(S.codex.ver||'codex')+', polled '+fmtAgo(S.codex.age)+', next in '+S.codex.next_in+'s'):'');
  // fleet verdict: one account capping is normal (cswap switches); ALL of them is a block
  const U=s.update||{};
@@ -2194,7 +2180,7 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
         +((a.provider=='codex'&&a.s<0)?'':a.nos?'<span class=muted>no 5h limit</span> · ':('S <b>'+pc(a.s)+'</b> · '))+'W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
     +(dead&&tk?'<div class=muted>mint a new one with <code>claude setup-token</code> and replace the token file</div>':'')
     +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+esc(a.home)+' codex login --device-auth</code></div>'):'')
-    +'<div class=row style=margin:0><span class=muted>'+(((a.provider=='codex'&&a.s<0)||a.nos)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):(a.s<0?'':'idle'))+(a.wr?(' · '+esc(a.wr)):'')))
+    +'<div class=row style=margin:0><span class=muted>'+(((a.provider=='codex'&&a.s<0)||a.nos)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):(a.s<0&&tk?'':'idle'))+(a.wr?(' · '+esc(a.wr)):'')))
       +'</span><span class=muted>'+esc(a.err||(a.age?a.age+'s':''))+'</span></div>'
     +((a.buckets||[]).length>1?('<div class=muted style="margin-top:2px">'+a.buckets.map(b=>esc(b.name||b.id)+': '
       +b.windows.map(w=>pc(w.pct)+'/'+(w.mins>=1440?Math.round(w.mins/1440)+'d':(w.mins?Math.round(w.mins/60)+'h':'?'))).join(' ')).join(' | ')+'</div>'):'')

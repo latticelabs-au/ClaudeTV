@@ -5,8 +5,8 @@
 # running process makes systemd relaunch it with the freshly-pulled code. Run from the clone:
 #   ~/ClaudeTV/host/update.sh
 #
-# The collector's config + state (.env, notify_state.json, resets.log, token_seats.json) live in
-# ~/.claudetv and are gitignored, so a pull never touches them.
+# The collector's config + state (.env, notify_state.json, resets.log) live in ~/.claudetv and are
+# gitignored, so a pull never touches them.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 echo "-> git pull"

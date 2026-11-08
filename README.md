@@ -243,23 +243,26 @@ utilization in its `anthropic-ratelimit-unified-*` headers. So name the seat's t
 `~/.claudetv/.env` and ClaudeTV reads the seat from a 1‑token Haiku request:
 
 ```bash
-CLAUDETV_CLAUDE_TOKENS=team1=/home/me/tokens/team1.token,ops@example.com=/home/me/tokens/ops.token
+CLAUDETV_CLAUDE_TOKENS=team1@example.com=/home/me/tokens/team1.token,ops@example.com=/home/me/tokens/ops.token
 ```
 
 - **Which account:** the name before `=` is the cswap slot, alias or email the token belongs to.
   That account is then read through its token, whatever cswap says about its login. A name cswap
   does not have becomes a seat of its own, labelled from the name (`ops@example.com` shows as
   `OPS`; `team5` shows as `TEAM5`). No regular login is needed, kept or fallen back to.
-- **Renaming:** a seat follows its account through a rename (in the master terminal or with
-  `cswap alias`), also across a restart: when its name no longer answers to any account, it stays
-  on the account it read last (remembered in `token_seats.json` beside `.env`, names and account
-  keys only). If the name later answers to another account, the name wins.
+- **Renaming:** a seat reads the account its name answers to *now*. Name it by the account's
+  **email** (or slot), which a rename never changes, and it follows its account through any rename
+  (in the master terminal or with `cswap alias`). A seat named by alias stops naming the account
+  when the alias changes: that account then reads exactly as cswap reads it, and the token shows
+  as a seat of its own under the old name until you update the line. Nothing is remembered across
+  a rename, on purpose: ClaudeTV cannot tell whose token it is, so following a renamed account
+  would keep a wrongly named token's numbers on it, with its own expired login hidden.
 - **Name the right account:** ClaudeTV cannot check whose token it is, because a setup token cannot
   read its own profile. A token named after a cswap account shows its numbers on that account. So
   when a seat moved to a different account that cswap does not have (the old account's alias was
   `team5`, the token is now another person's), name it by that account's email, or take the old
   account out of `CLAUDETV_CSWAP_ACCOUNTS` first; `team5=` would put the new account's numbers on
-  the old one.
+  the old one, until the old account is renamed away (see Renaming).
 - **No cswap needed:** token seats are read and shown even when cswap is not installed, lists no
   accounts, or fails. While cswap fails, its own accounts keep their last numbers, marked stale.
 - **What it shows:** live session and week numbers and reset times, like any account. A seat at
@@ -270,11 +273,15 @@ CLAUDETV_CLAUDE_TOKENS=team1=/home/me/tokens/team1.token,ops@example.com=/home/m
   seat on such an account stays stale, because nothing has shown that its 5‑hour window is absent
   rather than missing from the headers.
 - **When it cannot read:** a network error, a 5xx, a bare 429 or a missing token file leaves the
-  seat **not dead and not 0%**: it keeps its last reading marked stale, or shows `--` if it never
-  had one (the session reads `--`, never `idle`, on the display). A reading without both windows
-  is stale too. Only Anthropic rejecting the token itself (401, or a 403 about the credential:
-  OAuth, or an invalid, expired or revoked token) shows **LOGIN EXPIRED** and alerts, with the
-  remedy: mint a new token with `claude setup-token` and replace the file.
+  seat **not dead and not 0%**. It keeps showing its last complete reading, marked stale on the
+  dashboards, for an hour at most, and never a window whose reset time has passed (the display
+  has no stale marker per account, so an older number would pass for a live one). After that, or
+  if it never had a reading, it shows `--` (its session reads `--`, never `idle`, on the display).
+  A reading without both windows is stale too. Only Anthropic rejecting the token itself twice in
+  a row (401, or a 403 about the credential: OAuth, or an invalid, expired or revoked token) shows
+  **LOGIN EXPIRED** and alerts, with the remedy: mint a new token with `claude setup-token` and
+  replace the file. A single rejection, such as a passing fault at Anthropic, leaves the seat
+  stale with `token_rejected` until the next probe.
 - **A retired model:** if `CLAUDETV_TOKEN_MODEL` answers 404, ClaudeTV asks the token which models
   it may use and probes the newest Haiku instead until the next restart, so the seats keep
   reading. Set the line to a current model to make it stick.
