@@ -140,8 +140,10 @@ look like they should work but **don't** (save yourself the detour):
 
 - **API keys (`sk-ant-api…`)**: the usage endpoint reports *subscription* limits (5h / 7d /
   model-scoped), which API-key accounts don't have. Wrong credential entirely.
-- **`claude setup-token`**: that long-lived token is scoped for Claude Code *inference* and
-  is rejected (**403**) by the usage endpoint.
+- **`claude setup-token`** *as your only way in*: that long-lived token is scoped for Claude
+  Code *inference* and is rejected (**403**) by the usage endpoint. A seat that already runs on
+  one can still be shown, read from rate-limit headers instead: see
+  [Setup-token seats](#setup-token-seats-no-regular-login).
 
 If a login really does die, only that account flips to **LOGIN EXPIRED** on the display and
 alerts by name; the others keep showing. Re-register it with `cswap add --alias <name>`.
@@ -224,6 +226,51 @@ accounts** in the master terminal if you want it immediately.
 - **One device per account instead of cycling?** Point it at `/usage?acct=<label>` — that serves a
   single account, and the header reverts to the classic title.
 - The firmware cycles up to **8** accounts (`MAXACC`); the collector itself has no limit.
+
+---
+
+## Setup-token seats (no regular login)
+
+`claude setup-token` mints a token that lasts a year, which is how headless seats usually run
+(`CLAUDE_CODE_OAUTH_TOKEN`). A regular login expires about every four weeks and cannot be renewed
+without a person, so on such a seat it lapses, and cswap then reports the account as needing a
+login. The token itself only carries the `user:inference` scope, and the usage endpoint answers it
+**403** (`oauth_scope_insufficient`, it wants `user:profile`). Left at that, a seat that is
+running work shows **LOGIN EXPIRED**.
+
+What the token *can* do is inference, and every response carries the account's 5‑hour and weekly
+utilization in its `anthropic-ratelimit-unified-*` headers. So name the seat's token **file** in
+`~/.claudetv/.env` and ClaudeTV reads the seat from a 1‑token Haiku request:
+
+```bash
+CLAUDETV_CLAUDE_TOKENS=team1=/home/me/tokens/team1.token,ops@example.com=/home/me/tokens/ops.token
+```
+
+- **Which account:** the name before `=` is the cswap slot, alias or email the token belongs to.
+  That account is then read through its token, whatever cswap says about its login. A name cswap
+  does not have becomes a seat of its own, labelled from the name (`ops@example.com` shows as
+  `OPS`; `team5` shows as `TEAM5`). No regular login is needed, kept or fallen back to.
+- **What it shows:** live session and week numbers and reset times, like any account. A seat at
+  its cap still reads (the API answers 429 with the same headers) and the master terminal marks it
+  *blocked*. The headers carry no model‑scoped weekly window apart from Fable's (`7d_oi`), so a
+  token seat usually has no third (Fable) column, rather than a made‑up one.
+- **When it cannot read:** a network error, a 5xx, a bare 429 or a missing token file leaves the
+  seat **not dead and not 0%**: it keeps its last reading marked stale, or shows `--` if it never
+  had one. A reading without both windows is stale too. Only Anthropic rejecting the token itself
+  (401, or a 403 that names the token) shows **LOGIN EXPIRED** and alerts, with the remedy: mint a
+  new token with `claude setup-token` and replace the file.
+- **Fleet alert:** "every account is out of quota" stays cswap's own verdict, judged on what cswap
+  itself reads for each account. Room on a seat only helps if cswap can switch onto it, and cswap
+  cannot use a lapsed login however much room its token shows, so token readings can neither raise
+  nor clear that alert. A token-only seat is not in cswap's rotation at all.
+- **Alerts:** a seat's token readings keep their own reset history, so moving a seat onto its token
+  does not replay resets that happened while its login was lapsed.
+- **Cost and pace:** one request per seat every `CLAUDETV_TOKEN_EVERY` seconds (300 by default,
+  120 at least). **Re‑read accounts** re‑probes at most once a minute.
+- **Safety:** the line holds paths, never a token. Only a file that holds exactly one OAuth token
+  (`sk-ant-oat…`) is ever sent, only to `api.anthropic.com`, and the token is never stored, logged
+  or served. The master terminal cannot show or change the line. A setup token has no refresh
+  token, so reading it never rotates or expires anything.
 
 ---
 

@@ -1922,5 +1922,480 @@ class TestCodexHardening(CodexIsolated):
             self.assertIn(needle, srv.TERMINAL)
 
 
+
+# ---------------------------------------------------------------- setup-token seats (issue #14)
+# Captured from a live POST /v1/messages on a `claude setup-token` token, 9 Nov 2026 (values only;
+# no credential). The same token gets HTTP 403 oauth_scope_insufficient from /api/oauth/usage.
+TOKEN_HEADERS_200 = {
+    "anthropic-ratelimit-unified-5h-reset": "1794159600",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.01",
+    "anthropic-ratelimit-unified-7d-reset": "1794171600",
+    "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+    "anthropic-ratelimit-unified-7d-surpassed-threshold": "0.75",
+    "anthropic-ratelimit-unified-7d-utilization": "0.94",
+    "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+    "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+    "anthropic-ratelimit-unified-overage-status": "rejected",
+    "anthropic-ratelimit-unified-representative-claim": "seven_day",
+    "anthropic-ratelimit-unified-reset": "1794171600",
+    "anthropic-ratelimit-unified-status": "allowed_warning",
+    "content-type": "application/json",
+}
+# The same capture from a seat at its weekly cap: HTTP 429, and the headers still carry both windows.
+TOKEN_HEADERS_429 = {
+    "anthropic-ratelimit-unified-5h-reset": "1794160800",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.0",
+    "anthropic-ratelimit-unified-7d-reset": "1794326400",
+    "anthropic-ratelimit-unified-7d-status": "rejected",
+    "anthropic-ratelimit-unified-7d-surpassed-threshold": "1.0",
+    "anthropic-ratelimit-unified-7d-utilization": "1.0",
+    "anthropic-ratelimit-unified-representative-claim": "seven_day",
+    "anthropic-ratelimit-unified-reset": "1794326400",
+    "anthropic-ratelimit-unified-status": "rejected",
+    "retry-after": "183137",
+    "content-type": "application/json",
+}
+FAKE_TOKEN = "sk-ant-oat01-" + "FAKE0TEST0ONLY0" * 6
+ERR_JSON = lambda typ, msg, **det: json.dumps({"type": "error", "error": dict(
+    {"type": typ, "message": msg}, **({"details": det} if det else {}))})
+
+
+def team_doc():
+    """Two Team seats whose full logins hard-expired (the issue's exact cswap state) beside a
+    healthy personal account that has no token and must never change."""
+    d = doc()
+    d["accounts"][0].update({"number": 3, "email": "seat1@example.com", "alias": "team1",
+                             "active": False, "usageStatus": "relogin_required", "usage": None,
+                             "lastGoodUsage": {"fiveHour": {"pct": 45.0, "resetsAt": "2026-11-06T20:10:00+00:00"},
+                                               "sevenDay": {"pct": 89.0, "resetsAt": "2026-11-07T01:00:00+00:00"}},
+                             "lastGoodAgeSeconds": 150000})
+    d["accounts"][1].update({"number": 2, "active": True})
+    d["accounts"].append({"number": 4, "email": "seat2@example.com", "alias": "team2",
+                          "active": False, "usageStatus": "unavailable", "usage": None})
+    return d
+
+
+class TokenIsolated(TzPinned):
+    """Token files and notifier files in a temp dir, no channels, token-seat state reset."""
+
+    KEYS = ("CLAUDE_TOKENS", "TOKEN_EVERY", "TOKEN_MODEL", "NOTIFY_DISCORD_WEBHOOK",
+            "NOTIFY_SLACK_WEBHOOK", "NOTIFY_EMAIL", "NOTIFY_AUTH")
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self._paths = (srv.NOTIFY_STATE_PATH, srv.RESET_LOG_PATH)
+        srv.NOTIFY_STATE_PATH = os.path.join(self.tmp.name, "notify_state.json")
+        srv.RESET_LOG_PATH = os.path.join(self.tmp.name, "resets.log")
+        srv._notify_state = None; srv._reset_log = None
+        self._cfg = {k: srv.CONFIG.get(k) for k in self.KEYS}
+        for k in self.KEYS: srv.CONFIG[k] = ""
+        srv.CONFIG["TOKEN_EVERY"] = "300"
+        self._tok = dict(srv._tok); srv._tok.clear()
+        self._alerted = dict(srv._alerted); srv._alerted.clear()
+        self.calls = []
+
+    def tearDown(self):
+        srv._tok.clear(); srv._tok.update(self._tok)
+        srv._alerted.clear(); srv._alerted.update(self._alerted)
+        srv.NOTIFY_STATE_PATH, srv.RESET_LOG_PATH = self._paths
+        srv._notify_state = None; srv._reset_log = None
+        srv.CONFIG.update(self._cfg); self.tmp.cleanup()
+        super().tearDown()
+
+    def token_file(self, name, text=FAKE_TOKEN):
+        path = os.path.join(self.tmp.name, name + ".token")
+        with open(path, "w", encoding="utf-8") as f: f.write(text)
+        return path
+
+    def configure(self, **seats):
+        """seats: account=path. Order is kept, as the config line keeps it."""
+        srv.CONFIG["CLAUDE_TOKENS"] = ",".join("%s=%s" % kv for kv in seats.items())
+
+    def prober(self, *replies):
+        """A stub for token_probe: each call takes the next reply, an exception raises."""
+        q = list(replies)
+        def probe(token, model, timeout):
+            self.calls.append((token, model))
+            r = q.pop(0) if len(q) > 1 else q[0]
+            if isinstance(r, Exception): raise r
+            return r
+        return probe
+
+    def seats(self, now=1000.0, force=False, replies=((200, TOKEN_HEADERS_200, "{}"),), d=None):
+        recs = srv.cswap_accounts_from_json(d or team_doc())
+        return srv.apply_token_seats(recs, now, force=force, prober=self.prober(*replies))
+
+    def by_label(self, recs):
+        return {r["label"]: r for r in recs}
+
+
+class TestSetupTokenSeats(TokenIsolated):
+    """Issue #14. A Team seat whose only credential is its year-long setup token
+    (`claude setup-token`, user:inference scope only) cannot read the usage endpoint: it answers
+    403 oauth_scope_insufficient. cswap polls through the seat's full login, which hard-expired,
+    so the seat read as dead while it was running work. A setup token CAN run inference, and
+    every /v1/messages response carries the account's unified 5h/7d utilization, so the seat is
+    read from those headers instead. No regular login is needed, kept or fallen back to."""
+
+    def test_reproduces_the_issue_without_a_token_configured(self):
+        # the symptom, exactly as the live collector showed it on 9 Nov
+        recs = self.seats()
+        self.assertEqual(self.by_label(recs)["TEAM1"]["auth"], "dead")
+        self.assertEqual(self.calls, [], "no token configured, so nothing may be probed")
+
+    def test_a_setup_token_seat_reads_live_usage_not_dead(self):
+        self.configure(team1=self.token_file("team1"))
+        t1 = self.by_label(self.seats())["TEAM1"]
+        self.assertEqual(t1["auth"], "ok")
+        self.assertFalse(t1["stale"])
+        self.assertEqual((t1["u"]["s"], t1["u"]["w"]), (1, 94))
+        self.assertEqual(t1["u"]["sr"], "5:40pm")
+        self.assertEqual(t1["u"]["wr"], "Nov 8 9pm")
+        self.assertEqual(t1["resets"]["week"], "2026-11-08T21:00:00+00:00")
+        self.assertEqual(t1["via"], "token")
+        self.assertEqual(t1["err"], "")
+        self.assertTrue(srv.notifiable(t1))
+        # the wire carries a live account, so the device shows numbers, not LOGIN EXPIRED
+        w = srv.usage_wire(self.seats(), {})
+        self.assertEqual([(a["l"], a["auth"]) for a in w["acc"]][0], ("TEAM1", "ok"))
+
+    def test_the_probe_sends_the_token_from_its_file_and_asks_for_one_token(self):
+        self.configure(team1=self.token_file("team1"))
+        srv.CONFIG["TOKEN_MODEL"] = "claude-haiku-5-5"
+        self.seats()
+        self.assertEqual(self.calls, [(FAKE_TOKEN, "claude-haiku-5-5")])
+
+    def test_the_request_is_a_minimal_oauth_inference_call(self):
+        seen = {}
+        class Resp:
+            status = 200
+            headers = TOKEN_HEADERS_200
+            def read(self, n=-1): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def urlopen(req, timeout=None):
+            seen["req"], seen["timeout"] = req, timeout
+            return Resp()
+        orig = srv.urllib.request.urlopen
+        srv.urllib.request.urlopen = urlopen
+        try:
+            status, headers, body = srv.token_probe(FAKE_TOKEN, "claude-haiku-5-5", 9)
+        finally:
+            srv.urllib.request.urlopen = orig
+        req = seen["req"]
+        self.assertEqual((status, req.get_method(), req.full_url),
+                         (200, "POST", "https://api.anthropic.com/v1/messages"))
+        self.assertEqual(req.get_header("Authorization"), "Bearer " + FAKE_TOKEN)
+        self.assertIn("oauth-2025-04-20", req.get_header("Anthropic-beta"))
+        self.assertEqual(req.get_header("Anthropic-version"), "2023-06-01")
+        sent = json.loads(req.data)
+        self.assertEqual((sent["model"], sent["max_tokens"]), ("claude-haiku-5-5", 1))
+        self.assertEqual(headers["anthropic-ratelimit-unified-7d-utilization"], "0.94")
+        self.assertEqual(seen["timeout"], 9)
+
+    def test_a_seat_at_its_cap_answers_429_and_that_is_still_a_reading(self):
+        self.configure(team1=self.token_file("team1"))
+        t1 = self.by_label(self.seats(replies=((429, TOKEN_HEADERS_429, ERR_JSON(
+            "rate_limit_error", "This request would exceed your account's rate limit.")),)))["TEAM1"]
+        self.assertEqual((t1["auth"], t1["stale"]), ("ok", False))
+        self.assertEqual((t1["u"]["s"], t1["u"]["w"]), (0, 100))
+        self.assertTrue(t1["blocked"])
+
+    def test_a_bare_429_is_transient_not_dead_and_not_zero(self):
+        self.configure(team1=self.token_file("team1"))
+        t1 = self.by_label(self.seats(replies=((429, {"retry-after": "30"}, ERR_JSON(
+            "rate_limit_error", "slow down")),)))["TEAM1"]
+        self.assertEqual(t1["auth"], "ok")
+        self.assertTrue(t1["stale"])
+        self.assertEqual((t1["u"]["s"], t1["u"]["w"]), (-1, -1))
+        self.assertFalse(srv.notifiable(t1))
+
+    def test_401_means_the_token_itself_is_rejected(self):
+        self.configure(team1=self.token_file("team1"))
+        t1 = self.by_label(self.seats(replies=((401, {}, ERR_JSON(
+            "authentication_error", "Invalid bearer token")),)))["TEAM1"]
+        self.assertEqual(t1["auth"], "dead")
+        self.assertTrue(t1["stale"])
+
+    def test_403_is_dead_only_when_anthropic_says_it_is_the_token(self):
+        self.configure(team1=self.token_file("team1"))
+        cases = [
+            (ERR_JSON("permission_error", "OAuth token does not meet scope requirement user:inference",
+                      error_code="oauth_scope_insufficient"), "application/json", "dead"),
+            (ERR_JSON("permission_error", "OAuth token has been revoked"), "application/json", "dead"),
+            (ERR_JSON("permission_error", "Your organization cannot use this model"), "application/json", "ok"),
+            ("<html>Attention Required</html>", "text/html", "ok"),
+        ]
+        for body, ctype, want in cases:
+            srv._tok.clear()
+            t1 = self.by_label(self.seats(replies=((403, {"content-type": ctype}, body),)))["TEAM1"]
+            self.assertEqual(t1["auth"], want, body[:60])
+            self.assertTrue(t1["stale"], body[:60])
+
+    def test_network_and_server_errors_are_transient(self):
+        self.configure(team1=self.token_file("team1"))
+        for reply in (OSError("timed out"), (500, {}, "oops"), (529, {}, ERR_JSON("overloaded_error", "busy")),
+                      (404, {}, ERR_JSON("not_found_error", "model: claude-haiku-5-5"))):
+            srv._tok.clear()
+            t1 = self.by_label(self.seats(replies=(reply,)))["TEAM1"]
+            self.assertEqual(t1["auth"], "ok", repr(reply)[:60])
+            self.assertTrue(t1["stale"])
+            self.assertEqual((t1["u"]["s"], t1["u"]["w"]), (-1, -1), "no reading is never 0%")
+            self.assertTrue(t1["err"])
+
+    def test_a_failed_probe_keeps_showing_the_last_token_reading_marked_stale(self):
+        self.configure(team1=self.token_file("team1"))
+        self.seats(now=1000.0)
+        t1 = self.by_label(self.seats(now=1400.0, replies=(OSError("down"),)))["TEAM1"]
+        self.assertTrue(t1["stale"])
+        self.assertEqual((t1["u"]["s"], t1["u"]["w"]), (1, 94))
+        self.assertEqual(t1["auth"], "ok")
+        self.assertEqual(t1["age"], 400)
+
+    def test_a_200_without_rate_limit_headers_is_unknown(self):
+        self.configure(team1=self.token_file("team1"))
+        t1 = self.by_label(self.seats(replies=((200, {"content-type": "application/json"}, "{}"),)))["TEAM1"]
+        self.assertEqual((t1["auth"], t1["stale"]), ("ok", True))
+        self.assertEqual((t1["u"]["s"], t1["u"]["w"]), (-1, -1))
+
+    def test_a_header_reading_without_its_5h_window_stays_stale(self):
+        # the same rule v5.3.0 applies to cswap's header readings: headers can omit a window the
+        # account has, so this is never mistaken for an Ultra account with no session limit
+        self.configure(team1=self.token_file("team1"))
+        h = {k: v for k, v in TOKEN_HEADERS_200.items() if "-5h-" not in k}
+        t1 = self.by_label(self.seats(replies=((200, h, "{}"),)))["TEAM1"]
+        self.assertTrue(t1["stale"])
+        self.assertNotIn("nos", t1["u"])
+        self.assertEqual((t1["u"]["s"], t1["u"]["w"]), (-1, 94))
+
+    def test_an_unusable_utilization_is_not_read_as_a_number(self):
+        self.configure(team1=self.token_file("team1"))
+        for bad in ("nan", "-0.2", "", "abc", "inf"):
+            srv._tok.clear()
+            h = dict(TOKEN_HEADERS_200, **{"anthropic-ratelimit-unified-7d-utilization": bad})
+            t1 = self.by_label(self.seats(replies=((200, h, "{}"),)))["TEAM1"]
+            self.assertTrue(t1["stale"], bad)
+            self.assertEqual(t1["u"]["w"], -1, bad)
+
+    def test_a_fable_bucket_in_the_headers_becomes_the_scoped_column(self):
+        self.configure(team1=self.token_file("team1"))
+        h = dict(TOKEN_HEADERS_200, **{"anthropic-ratelimit-unified-7d_oi-utilization": "0.31",
+                                       "anthropic-ratelimit-unified-7d_oi-reset": "1794171600"})
+        t1 = self.by_label(self.seats(replies=((200, h, "{}"),)))["TEAM1"]
+        self.assertEqual((t1["u"]["f"], t1["u"]["fl"]), (31, "FABLE"))
+        t0 = self.by_label(self.seats(now=2000.0))["TEAM1"]
+        self.assertEqual((t0["u"]["f"], t0["u"]["fl"]), (-1, ""), "no bucket, no invented column")
+
+    def test_a_missing_or_foreign_token_file_is_unknown_and_never_sent(self):
+        not_a_token = self.token_file("junk", "CLAUDETV_SMTP_PASS=hunter2\n")
+        self.configure(team1=os.path.join(self.tmp.name, "missing.token"), team2=not_a_token)
+        recs = self.by_label(self.seats())
+        self.assertEqual(self.calls, [], "only a file holding a setup token is ever sent")
+        for lbl in ("TEAM1", "TEAM2"):
+            self.assertEqual(recs[lbl]["auth"], "ok", lbl)
+            self.assertTrue(recs[lbl]["stale"], lbl)
+            self.assertEqual((recs[lbl]["u"]["s"], recs[lbl]["u"]["w"]), (-1, -1), lbl)
+            self.assertTrue(recs[lbl]["err"], lbl)
+
+    def test_a_seat_without_a_token_reads_exactly_as_before(self):
+        self.configure(team1=self.token_file("team1"))
+        before = {r["key"]: r for r in srv.cswap_accounts_from_json(team_doc())}
+        after = {r["key"]: r for r in self.seats()}
+        for key in ("2:varma.adityaa@gmail.com", "4:seat2@example.com"):
+            self.assertEqual(after[key], before[key])
+
+    def test_the_seat_matches_by_alias_email_or_slot(self):
+        for spec in ("team1", "TEAM1", "seat1@example.com", "3"):
+            srv._tok.clear()
+            srv.CONFIG["CLAUDE_TOKENS"] = "%s=%s" % (spec, self.token_file("team1"))
+            recs = self.seats()
+            self.assertEqual(len(recs), 3, spec)
+            self.assertEqual(self.by_label(recs)["TEAM1"]["via"], "token", spec)
+
+    def test_a_token_for_an_account_cswap_does_not_have_is_its_own_seat(self):
+        # issue #14: team5 now runs on aditya2's token, which is not a cswap account at all
+        self.configure(**{"seat5@example.com": self.token_file("team5")})
+        recs = self.seats()
+        self.assertEqual(len(recs), 4)
+        t5 = recs[-1]
+        self.assertEqual((t5["label"], t5["email"], t5["key"]), ("SEAT5", "seat5@example.com",
+                                                                 "token:seat5@example.com"))
+        self.assertEqual((t5["auth"], t5["stale"], t5["u"]["w"]), ("ok", False, 94))
+        self.assertTrue(t5["token_only"])
+        srv._tok.clear(); self.configure(team5=self.token_file("team5"))
+        self.assertEqual(self.seats()[-1]["label"], "TEAM5")
+
+    def test_probes_are_paced_and_a_forced_reread_is_capped(self):
+        self.configure(team1=self.token_file("team1"))
+        self.seats(now=1000.0)
+        self.seats(now=1090.0)                 # the next cswap poll: still inside TOKEN_EVERY
+        self.assertEqual(len(self.calls), 1)
+        self.seats(now=1030.0, force=True)     # "Re-read accounts" inside a minute: not yet
+        self.assertEqual(len(self.calls), 1)
+        self.seats(now=1061.0, force=True)
+        self.assertEqual(len(self.calls), 2)
+        self.seats(now=1361.0)
+        self.assertEqual(len(self.calls), 3)
+        srv.CONFIG["TOKEN_EVERY"] = "5"        # a floor keeps a typo from hammering the API
+        self.seats(now=1400.0)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_the_token_never_reaches_a_record_the_wire_or_the_log(self):
+        import contextlib, io
+        self.configure(team1=self.token_file("team1"), team2=self.token_file("team2"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            recs = self.seats(replies=((200, TOKEN_HEADERS_200, "{}"), OSError("boom " + "x")))
+            recs = self.seats(now=5000.0, replies=((401, {}, ERR_JSON("authentication_error", "bad")),))
+        blob = json.dumps(recs) + json.dumps(srv.usage_wire(recs, {})) + json.dumps(srv._tok) + out.getvalue()
+        self.assertNotIn(FAKE_TOKEN, blob)
+        self.assertNotIn(FAKE_TOKEN[14:40], blob)
+
+
+class TestSetupTokenSeatsDownstream(TokenIsolated):
+    """What the rest of the collector does with a token seat: the fleet verdict, alerts, the
+    notifier and the terminal."""
+
+    POLICY = {"threshold": 95.0, "hysteresis": 5.0, "cooldown": 300.0,
+              "strategy": "best", "model": None}
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []; self.bodies = []
+        self._alert = srv._fleet_alert
+        srv._fleet_alert = lambda ev, body: (self.sent.append(ev), self.bodies.append(body))
+        self._auth = srv._auth_alert
+        srv._auth_alert = lambda ev, body: (self.sent.append(ev), self.bodies.append(body))
+        self._fleet = dict(srv._fleet_last); srv._fleet_last.clear()
+
+    def tearDown(self):
+        srv._fleet_alert = self._alert; srv._auth_alert = self._auth
+        srv._fleet_last.clear(); srv._fleet_last.update(self._fleet)
+        super().tearDown()
+
+    def maxed_doc(self):
+        """Personal maxed and in rotation; team1's login expired (relogin_required)."""
+        d = team_doc()
+        d["accounts"][1]["usage"]["fiveHour"]["pct"] = 100.0
+        del d["accounts"][2]
+        return d
+
+    def test_a_seat_cswap_cannot_switch_to_never_sounds_an_all_clear(self):
+        # cswap's own login for team1 is dead, so cswap cannot move onto it. Its token reading
+        # (94% week, 1% session) must not read as fleet headroom.
+        self.configure(team1=self.token_file("team1"))
+        st = srv.fleet_state(self.seats(d=self.maxed_doc()), self.POLICY)
+        self.assertTrue(st["exhausted"])
+        self.assertNotIn("TEAM1", st["headroom"])
+        self.assertEqual(st["benched"], [])
+
+    def test_a_token_only_seat_is_outside_cswap_rotation(self):
+        self.configure(**{"seat5@example.com": self.token_file("team5")})
+        st = srv.fleet_state(self.seats(d=self.maxed_doc()), self.POLICY)
+        self.assertTrue(st["exhausted"])
+        self.assertNotIn("SEAT5", st["binding"])
+
+    def test_a_lapsed_login_cswap_calls_unavailable_is_not_headroom_through_its_token(self):
+        # team1's login hard-expired, but cswap reported it "unavailable", not dead. Its token says
+        # 94% week: under the 95% bar, so it would read as room. cswap cannot switch onto it, so
+        # that would be a false all-clear. The fleet keeps cswap's own view: unknown.
+        d = self.maxed_doc()
+        d["accounts"][0].update({"usageStatus": "unavailable"})
+        self.configure(team1=self.token_file("team1"))
+        st = srv.fleet_state(self.seats(d=d), self.POLICY)
+        self.assertNotIn("TEAM1", st["headroom"])
+        self.assertNotIn("TEAM1", st["binding"])
+        self.assertEqual(st["unknown"], 1)
+        self.assertFalse(st["exhausted"])
+
+    def test_tokens_never_change_the_fleet_verdict(self):
+        variants = []
+        for status in ("relogin_required", "unavailable", "ok"):
+            d = self.maxed_doc()
+            d["accounts"][0].update({"usageStatus": status})
+            if status == "ok": d["accounts"][0]["usage"] = d["accounts"][0]["lastGoodUsage"]
+            variants.append(d)
+        for d in variants:
+            for policy in (self.POLICY, dict(self.POLICY, model="Fable")):
+                srv.CONFIG["CLAUDE_TOKENS"] = ""; srv._tok.clear()
+                plain = srv.fleet_state(srv.cswap_accounts_from_json(d), policy)
+                self.configure(team1=self.token_file("team1"),
+                               **{"seat5@example.com": self.token_file("team5")})
+                for reply in ((200, TOKEN_HEADERS_200, "{}"), (429, TOKEN_HEADERS_429, "{}"),
+                              (401, {}, ERR_JSON("authentication_error", "bad")), OSError("down")):
+                    srv._tok.clear()
+                    self.assertEqual(srv.fleet_state(self.seats(d=d, replies=(reply,)), policy), plain,
+                                     (d["accounts"][0]["usageStatus"], policy["model"], repr(reply)[:40]))
+
+    def test_a_live_token_seat_raises_no_auth_alert(self):
+        self.configure(team1=self.token_file("team1"))
+        srv._auth_transitions(self.seats())
+        self.assertNotIn("dead", self.sent)
+
+    def test_a_rejected_token_alerts_with_the_token_remedy_not_a_relogin(self):
+        self.configure(team1=self.token_file("team1"))
+        recs = self.seats(replies=((401, {}, ERR_JSON("authentication_error", "bad")),))
+        srv._auth_transitions(recs)
+        self.assertEqual(self.sent, ["dead"])
+        self.assertIn("setup-token", self.bodies[0])
+        self.assertNotIn("cswap add", self.bodies[0])
+        self.assertNotIn(FAKE_TOKEN, self.bodies[0])
+
+    def test_switching_a_seat_onto_its_token_is_not_a_reset(self):
+        # cswap's last-good for team1 (from before its login expired) says s=45, w=89 with resets
+        # long past. The token's first reading must baseline, not alert a stale "reset".
+        rec = srv.cswap_accounts_from_json(dict(team_doc(), accounts=[dict(
+            team_doc()["accounts"][0], usageStatus="ok", usage=team_doc()["accounts"][0]["lastGoodUsage"])]))[0]
+        srv.notify_check(rec["u"], rec["resets"], acct=srv.notify_key(rec), label=rec["label"])
+        self.configure(team1=self.token_file("team1"))
+        t1 = self.by_label(self.seats())["TEAM1"]
+        self.assertNotEqual(srv.notify_key(t1), srv.notify_key(rec))
+        srv.notify_check(t1["u"], t1["resets"], acct=srv.notify_key(t1), label=t1["label"])
+        self.assertEqual(srv._load_reset_log(), [])
+
+    def test_the_tokens_line_is_host_only_and_survives_a_terminal_save(self):
+        env = os.path.join(self.tmp.name, ".env")
+        orig = srv.ENV_PATH; srv.ENV_PATH = env
+        try:
+            srv.CONFIG["CLAUDE_TOKENS"] = "team1=/x/team1.token"
+            srv.save_config({"CLAUDE_TOKENS": "team1=/etc/shadow", "CITY": srv.CONFIG.get("CITY", "")})
+            self.assertEqual(srv.CONFIG["CLAUDE_TOKENS"], "team1=/x/team1.token")
+            self.assertIn("CLAUDETV_CLAUDE_TOKENS=team1=/x/team1.token", open(env, encoding="utf-8").read())
+        finally:
+            srv.ENV_PATH = orig
+        self.assertNotIn("CLAUDE_TOKENS", srv.EDITABLE)
+
+    def test_a_token_only_seat_cannot_be_renamed_through_cswap(self):
+        self.configure(**{"seat5@example.com": self.token_file("team5")})
+        with srv._lock:
+            prev = (list(srv._accounts), {k: list(v) for k, v in srv._src_accts.items()})
+        try:
+            srv._publish("claude", self.seats())
+            out = srv.rename_account("token:seat5@example.com", "five")
+        finally:
+            with srv._lock:
+                srv._accounts = prev[0]; srv._src_accts.update(prev[1])
+        self.assertEqual(out["ok"], 0)
+        self.assertIn("CLAUDE_TOKENS", out["err"])
+
+    def test_the_terminal_says_which_seats_read_through_a_token(self):
+        self.assertIn("a.via=='token'", srv.TERMINAL)
+        self.configure(team1=self.token_file("team1"))
+        with srv._lock:
+            prev = (list(srv._accounts), {k: list(v) for k, v in srv._src_accts.items()})
+        try:
+            srv._publish("claude", self.seats())
+            rows = {r["label"]: r for r in srv.full_state()["accounts"]["list"]}
+        finally:
+            with srv._lock:
+                srv._accounts = prev[0]; srv._src_accts.update(prev[1])
+        self.assertEqual(rows["TEAM1"]["via"], "token")
+        self.assertEqual(rows["PERSONAL"]["via"], "")
+        self.assertNotIn(FAKE_TOKEN, json.dumps(rows))
+
+
 if __name__ == "__main__":
     unittest.main()
