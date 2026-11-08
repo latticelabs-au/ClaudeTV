@@ -250,6 +250,11 @@ CLAUDETV_CLAUDE_TOKENS=team1@example.com=/home/me/tokens/team1.token,ops@example
   That account is then read through its token, whatever cswap says about its login. A name cswap
   does not have becomes a seat of its own, labelled from the name (`ops@example.com` shows as
   `OPS`; `team5` shows as `TEAM5`). No regular login is needed, kept or fallen back to.
+- **A name two accounts answer to:** claude-swap lets one email sit in several orgs, and two
+  accounts can share a label. A name that more than one cswap account answers to (counting
+  accounts `CLAUDETV_CSWAP_ACCOUNTS` hides) binds to none of them: both read exactly as cswap reads
+  them, the token shows as a seat of its own, and the master terminal says which slots matched.
+  Name such a seat by its **slot** (`2=/home/me/tokens/team1.token`), which is unique.
 - **Renaming:** a seat reads the account its name answers to *now*. Name it by the account's
   **email** (or slot), which a rename never changes, and it follows its account through any rename
   (in the master terminal or with `cswap alias`). A seat named by alias stops naming the account
@@ -264,24 +269,42 @@ CLAUDETV_CLAUDE_TOKENS=team1@example.com=/home/me/tokens/team1.token,ops@example
   account out of `CLAUDETV_CSWAP_ACCOUNTS` first; `team5=` would put the new account's numbers on
   the old one, until the old account is renamed away (see Renaming).
 - **No cswap needed:** token seats are read and shown even when cswap is not installed, lists no
-  accounts, or fails. While cswap fails, its own accounts keep their last numbers, marked stale.
+  accounts, or fails. While cswap fails, its own accounts show exactly what they showed before the
+  failure, on the display and the dashboards, as they always have; only the token seats are read.
 - **What it shows:** live session and week numbers and reset times, like any account. A seat at
   its cap still reads (the API answers 429 with the same headers) and the master terminal marks it
-  *blocked*. The headers carry no model‑scoped weekly window apart from Fable's (`7d_oi`), so a
-  token seat usually has no third (Fable) column, rather than a made‑up one. An account cswap has
-  read as having no 5‑hour limit (Ultra) shows its weekly card through its token too; a token‑only
-  seat on such an account stays stale, because nothing has shown that its 5‑hour window is absent
-  rather than missing from the headers.
+  *blocked*. Anthropic can also refuse a seat below 100% on both windows (a per‑model or overage
+  limit). The display has no *blocked* marker, so there the limit that refused it reads 100%: the
+  window the headers mark as refused, else the third column, named after the limit (`OPUS`,
+  `OVERAGE`, or `LIMIT` when the headers name none). The master terminal keeps the real numbers
+  and says `blocked · OPUS`. The headers carry no model‑scoped weekly window apart from Fable's
+  (`7d_oi`), so a token seat usually has no third (Fable) column, rather than a made‑up one.
+- **No 5‑hour limit (Ultra):** an account cswap has read as having no 5‑hour limit shows its
+  weekly card through its token too. A token‑only seat on such an account stays stale with its
+  session at `--`: the headers carry a utilization, a reset and a status for each window they
+  include, and nothing that says a window does not exist, so a missing 5‑hour window looks the
+  same whether the account has none or the headers left it out.
 - **When it cannot read:** a network error, a 5xx, a bare 429 or a missing token file leaves the
   seat **not dead and not 0%**. It keeps showing its last complete reading, marked stale on the
-  dashboards, for an hour at most, and never a window whose reset time has passed (the display
-  has no stale marker per account, so an older number would pass for a live one). After that, or
-  if it never had a reading, it shows `--` (its session reads `--`, never `idle`, on the display).
-  A reading without both windows is stale too. Only Anthropic rejecting the token itself twice in
-  a row (401, or a 403 about the credential: OAuth, or an invalid, expired or revoked token) shows
-  **LOGIN EXPIRED** and alerts, with the remedy: mint a new token with `claude setup-token` and
-  replace the file. A single rejection, such as a passing fault at Anthropic, leaves the seat
-  stale with `token_rejected` until the next probe.
+  dashboards, for two probe intervals at most (10 minutes by default, so it covers one failed
+  probe), and never a window whose reset time has passed (the display has no stale marker per
+  account, so an older number would pass for a live one). After that, or if it never had a
+  reading, it shows `--` (its session reads `--`, never `idle`, on the display). A reading
+  without both windows is stale too.
+- **A rejected token:** Anthropic refusing the token itself (401, or a 403 about the credential:
+  OAuth, or an invalid, expired or revoked token) shows **LOGIN EXPIRED** and alerts only once it
+  has lasted **30 minutes** (at least two probes) with no answer accepting the token in between,
+  with the remedy: mint a new token with `claude setup-token` and replace the file. Until then the
+  seat is stale with `token_rejected`. When every token seat is refused at once, which points at
+  a fault at Anthropic rather than at that many revoked tokens, it waits **4 hours** instead, and
+  the alert says so. A probe that gets no answer about the token (network error, 5xx, bare 429,
+  an edge page) neither restarts that count nor ends a LOGIN EXPIRED; only an answer that accepts
+  the token does.
+- **Retry‑After:** when Anthropic answers with `Retry-After` (a seat at its weekly cap gets about
+  two days), the seat is not probed again until then, for an hour at most so an early reset still
+  shows; **Re‑read accounts** does not override it. Meanwhile the seat keeps showing its capped
+  reading (not `--`, not 0%, not dead, and no alert), except a window whose reset passes during
+  the wait, which reads `--` until the next probe.
 - **A retired model:** if `CLAUDETV_TOKEN_MODEL` answers 404, ClaudeTV asks the token which models
   it may use and probes the newest Haiku instead until the next restart, so the seats keep
   reading. Set the line to a current model to make it stick.
@@ -292,11 +315,20 @@ CLAUDETV_CLAUDE_TOKENS=team1@example.com=/home/me/tokens/team1.token,ops@example
 - **Alerts:** a seat's token readings keep their own reset history, so moving a seat onto its token
   does not replay resets that happened while its login was lapsed.
 - **Cost and pace:** one request per seat every `CLAUDETV_TOKEN_EVERY` seconds (300 by default,
-  120 at least). **Re‑read accounts** re‑probes at most once a minute.
-- **Safety:** the line holds paths, never a token. Only a file that holds exactly one OAuth token
-  (`sk-ant-oat…`) is ever sent, only to `api.anthropic.com` (a redirect is never followed), and
-  the token is never stored, logged or served. The master terminal cannot show or change the line. A setup token has no refresh
-  token, so reading it never rotates or expires anything.
+  120 at least). **Re‑read accounts** re‑probes at most once a minute. Two costs come with every
+  probe, and you accept them by naming a token:
+  - **each probe sends Claude Code's system prompt.** Anthropic only takes an OAuth inference
+    request that carries it; without it the API answers 429 with no usage headers, so there would
+    be nothing to read.
+  - **each probe is a small amount of real usage on that seat** (a 1‑token Haiku request),
+    counted against that seat's own 5‑hour and weekly limits like any other request.
+- **Safety:** the line takes token **file paths** only (`~` for your home directory works), so it
+  points at the token files you already have and never holds a copy of a token. An entry that
+  holds a token itself is ignored, with a log line that names the entry by its position and never
+  shows what it holds. Only a file that holds exactly one OAuth token (`sk-ant-oat…`) is ever
+  sent, only to `api.anthropic.com` (a redirect is never followed), and the token is never stored,
+  logged or served. The master terminal cannot show or change the line. A setup token has no
+  refresh token, so reading it never rotates or expires anything.
 
 ---
 

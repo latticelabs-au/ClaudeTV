@@ -519,10 +519,16 @@ def cswap_accounts():
     polling this on the usage timer is what keeps every account's numbers current."""
     exe = cswap_bin()
     if not exe: raise RuntimeError("cswap not found")
+    global _cswap_names
     p = subprocess.run([exe, "list", "--json"], capture_output=True, text=True, timeout=45)
     if p.returncode != 0:
         raise RuntimeError("cswap list exited %d: %s" % (p.returncode, (p.stderr or "").strip()[:120]))
-    return cswap_accounts_from_json(json.loads(p.stdout), CONFIG.get("CSWAP_ACCOUNTS", ""))
+    doc = json.loads(p.stdout)
+    recs = cswap_accounts_from_json(doc, CONFIG.get("CSWAP_ACCOUNTS", ""))
+    # every account's names, the ones CSWAP_ACCOUNTS hides included: a setup-token seat must not
+    # bind to a name that a hidden account also answers to (_token_matches)
+    _cswap_names = [(_match_keys(r), str(r["key"]).split(":", 1)[0]) for r in cswap_accounts_from_json(doc)]
+    return recs
 
 # ---------- accounts: setup-token seats (issue #14) ----------
 # `claude setup-token` mints a year-long OAuth token with ONLY the user:inference scope and no
@@ -552,11 +558,20 @@ TOKEN_FLOOR = 120                  # seconds: TOKEN_EVERY below this is raised t
 TOKEN_FORCE_GAP = 60               # "Re-read accounts" re-probes a seat at most once a minute
 TOKEN_TIMEOUT = 15                 # one probe; all due seats run concurrently under this
 _UNIFIED = "anthropic-ratelimit-unified-"
-TOKEN_HOLD = 3600                  # seconds a failed probe may keep showing the last complete reading
-TOKEN_REJECTS = 2                  # rejections in a row before a token is dead (a blip is not a verdict)
+TOKEN_HOLD = 3600                  # cap on how long a failed probe keeps showing the last complete
+                                   # reading; the hold itself is two probe intervals (_token_hold)
+TOKEN_REJECTS = 2                  # a token is dead after at least this many refusals ...
+TOKEN_DEAD_AFTER = 1800            # ... spanning at least this long, with no answer accepting it between
+TOKEN_OUTAGE_AFTER = 4 * 3600      # ... or this long when every seat that answers is refused at once
+TOKEN_WAIT_MAX = 3600              # Retry-After is honoured up to this, so an early reset still shows
 _tok = {}                          # seat -> {"at": last probe, "read": last reading, "good": last complete,
-                                   #          "rejects": rejections in a row}
+                                   #          "auth": verdict, "rej": refusals since the last acceptance,
+                                   #          "rej_since": first of them, "ok_at": last acceptance,
+                                   #          "wait_until": Retry-After, "outage": dead during an outage}
 _probe_model = {}                  # TOKEN_MODEL -> the model that replaced it after it answered 404
+_cswap_names = []                  # (names, slot) of EVERY Claude account cswap lists, filter or not
+_CONFIG_TOKEN = re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}")   # any Anthropic credential, in the config line
+_config_warned = set()
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """urllib re-sends a request to wherever a 3xx points, Authorization header included. A token
@@ -572,9 +587,19 @@ def _token_headers(token):
 def token_seats(spec=None):
     """[(account, path)] from CLAUDE_TOKENS, a comma list of account=/path/to/token pairs. The
     account names whose token it is: a cswap slot, alias or email, matched the way CSWAP_ACCOUNTS
-    matches. One that names no cswap account becomes a seat of its own. A repeat is ignored."""
+    matches. One that names no cswap account becomes a seat of its own. A repeat is ignored.
+    The line takes token FILE paths only: an entry that holds a credential itself is ignored, so a
+    pasted token never becomes a seat's name, a record key or a path in an alert. The warning
+    names the entry by its position, never by what it holds."""
     out, seen = [], set()
-    for part in (CONFIG.get("CLAUDE_TOKENS", "") if spec is None else spec).split(","):
+    spec = CONFIG.get("CLAUDE_TOKENS", "") if spec is None else spec
+    for i, part in enumerate(spec.split(","), 1):
+        if _CONFIG_TOKEN.search(part):
+            if (hash(spec), i) not in _config_warned:
+                _config_warned.add((hash(spec), i))
+                print("[token] CLAUDE_TOKENS entry %d holds a token, not a file path: ignored. Put the "
+                      "token in a file only you can read and name that file." % i)
+            continue
         name, _, path = part.partition("=")
         name, path = name.strip().lower(), path.strip()
         if name and path and name not in seen:
@@ -670,21 +695,47 @@ def _token_unread(err, auth="ok"):
     """A reading with no numbers: -1 is "not known", never 0."""
     return {"u": {"s": -1, "w": -1, "sr": "", "wr": "", "f": -1, "fl": ""},
             "resets": {"session": None, "week": None}, "stale": True, "auth": auth, "err": err,
-            "blocked": False}
+            "blocked": False, "limit": None, "accepted": False, "retry_after": None}
 
-def token_reading(status, headers, body="", no_session=False):
-    """Map one probe response to {u, resets, stale, auth, err, blocked}. Only a 200 or a 429 that
-    carries the unified headers is a reading; anything else is a verdict with no numbers.
+def _retry_after(h):
+    """Retry-After in seconds (the delta form; a date is ignored), else None."""
+    v = _num(h.get("retry-after"))
+    return v if v is not None and v > 0 else None
+
+# The representative claim of a refused request names the limit that refused it. The headers carry
+# windows only for 5h, 7d and Fable's 7d_oi; any other claim (another model's weekly, overage) is a
+# limit the device has no column for, so it is named on the third column (_wire_u).
+_CLAIM_LABELS = {"five_hour": "5H", "seven_day": "WEEK", "seven_day_oi": "FABLE"}
+
+def _limit_label(claim):
+    c = str(claim or "").strip().lower()
+    if c in _CLAIM_LABELS: return _CLAIM_LABELS[c]
+    if c.startswith("seven_day_"): c = c[len("seven_day_"):]
+    return re.sub(r"[^a-z0-9]", "", c).upper()[:7] or "LIMIT"
+
+def token_reading(status, headers, body="", no_session=False, now=None):
+    """Map one probe response to {u, resets, stale, auth, err, blocked, limit, accepted,
+    retry_after}. Only a 200 or a 429 that carries the unified headers is a reading; anything
+    else is a verdict with no numbers.
     Like cswap's header readings (v5.3.0), a reading without both the 5h and the 7d window is
     incomplete and stale: the headers can omit a window, so a missing 5h is never taken on its
     own as an Ultra account with no session limit. `no_session` is the exception: cswap read
     this account from the usage endpoint as having no 5h limit (a verified Ultra), so for it a
-    week with no 5h window is the whole reading, as cswap_accounts_from_json reads it."""
+    week with no 5h window is the whole reading, as cswap_accounts_from_json reads it.
+    `accepted`: Anthropic took the token (a 200, or an answer carrying the account's own rate-limit
+    headers), the only evidence that ends a run of refusals (token_refresh)."""
+    now = time.time() if now is None else now
     h = {str(k).lower(): v for k, v in (headers or {}).items()}
-    if status not in (200, 429) or not any(k.startswith(_UNIFIED) for k in h):
+    has = any(k.startswith(_UNIFIED) for k in h)
+    if status not in (200, 429) or not has:
         auth, err = token_verdict(status, h, body)
-        return _token_unread(err, auth)
+        out = _token_unread(err, auth)
+        out["accepted"] = status == 200 or has
+        out["retry_after"] = _retry_after(h) if status != 200 else None
+        return out
     out = _token_unread("")
+    out["accepted"] = True
+    out["retry_after"] = _retry_after(h) if status != 200 else None
     u, resets = out["u"], out["resets"]
     s, sra = _unified_window(h, "5h")
     w, wra = _unified_window(h, "7d")
@@ -701,6 +752,15 @@ def token_reading(status, headers, body="", no_session=False):
     out["stale"] = w is None or (s is None and not u.get("nos"))
     out["err"] = "partial" if out["stale"] else ""
     out["blocked"] = str(h.get(_UNIFIED + "status", "")).lower() == "rejected"
+    if out["blocked"]:
+        # Refused, whatever the numbers say: a per-model or overage limit can refuse below 100% on
+        # 5h and 7d. Which limit: the window whose own status says rejected, else the claim. Until
+        # when: Retry-After, else the unified reset.
+        win = next((k for k, p in (("s", "5h"), ("w", "7d"), ("f", "7d_oi"))
+                    if str(h.get(_UNIFIED + p + "-status", "")).lower() == "rejected"), "")
+        ra, at = out["retry_after"], _num(h.get(_UNIFIED + "reset"))
+        out["limit"] = {"win": win, "label": _limit_label(h.get(_UNIFIED + "representative-claim")),
+                        "until": now + ra if ra else (at if at and at > 0 else None)}
     return out
 
 def token_refresh(seats, now, force=False, prober=None, lister=None, no_session=()):
@@ -712,11 +772,15 @@ def token_refresh(seats, now, force=False, prober=None, lister=None, no_session=
     rate-limit headers, so every seat would stay unread until someone changed TOKEN_MODEL. The
     token is asked which models it may use instead, and the newest Haiku takes over for this run."""
     prober, lister = prober or token_probe, lister or token_models
-    every = max(float(TOKEN_FLOOR), _cfg_num("TOKEN_EVERY", 300))
+    every = _token_every()
     model = (CONFIG.get("TOKEN_MODEL") or DEFAULTS["TOKEN_MODEL"]).strip()
     due = []
     for name, path in seats:
-        last = _tok.setdefault(name, {"at": 0.0, "read": None, "good": None})["at"]
+        st = _tok.setdefault(name, {"at": 0.0, "read": None, "good": None})
+        # Anthropic said when to ask again (Retry-After). Asking sooner only collects another
+        # refusal, so not even "Re-read accounts" does; the seat keeps showing what it last read.
+        if now < st.get("wait_until", 0): continue
+        last = st["at"]
         if not last or now - last >= every or (force and now - last >= TOKEN_FORCE_GAP):
             due.append((name, path))
     if not due: return
@@ -740,46 +804,81 @@ def token_refresh(seats, now, force=False, prober=None, lister=None, no_session=
             except Exception:
                 res[name] = _token_unread("unavailable"); return
             finally: tok = None
-            res[name] = token_reading(status, h, body, name in no_session)
+            res[name] = token_reading(status, h, body, name in no_session, now)
         except Exception:
             res[name] = _token_unread("unparseable")
     ths = [threading.Thread(target=one, args=s, daemon=True) for s in due]
     for t in ths: t.start()
     end = time.monotonic() + TOKEN_TIMEOUT + 5
     for t in ths: t.join(max(0.0, end - time.monotonic()))
+    refused = []
     for name, _ in due:
         st = _tok[name]
         r = res.get(name) or _token_unread("timeout")
-        # One rejection is not a verdict: a passing authentication fault at Anthropic answers every
-        # seat 401 once, and would flip them all to LOGIN EXPIRED and alert, then recover a probe
-        # later. Until TOKEN_REJECTS come in a row the seat is unread (stale, err token_rejected).
-        st["rejects"] = st.get("rejects", 0) + 1 if r["auth"] == "dead" else 0
-        if r["auth"] == "dead" and st["rejects"] < TOKEN_REJECTS: r["auth"] = "ok"
+        # A refusal is a verdict only once it has lasted: an authentication fault at Anthropic that
+        # outlasts one probe would otherwise flip every seat to LOGIN EXPIRED and alert. Only an
+        # answer that accepts the token ends a run of refusals. A probe that got no verdict at all
+        # (network, timeout, 5xx, a bare 429, an edge page, a missing file) is no news about the
+        # token, so it neither restarts the count nor clears a dead verdict.
+        if r["accepted"]:
+            st.update(rej=0, rej_since=None, auth="ok", ok_at=now, outage=False)
+        elif r["auth"] == "dead":
+            st["rej"] = st.get("rej", 0) + 1
+            st["rej_since"] = st.get("rej_since") or now
+            refused.append(name)
+        r["auth"] = st.get("auth", "ok")
+        if r["retry_after"]: st["wait_until"] = now + min(r["retry_after"], TOKEN_WAIT_MAX)
+        else: st.pop("wait_until", None)
         if r["err"] != ((st.get("read") or {}).get("err")):
             print("[%s] token seat %s: %s" % (time.strftime("%H:%M:%S"), name, r["err"] or "reading"))
         r["at"] = st["at"] = now
         if not r["stale"]:
             r["good_at"] = now; st["good"] = r
         st["read"] = r
+    # Every seat that answers refused at once is Anthropic, not that many revoked year-long
+    # tokens, so the verdict waits longer; one seat refused while another reads is that token.
+    answered = [_tok[n] for n, _ in seats if n in _tok and (_tok[n].get("rej") or _tok[n].get("ok_at"))]
+    outage = len(answered) >= 2 and all(s.get("rej") for s in answered)
+    need = TOKEN_OUTAGE_AFTER if outage else TOKEN_DEAD_AFTER
+    for name in refused:
+        st = _tok[name]
+        if st.get("auth") != "dead" and st["rej"] >= TOKEN_REJECTS and now - st["rej_since"] >= need:
+            st.update(auth="dead", outage=outage)
+        st["read"]["auth"] = st.get("auth", "ok")
+
+def _token_every():
+    return max(float(TOKEN_FLOOR), _cfg_num("TOKEN_EVERY", 300))
+
+def _token_hold():
+    """How long a failed probe keeps showing the last complete reading: two probe intervals, so it
+    covers one failed probe and never a second. The device has no per-account stale flag."""
+    return min(float(TOKEN_HOLD), 2 * _token_every())
 
 def token_view(name, path, now):
     """The fields a seat's token supplies to its record. A failed probe keeps SHOWING the last
     complete reading, with `stale` set so the notifier and the fleet never mistake remembered
     numbers for a fresh reading. The device gets no per-account stale flag, so there a held
-    reading looks live: it is held for TOKEN_HOLD at most, and a window whose reset time has
-    passed is dropped from it at once, because that window is over and its number no longer the
-    account's. A dropped window reads -1 (unknown), never 0."""
+    reading looks live: it is held for two probe intervals at most (_token_hold). A window whose
+    reset time has passed is dropped from whatever is shown, a held reading or one that waits out
+    a Retry-After, because that window is over and its number no longer the account's. A dropped
+    window reads -1 (unknown), never 0. A refusal (`blocked`, `limit`) goes with the numbers it
+    came with, and ends when Anthropic said it would."""
     st = _tok.get(name) or {}
     r, good = st.get("read") or _token_unread("pending"), st.get("good")
-    held = bool(r["stale"] and good and now - good["good_at"] <= TOKEN_HOLD)
+    held = bool(r["stale"] and good and now - good["good_at"] < _token_hold())
     shown = good if held else r
     u, resets = dict(shown["u"]), dict(shown["resets"])
-    if held and resets["session"] and _parse(resets["session"]).timestamp() <= now:
+    old = shown.get("at", now) < now                    # read on an earlier probe, not this one
+    if old and resets["session"] and _parse(resets["session"]).timestamp() <= now:
         u.update(s=-1, sr=""); resets["session"] = None
-    if held and resets["week"] and _parse(resets["week"]).timestamp() <= now:
+    if old and resets["week"] and _parse(resets["week"]).timestamp() <= now:
         u.update(w=-1, wr="", f=-1, fl=""); resets["week"] = None       # Fable rides on the week
+    limit = shown.get("limit") if shown.get("blocked") else None
+    if limit and limit.get("until") and limit["until"] <= now: limit = None
+    wait = st.get("wait_until", 0) - now
     return {"u": u, "resets": resets, "stale": r["stale"],
-            "auth": r["auth"], "err": r["err"], "blocked": r["blocked"], "via": "token",
+            "auth": r["auth"], "err": r["err"], "blocked": bool(limit), "limit": limit,
+            "outage": bool(st.get("outage")), "retry_in": int(wait) if wait > 0 else 0, "via": "token",
             "token_file": path, "good_at": good["good_at"] if good else None,
             "age": int(now - good["good_at"]) if good else 0}
 
@@ -789,18 +888,31 @@ def _match_keys(rec):
             (rec.get("email") or "").lower(), rec["label"].lower()} - {""}
 
 def _token_matches(seats, recs):
-    """{seat: index of the cswap record it reads}: the account its name answers to NOW (slot,
-    alias, email or label). A name that answers to no account is a seat of its own. Nothing is
-    remembered across a rename: ClaudeTV cannot tell whose token it is, so following a renamed
-    account would keep another person's numbers on it whenever the line named the wrong account
-    (the issue's TEAM5, set as team5= and then renamed away), with its dead login hidden. An email
-    or a slot never changes in a rename, so a seat named by one follows its account anyway."""
+    """({seat: index of the cswap record it reads}, {seat: why it reads no cswap record}): the
+    account its name answers to NOW (slot, alias, email or label). A name that answers to no
+    account is a seat of its own. Nothing is remembered across a rename: ClaudeTV cannot tell whose
+    token it is, so following a renamed account would keep another person's numbers on it whenever
+    the line named the wrong account (the issue's TEAM5, set as team5= and then renamed away), with
+    its dead login hidden. An email or a slot never changes in a rename, so a seat named by one
+    follows its account anyway.
+    A name more than one account answers to binds to none of them: claude-swap allows one email in
+    several orgs, and picking one would put the token's numbers on an account that may not be its
+    own (one with no token at all), with the seat's own lapsed login still showing. Every account
+    cswap lists counts, CSWAP_ACCOUNTS or not, since the token may be a hidden account's. The seat
+    is then shown on its own, with a note to name it by slot, which is unique."""
     claude = [j for j, r in enumerate(recs) if r.get("provider", "claude") == "claude"]
-    at, taken = {}, set()
+    slot = lambda r: str(r.get("key", "")).split(":", 1)[0]
+    listed = list(_cswap_names) + [(_match_keys(recs[j]), slot(recs[j])) for j in claude]
+    at, notes, taken = {}, {}, set()
     for name, _ in seats:
+        owners = sorted({s for keys, s in listed if name in keys}, key=lambda s: (len(s), s))
+        if len(owners) > 1:
+            notes[name] = ("matches claude-swap slots %s: name this seat by its slot in CLAUDE_TOKENS"
+                           % " and ".join(owners))
+            continue
         i = next((j for j in claude if j not in taken and name in _match_keys(recs[j])), None)
         if i is not None: at[name] = i; taken.add(i)
-    return at
+    return at, notes
 
 def apply_token_seats(recs, now, force=False, prober=None, lister=None):
     """Overlay every configured setup-token seat onto the cswap records.
@@ -816,7 +928,7 @@ def apply_token_seats(recs, now, force=False, prober=None, lister=None):
     seats = token_seats()
     if not seats: return recs
     out = list(recs)
-    at = _token_matches(seats, out)
+    at, notes = _token_matches(seats, out)
     nos = {name for name, i in at.items() if out[i]["u"].get("nos")}
     try: token_refresh(seats, now, force, prober, lister, nos)
     except Exception as e: print("[token] probe pass failed: %s" % str(e)[:80])
@@ -829,9 +941,13 @@ def apply_token_seats(recs, now, force=False, prober=None, lister=None):
                           cs={"u": base["u"], "stale": base["stale"]})
         else:
             email = name if "@" in name else ""
+            note = notes.get(name, "")
+            st = _tok.setdefault(name, {"at": 0.0, "read": None, "good": None})
+            if note and st.get("note") != note: print("[token] seat %s %s" % (name, note))
+            st["note"] = note
             out.append(dict(view, provider="claude", key="token:" + name,
                             label=_label("" if email else name, email, ""), alias="", email=email,
-                            active=False, disabled=False, token_only=True))
+                            active=False, disabled=False, token_only=True, note=note))
     return out
 
 def _wire_u(rec):
@@ -840,9 +956,23 @@ def _wire_u(rec):
     of a session that was READ: a token seat's session nobody could read (s=-1: not read yet, an
     unreadable token, a failed probe past its hold) gets "--" there instead, on every firmware
     already in the field. Only token seats: every other account is sent exactly as before, and a
-    token seat with no 5h limit (nos) has its own card and keeps ""."""
+    token seat with no 5h limit (nos) has its own card and keeps "".
+    A refused token seat (429, status rejected) cannot be used, whatever its numbers say: a
+    per-model or overage limit can refuse it below 100% on 5h and 7d. The device has no "blocked"
+    field, so unless a number on its card already reads 100, the limit that refused it is shown at
+    100 with the fields every firmware draws: the window the headers marked rejected, else the
+    third column, named after the limit (OPUS, OVERAGE, or LIMIT when the headers name none). Only
+    the device copy: the record, the notifier and the terminal keep the numbers that were read."""
     u = rec["u"]
-    if rec.get("via") == "token" and u.get("s", -1) < 0 and not u.get("nos") and not u.get("sr"):
+    if rec.get("via") != "token": return u
+    lim = rec.get("limit") if rec.get("blocked") else None
+    if lim and not any(u.get(k, -1) >= 100 for k in ("s", "w", "f")):
+        u, win = dict(u), lim.get("win")
+        if win in ("s", "w", "f") and u.get(win, -1) >= 0 and not (win == "s" and u.get("nos")):
+            u[win] = 100
+        else:
+            u["f"], u["fl"] = 100, lim.get("label") or "LIMIT"
+    if u.get("s", -1) < 0 and not u.get("nos") and not u.get("sr"):
         u = dict(u, sr="--")
     return u
 
@@ -1848,21 +1978,23 @@ def claude_source(now, force=False, prober=None, lister=None):
     """cswap's accounts with every setup-token seat applied -> (records, err).
 
     A token seat does not depend on cswap: it is probed and published whether cswap is there or
-    not. When cswap is not installed or lists no accounts, the token seats are the whole source
-    and the poll is complete (err ""; the dashboards still show why cswap has nothing). When cswap
-    fails, its last records stay on show, marked stale so neither the notifier nor the fleet
-    verdict takes them for this poll's, and err says why, so the device still reads the poll as
-    stale. With no token seat configured, a cswap failure raises exactly as before."""
-    global _cswap_last
+    not. When cswap is not installed or lists no accounts and has not been read since the start,
+    the token seats are the whole source and the poll is complete (err ""; the dashboards still
+    show why cswap has nothing). When cswap fails after a good read, its last records are shown
+    again exactly as they were and err says why, so the device reads the poll as stale as it always
+    has: before token seats a failed read published nothing, so every account kept its last record
+    (poll_claude runs no alert, reset or fleet pass on them either). With no token seat
+    configured, a cswap failure raises exactly as before."""
+    global _cswap_last, _cswap_names
     try:
         base, err = fetch_accounts(), ""
         _cswap_last = base
-    except NoCswapAccounts:
-        if not token_seats(): raise
-        base, err, _cswap_last = [], "", []
     except Exception as e:
         if not token_seats(): raise
-        base, err = [dict(r, stale=True) for r in _cswap_last], str(e) or "cswap failed"
+        if isinstance(e, NoCswapAccounts) and not _cswap_last:
+            base, err, _cswap_names = [], "", []
+        else:
+            base, err = list(_cswap_last), str(e) or "cswap failed"
     return apply_token_seats(base, now, force, prober, lister), err
 
 def poll_claude(now, force=False, prober=None, lister=None):
@@ -1875,12 +2007,16 @@ def poll_claude(now, force=False, prober=None, lister=None):
     with _lock:
         _usage_err = err[:90]
         if not err: _usage_ts = int(now)
-    _auth_transitions(accts)
+    # When cswap failed, only the token seats were read on this poll. Every other record is cswap's
+    # last one, shown again as it was; a failed read used to run no alert, reset or fleet pass at
+    # all, so none runs on those records now, and the fleet verdict holds.
+    fresh = accts if not err else [a for a in accts if a.get("via") == "token"]
+    _auth_transitions(fresh)
     # the first poll that read cswap re-homes state onto stable keys (token-only seats have none)
     if not _migrated and not err and any(not a.get("token_only") for a in accts):
         _migrated = True
         migrate_notify_state(accts)
-    for rec in accts:                       # detect/log/notify resets (never raises)
+    for rec in fresh:                       # detect/log/notify resets (never raises)
         # A stale/partial reading is skipped outright rather than baselined: writing
         # it would make the NEXT good poll look like a jump back up.
         if notifiable(rec):
@@ -1888,8 +2024,9 @@ def poll_claude(now, force=False, prober=None, lister=None):
     # "every account is out" is the only state that actually blocks you; one account
     # capping just makes cswap switch. Checked after the per-account pass so the
     # verdict uses this poll's numbers.
-    _f = fleet_check(accts, switch_policy())
-    with _lock: _fleet = _f
+    if not err:
+        _f = fleet_check(accts, switch_policy())
+        with _lock: _fleet = _f
     return not err
 
 def _auth_transitions(accts):
@@ -1901,10 +2038,15 @@ def _auth_transitions(accts):
         if dead and not was:
             _alerted[rec["key"]] = True
             if rec.get("via") == "token":
-                _auth_alert("dead", "Anthropic rejected the setup token for %s, read from %s. That seat "
-                            "shows LOGIN EXPIRED on the display until its token works again. Mint a new "
-                            "one with `claude setup-token`, signed in as that account, and replace the "
-                            "file. No regular login is needed." % (who, rec.get("token_file") or "its token file"))
+                _auth_alert("dead", "Anthropic has refused the setup token for %s, read from %s, for %d "
+                            "minutes. That seat shows LOGIN EXPIRED on the display until its token works "
+                            "again. Mint a new one with `claude setup-token`, signed in as that account, "
+                            "and replace the file. No regular login is needed.%s"
+                            % (who, rec.get("token_file") or "its token file",
+                               (TOKEN_OUTAGE_AFTER if rec.get("outage") else TOKEN_DEAD_AFTER) // 60,
+                               " Every token seat is being refused at once, which more often means a fault "
+                               "at Anthropic: check status.anthropic.com before replacing tokens."
+                               if rec.get("outage") else ""))
             elif codex:
                 _auth_alert("codex_dead", "OpenAI rejected the Codex login for %s. That account shows "
                             "LOGIN EXPIRED on the display until you log in again. Run this in your own "
@@ -1996,6 +2138,10 @@ def full_state():
                                    "disabled": a.get("disabled", False),
                                    "provider": a.get("provider", "claude"), "plan": a.get("plan", ""),
                                    "via": a.get("via", ""),
+                                   # a token seat: the limit that refused it, why it reads no cswap
+                                   # account, and when Retry-After lets it be probed again
+                                   "limit": (a.get("limit") or {}).get("label", ""),
+                                   "note": a.get("note", ""), "retry_in": a.get("retry_in", 0),
                                    "blocked": a.get("blocked", False), "home": a.get("home", ""),
                                    "buckets": a.get("buckets", []), **a["u"]} for a in accts]},
             "usage": {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err, **(u or {})},
@@ -2172,13 +2318,15 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
    const f=a.f>=0?(' · '+esc(a.fl||'F')+' <b>'+pc(a.f)+'</b>'):'';
    return '<div style="border-top:1px solid var(--line);padding:8px 0">'
     +'<div class=row style=margin:0><span><b>'+esc(a.label)+'</b> <span class=muted>'+(a.provider=='codex'?'codex':'claude')+(tk?' token':'')+(a.plan?(' '+esc(a.plan)):'')
-      +'</span>'+(a.blocked?' <span style=color:#f0ad36>blocked</span>':'')+(a.provider!='codex'&&a.active?' <span class=muted>active</span>':'')
+      +'</span>'+(a.blocked?' <span style=color:#f0ad36>blocked'+(a.limit?(' · '+esc(a.limit)):'')+'</span>':'')+(a.provider!='codex'&&a.active?' <span class=muted>active</span>':'')
       +' <a href=# class=muted data-rename="'+esc(a.key)+'" data-label="'+esc(a.label)+'" style="text-decoration:underline">rename</a>'
       +'</span><span class="pill '+(dead?'bad':'ok')+'">'+(dead?(tk?'TOKEN REJECTED':'LOGIN EXPIRED'):'ok')+'</span></div>'
     +'<div class=row style="margin:2px 0"><span class=muted>'+esc(a.email||'')+'</span>'
       +'<span>'+(a.stale?'<span style=color:#f0ad36>stale </span>':'')
         +((a.provider=='codex'&&a.s<0)?'':a.nos?'<span class=muted>no 5h limit</span> · ':('S <b>'+pc(a.s)+'</b> · '))+'W <b>'+pc(a.w)+'</b>'+f+'</span></div>'
     +(dead&&tk?'<div class=muted>mint a new one with <code>claude setup-token</code> and replace the token file</div>':'')
+    +(a.note?('<div style=color:#f0ad36>'+esc(a.note)+'</div>'):'')
+    +(a.retry_in>0?('<div class=muted>not probed again for '+Math.ceil(a.retry_in/60)+' min: Anthropic sent Retry-After</div>'):'')
     +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+esc(a.home)+' codex login --device-auth</code></div>'):'')
     +'<div class=row style=margin:0><span class=muted>'+(((a.provider=='codex'&&a.s<0)||a.nos)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):(a.s<0&&tk?'':'idle'))+(a.wr?(' · '+esc(a.wr)):'')))
       +'</span><span class=muted>'+esc(a.err||(a.age?a.age+'s':''))+'</span></div>'
