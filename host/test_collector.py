@@ -2633,7 +2633,7 @@ class TestSetupTokenSeatsHold(TokenPollIsolated):
         acc = {a["l"]: a for a in srv.usage_wire([idle, ultra], {})["acc"]}
         self.assertEqual([acc[k]["sr"] for k in ("IDLE", "ULTRA")], ["", ""])
         self.assertEqual(r["u"]["sr"], "")
-        self.assertIn("a.s<0&&tk?'':'idle'", srv.TERMINAL)
+        self.assertIn("a.s<0&&(tk||(a.ended||[]).includes('s'))?'':'idle'", srv.TERMINAL)
 
     def test_accounts_without_a_token_are_sent_exactly_as_before(self):
         # The wire as v5.3.0 built it: the flat keys are the lead's `u`, each acc[] entry is
@@ -2652,8 +2652,9 @@ class TestSetupTokenSeatsHold(TokenPollIsolated):
         self.configure(team1=self.token_file("team1"))
         acc = srv.usage_wire(self.seats(d=d), {})["acc"]
         self.assertEqual([a for a in acc if a["l"] != "TEAM1"], before(plain[1:]))
-        self.assertIn("(a.sr?('resets '+esc(a.sr)):(a.s<0&&tk?'':'idle'))", srv.TERMINAL,
-                      "the terminal still says idle for them too")
+        # (an ended held session, issue #16, is the one exception: it is not known, so not idle)
+        self.assertIn("(a.sr?('resets '+esc(a.sr)):(a.s<0&&(tk||(a.ended||[]).includes('s'))?'':'idle'))",
+                      srv.TERMINAL, "the terminal still says idle for them too")
 
     # -- the master terminal's source line --------------------------------------------------------
     def test_the_terminal_counts_token_seats_apart_from_cswap(self):
@@ -3094,6 +3095,188 @@ class TestSetupTokenSeatsReview3(TokenPollIsolated):
         finally:
             if home is None: os.environ.pop("HOME", None)
             else: os.environ["HOME"] = home
+
+
+
+# ---------- issue #16: Team seats and their weekly window ----------
+# Recorded live on 9 Nov 2026 at 03:12:19 UTC: one raw probe per Team seat token, the collector's
+# own request (token_probe). Rate-limit headers only, values exactly as Anthropic sent them.
+PROBED_AT = 1794193939.0
+_UH = "anthropic-ratelimit-unified-"
+
+def _recorded(five, five_reset, seven, seven_reset, seven_status="allowed", status="allowed",
+              claim="five_hour", reset=None, extra=None):
+    h = {_UH + "5h-utilization": five, _UH + "5h-reset": five_reset, _UH + "5h-status": "allowed",
+         _UH + "7d-utilization": seven, _UH + "7d-reset": seven_reset, _UH + "7d-status": seven_status,
+         _UH + "status": status, _UH + "representative-claim": claim,
+         _UH + "reset": reset or five_reset, _UH + "fallback-percentage": "0.5",
+         _UH + "overage-status": "rejected", _UH + "overage-disabled-reason": "org_level_disabled"}
+    h.update(extra or {})
+    return h
+
+RECORDED_9NOV = {
+    # refused on its seven_day window: 7d at 1.0 and rejected, the probe answered 429
+    "TEAM1": (429, _recorded("0.0", "1794211800", "1.0", "1794326400", seven_status="rejected",
+                             status="rejected", claim="seven_day", reset="1794326400",
+                             extra={_UH + "7d-surpassed-threshold": "1.0", "retry-after": "132460"}),
+              '{"type":"error","error":{"type":"rate_limit_error","message":"This request would '
+              'exceed your account\'s rate limit. Please try again later."}}'),
+    "TEAM2": (200, _recorded("0.01", "1794210600", "0.0", "1794776400"), "{}"),
+    "TEAM3": (200, _recorded("0.0", "1794211800", "0.0", "1794618000"), "{}"),
+    "TEAM4": (200, _recorded("0.0", "1794211800", "0.13", "1794574800"), "{}"),
+}
+
+
+class TestTeamSeatWeeklyWindow(TokenIsolated):
+    """Issue #16. The owner's understanding was that Team seats have a 5-hour window and no weekly
+    limit, so W 100% on them looked like a bug. The recorded headers say otherwise: every Team seat
+    carries its own 7d window, and TEAM1 was refused (429, 7d-status rejected, claim seven_day).
+    A weekly number the headers carry is the seat's, so it stays on screen, a real block included:
+    hiding it would show a seat that cannot run work as free."""
+
+    def reading(self, seat):
+        status, h, body = RECORDED_9NOV[seat]
+        return srv.token_reading(status, h, body, now=PROBED_AT)
+
+    def test_team1_is_refused_on_its_weekly_window_and_the_display_says_so(self):
+        r = self.reading("TEAM1")
+        self.assertFalse(r["stale"])
+        self.assertEqual((r["u"]["s"], r["u"]["w"], r["u"]["f"]), (0, 100, -1))
+        self.assertEqual(r["resets"]["week"], "2026-11-10T16:00:00+00:00")
+        self.assertEqual(r["u"]["wr"], "Nov 10 4pm")
+        self.assertTrue(r["blocked"])
+        self.assertEqual((r["limit"]["win"], r["limit"]["label"]), ("w", "WEEK"))
+        self.assertEqual(r["retry_after"], 132460)
+        dev = srv._wire_u({"via": "token", "u": r["u"], "blocked": True, "limit": r["limit"]})
+        self.assertEqual((dev["s"], dev["w"], dev["wr"]), (0, 100, "Nov 10 4pm"))
+
+    def test_team_seats_under_their_cap_show_the_weekly_the_headers_carry(self):
+        for seat, want in (("TEAM2", (1, 0)), ("TEAM3", (0, 0)), ("TEAM4", (0, 13))):
+            r = self.reading(seat)
+            self.assertEqual((r["u"]["s"], r["u"]["w"]), want, seat)
+            self.assertFalse(r["stale"], seat)
+            self.assertEqual(r["err"], "", seat)
+            self.assertTrue(r["u"]["wr"], seat)
+            # overage disabled for the org is not a block, and no window is read as a third column
+            self.assertFalse(r["blocked"], seat)
+            self.assertEqual(r["u"]["f"], -1, seat)
+
+    def test_end_to_end_the_recorded_team1_probe_reaches_the_device_as_its_weekly_100(self):
+        self.configure(team1=self.token_file("team1"))
+        recs = self.seats(now=PROBED_AT, replies=(RECORDED_9NOV["TEAM1"],))
+        t1 = self.by_label(recs)["TEAM1"]
+        self.assertEqual((t1["u"]["w"], t1["blocked"], t1["limit"]["label"]), (100, True, "WEEK"))
+        acc = {a["l"]: a for a in srv.usage_wire(recs, {})["acc"]}
+        self.assertEqual((acc["TEAM1"]["w"], acc["TEAM1"]["auth"]), (100, "ok"))
+
+
+# TEAM5 as cswap listed it on 9 Nov: its login lapsed, so cswap serves the last good read from the
+# usage endpoint (8 Nov 12:04 UTC), whose week reset on 8 Nov at 18:00 UTC.
+HELD_TEAM5 = {"number": 7, "email": "seat5@example.com", "alias": "team5", "active": False,
+              "usageStatus": "unavailable", "usage": None, "lastGoodAgeSeconds": 54431.0,
+              "lastGoodUsage": {"fiveHour": {"pct": 0.0},
+                                "sevenDay": {"pct": 100.0, "resetsAt": "2026-11-08T18:00:00.085882+00:00"},
+                                "scoped": [{"pct": 0.0, "name": "Fable",
+                                            "resetsAt": "2026-11-08T18:00:00+00:00"}]}}
+
+def held_doc(**team5):
+    d = doc()
+    personal = d["accounts"][1]
+    personal.update({"active": True})
+    row = json.loads(json.dumps(HELD_TEAM5)); row.update(team5)
+    d["accounts"] = [personal, row]
+    return d
+
+
+class TestHeldReadingPastItsReset(TzPinned):
+    """Issue #16. A cswap account whose login lapsed is shown from cswap's last good reading,
+    held for as long as the login stays lapsed. TEAM5's week reset on 9 Nov at 05:00 AEDT, but
+    the display kept W 100% with "resets Nov 9 5am": a window that has ended is not the account's
+    number any more. Such a window reads -1 ("--", never 0), as a setup-token seat's already does.
+    A fresh reading is never touched, so an account cswap reads (PERSONAL) reads exactly as before."""
+
+    def setUp(self):
+        super().setUp()
+        self._pub = (dict(srv._src_accts), list(srv._accounts))
+
+    def tearDown(self):
+        srv._src_accts.clear(); srv._src_accts.update(self._pub[0])
+        srv._accounts = self._pub[1]
+        super().tearDown()
+
+    def publish(self, d):
+        recs = srv.cswap_accounts_from_json(d)
+        srv._publish("claude", recs)
+        return recs
+
+    def device(self, now, primary=""):
+        return {a["l"]: a for a in srv.device_json(primary, now=now)["acc"]}
+
+    def terminal(self, now):
+        return {a["label"]: a for a in srv.full_state(now=now)["accounts"]["list"]}
+
+    def test_a_held_week_past_its_reset_reads_unknown_not_100(self):
+        self.publish(held_doc())
+        t5 = self.device(PROBED_AT)["TEAM5"]
+        self.assertEqual((t5["w"], t5["wr"]), (-1, ""))
+        self.assertEqual((t5["f"], t5["fl"]), (-1, ""), "the model weekly rides on the week")
+        self.assertEqual((t5["s"], t5["sr"]), (0, ""), "a window with no reset time is not judged")
+        row = self.terminal(PROBED_AT)["TEAM5"]
+        self.assertEqual((row["w"], row["wr"], row["f"]), (-1, "", -1))
+        self.assertTrue(row["stale"])
+
+    def test_the_flat_keys_of_a_device_pinned_to_it_read_unknown_too(self):
+        self.publish(held_doc())
+        st = srv.device_json("team5", now=PROBED_AT)
+        self.assertEqual((st["w"], st["wr"], st["f"]), (-1, "", -1))
+
+    def test_before_its_reset_a_held_week_still_shows_its_last_good_number(self):
+        self.publish(held_doc())
+        before = datetime(2026, 11, 8, 17, 0, tzinfo=timezone.utc).timestamp()
+        t5 = self.device(before)["TEAM5"]
+        self.assertEqual((t5["w"], t5["wr"], t5["f"]), (100, "Nov 8 6pm", 0))
+
+    def test_a_held_session_past_its_reset_reads_unknown_not_idle(self):
+        last = json.loads(json.dumps(HELD_TEAM5["lastGoodUsage"]))
+        last["fiveHour"] = {"pct": 45.0, "resetsAt": "2026-11-08T20:10:00+00:00"}
+        last["sevenDay"]["resetsAt"] = "2026-11-12T18:00:00+00:00"
+        self.publish(held_doc(lastGoodUsage=last))
+        t5 = self.device(PROBED_AT)["TEAM5"]
+        self.assertEqual((t5["s"], t5["sr"]), (-1, "--"), "the device must not say idle")
+        self.assertEqual((t5["w"], t5["wr"]), (100, "Nov 12 6pm"), "its week has not ended")
+        row = self.terminal(PROBED_AT)["TEAM5"]
+        self.assertEqual((row["s"], row["sr"]), (-1, ""))
+        self.assertEqual(row["ended"], ["s"])
+
+    def test_a_fresh_reading_reads_exactly_as_before_even_past_its_reset(self):
+        # PERSONAL's fixture resets are in August, long before PROBED_AT: a fresh cswap reading
+        # is cswap's to refresh, and is sent exactly as it always was
+        recs = self.publish(held_doc())
+        before = srv.usage_wire([recs[0]], {})["acc"][0]
+        self.assertEqual(self.device(PROBED_AT)["PERSONAL"], before)
+        flat = srv.device_json("", now=PROBED_AT)
+        for k in ("s", "w", "sr", "wr", "f", "fl"):
+            self.assertEqual(flat[k], recs[0]["u"][k], k)
+        self.assertEqual(self.terminal(PROBED_AT)["PERSONAL"].get("ended", []), [])
+
+    def test_the_published_record_and_the_notifier_keep_what_was_read(self):
+        recs = self.publish(held_doc())
+        srv.device_json("", now=PROBED_AT); srv.full_state(now=PROBED_AT)
+        self.assertEqual(recs[1]["u"]["w"], 100)
+        self.assertEqual(srv._accounts[1]["u"]["w"], 100)
+        self.assertFalse(srv.notifiable(recs[1]), "a held reading never drives the notifier")
+
+    def test_a_setup_token_seat_is_judged_by_its_own_reading_not_the_held_one(self):
+        rec = dict(srv.cswap_accounts_from_json(held_doc())[1], via="token")
+        self.assertIs(srv.held_view(rec, PROBED_AT), rec)
+
+    def test_codex_and_ultra_records_are_untouched_or_keep_their_shape(self):
+        last = {"sevenDay": {"pct": 37.0, "resetsAt": "2026-11-08T18:00:00+00:00"}}
+        self.publish(held_doc(lastGoodUsage=last))
+        t5 = self.device(PROBED_AT)["TEAM5"]
+        self.assertEqual((t5["w"], t5["wr"]), (-1, ""))
+        self.assertEqual(t5.get("nos"), 1, "a verified no-5h account keeps its own card")
+        self.assertEqual(t5["sr"], "", "no session column to mark")
 
 
 if __name__ == "__main__":
