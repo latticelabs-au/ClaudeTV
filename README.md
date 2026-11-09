@@ -223,6 +223,10 @@ accounts** in the master terminal if you want it immediately.
 - **Per‑account everything**: a dead login takes over only *its* card (`LOGIN EXPIRED`) while the
   others keep showing, alerts are prefixed with the account label, and reset detection is keyed
   per account — so switching accounts can never be mistaken for a usage reset.
+- **An account cswap cannot read** (its login lapsed, say) keeps showing its last good reading,
+  marked stale on the dashboards, as it always has, but never a window whose reset time has
+  passed: that window has ended, so it reads `--` (never 0) until cswap reads the account again.
+  An ended session reads `--` on the display, not `idle`.
 - **One device per account instead of cycling?** Point it at `/usage?acct=<label>` — that serves a
   single account, and the header reverts to the classic title.
 - The firmware cycles up to **8** accounts (`MAXACC`); the collector itself has no limit.
@@ -277,8 +281,12 @@ CLAUDETV_CLAUDE_TOKENS=team1@example.com=/home/me/tokens/team1.token,ops@example
   limit). The display has no *blocked* marker, so there the limit that refused it reads 100%: the
   window the headers mark as refused, else the third column, named after the limit (`OPUS`,
   `OVERAGE`, or `LIMIT` when the headers name none). The master terminal keeps the real numbers
-  and says `blocked · OPUS`. The headers carry no model‑scoped weekly window apart from Fable's
-  (`7d_oi`), so a token seat usually has no third (Fable) column, rather than a made‑up one.
+  and says `blocked · OPUS`. Team seats have a weekly window too: each seat carries its own
+  rolling 7‑day window in the headers (and did in the usage endpoint before its login lapsed),
+  and Anthropic refuses a seat that reaches it (429, `seven_day`) until it resets. Such a seat
+  shows W 100% and `blocked · WEEK`, because it cannot run work (#16). The headers carry no
+  model‑scoped weekly window apart from Fable's (`7d_oi`), so a token seat usually has no third
+  (Fable) column, rather than a made‑up one.
 - **No 5‑hour limit (Ultra):** an account cswap has read as having no 5‑hour limit shows its
   weekly card through its token too. A token‑only seat on such an account stays stale with its
   session at `--`: the headers carry a utilization, a reset and a status for each window they
@@ -428,7 +436,9 @@ Only a reading from the usage endpoint counts. When cswap read an account throug
 header probe (`"source": "headers"` in `cswap list --json`), a missing `fiveHour` only means the
 headers did not carry that window, and cswap treats the reading as incomplete; so does ClaudeTV,
 which keeps it stale. An account that reports a 5‑hour window but no weekly one (claude‑swap names
-Team and Enterprise seats) is also still stale, as before.
+Team and Enterprise seats) is also still stale, as before. Team seats are not always that shape:
+the ones read for #16 each reported a 7‑day window, from the usage endpoint and the rate‑limit
+headers alike, and that window is shown as read.
 
 Before v5.3 the collector treated a verified Ultra account as a partial reading. Its numbers kept
 updating, but the master terminal tagged it stale, it never sent a reset alert, and it counted as

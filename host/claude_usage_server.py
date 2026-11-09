@@ -268,7 +268,7 @@ def cswap_accounts_from_json(doc, only=""):
         status = (a.get("usageStatus") or "ok").strip().lower()
         # usage is None for EVERY non-ok status; display-grade numbers move to lastGoodUsage.
         usage = a.get("usage")
-        stale = not isinstance(usage, dict)
+        stale = held = not isinstance(usage, dict)
         if stale: usage = a.get("lastGoodUsage") or {}
         fh, sd = usage.get("fiveHour"), usage.get("sevenDay")
         # A verified Ultra account has NO five-hour limit: the usage API answers five_hour: null
@@ -304,7 +304,9 @@ def cswap_accounts_from_json(doc, only=""):
         recs.append({"provider": "claude", "key": "%s:%s" % (num, email), "label": _label(a.get("alias"), email, num),
                      "alias": (a.get("alias") or "").strip(),
                      "email": email, "active": bool(a.get("active")), "u": u, "stale": stale,
-                     "disabled": bool(a.get("disabled")),
+                     # held: cswap could not read the account and serves its last good reading
+                     # (held_view drops a window from it once that window has ended)
+                     "held": held, "disabled": bool(a.get("disabled")),
                      "resets": {"session": fh.get("resetsAt"), "week": sd.get("resetsAt")},
                      # Only a status that genuinely needs a human is "dead". Transient ones
                      # (token_expired, foreign_credential mid-switch, unavailable) must NOT
@@ -322,6 +324,29 @@ def cswap_accounts_from_json(doc, only=""):
             if w in keys and rec not in picked:
                 picked.append(rec); break
     return picked
+
+def held_view(rec, now):
+    """A held cswap reading as it may be SHOWN at `now` (issue #16). cswap keeps serving an
+    account's last good reading for as long as its login stays lapsed, and the collector has
+    always shown it: the dashboards mark it stale, the device has no per-account stale marker.
+    A window whose reset time has passed has ended, so its number is no longer the account's:
+    TEAM5 kept W 100% with "resets Nov 9 5am" all day after its week had reset. Such a window
+    reads -1 (--, never 0), the rule a setup-token seat's held reading already follows
+    (token_view), and the model weekly rides on the week as it does there and in the notifier.
+    `ended` names the windows dropped, so the device can say "--" for a session instead of
+    "idle". Only the view: the published record, the notifier and the fleet keep what was read
+    (none of them uses a held reading anyway). A fresh reading, a token seat and a Codex account
+    come back as they are."""
+    if not rec.get("held") or rec.get("via") == "token": return rec
+    u, resets, ended = dict(rec["u"]), dict(rec.get("resets") or {}), []
+    def over(iso):
+        try: return bool(iso) and _parse(iso).timestamp() <= now
+        except Exception: return False
+    if over(resets.get("session")):
+        u.update(s=-1, sr=""); resets["session"] = None; ended.append("s")
+    if over(resets.get("week")):
+        u.update(w=-1, wr="", f=-1, fl=""); resets["week"] = None; ended.append("w")
+    return dict(rec, u=u, resets=resets, ended=ended) if ended else rec
 
 # ---------- fleet exhaustion (the "you are actually blocked" signal) ----------
 # With cswap auto-switching, ONE account hitting its cap is a non-event: cswap moves to another
@@ -964,7 +989,9 @@ def _wire_u(rec):
     third column, named after the limit (OPUS, OVERAGE, or LIMIT when the headers name none). Only
     the device copy: the record, the notifier and the terminal keep the numbers that were read."""
     u = rec["u"]
-    if rec.get("via") != "token": return u
+    if rec.get("via") != "token":
+        # a held session that has ended (held_view) is not known, so it is not "idle" either
+        return dict(u, sr="--") if "s" in (rec.get("ended") or ()) else u
     lim = rec.get("limit") if rec.get("blocked") else None
     if lim and not any(u.get(k, -1) >= 100 for k in ("s", "w", "f")):
         u, win = dict(u), lim.get("win")
@@ -2096,11 +2123,14 @@ def poller():
                 with _lock: _wx_err = str(e)[:50]
         time.sleep(2)
 
-def device_json(primary=""):
+def device_json(primary="", now=None):
+    now = time.time() if now is None else now
     with _lock:
         accts, ts, err, wx = list(_accounts), _usage_ts, _usage_err, _wx
         # a Codex-only host has no Claude source to report on: its clock and errors are Codex's
         if not _src_accts["claude"] and _src_accts["codex"]: ts, err = _codex["ts"], ""
+    # judged when served, not when read: a held window ends while cswap keeps failing too
+    accts = [held_view(a, now) for a in accts]
     st = usage_wire(accts, wx, primary)
     # collector-side staleness (when we last polled) beats a per-account cache age here: it is
     # what the device's "stale Nm" readout has always meant.
@@ -2111,8 +2141,10 @@ def device_json(primary=""):
     if err: st["err"] = err
     return st
 
-def full_state():
+def full_state(now=None):
+    now = time.time() if now is None else now
     with _lock: accts, ts, err, wx, wxe = list(_accounts), _usage_ts, _usage_err, _wx, _wx_err
+    accts = [held_view(a, now) for a in accts]
     u = accts[0]["u"] if accts else None
     return {"service": {"uptime_s": int(time.time() - START_TS), "port": PORT},
             "fleet": {**_fleet, "policy": switch_policy()},
@@ -2143,6 +2175,7 @@ def full_state():
                                    "limit": (a.get("limit") or {}).get("label", ""),
                                    "note": a.get("note", ""), "retry_in": a.get("retry_in", 0),
                                    "blocked": a.get("blocked", False), "home": a.get("home", ""),
+                                   "ended": a.get("ended", []),
                                    "buckets": a.get("buckets", []), **a["u"]} for a in accts]},
             "usage": {"ok": 1 if u else 0, "age": (int(time.time()) - ts) if ts else -1, "err": err, **(u or {})},
             "update": update_status(),
@@ -2328,7 +2361,7 @@ function load(){fetch('/api/state').then(r=>r.json()).then(s=>{
     +(a.note?('<div style=color:#f0ad36>'+esc(a.note)+'</div>'):'')
     +(a.retry_in>0?('<div class=muted>not probed again for '+Math.ceil(a.retry_in/60)+' min: Anthropic sent Retry-After</div>'):'')
     +(dead&&a.provider=='codex'?('<div class=muted>run on this host: <code>CODEX_HOME='+esc(a.home)+' codex login --device-auth</code></div>'):'')
-    +'<div class=row style=margin:0><span class=muted>'+(((a.provider=='codex'&&a.s<0)||a.nos)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):(a.s<0&&tk?'':'idle'))+(a.wr?(' · '+esc(a.wr)):'')))
+    +'<div class=row style=margin:0><span class=muted>'+(((a.provider=='codex'&&a.s<0)||a.nos)?(a.wr?('resets '+esc(a.wr)):''):((a.sr?('resets '+esc(a.sr)):(a.s<0&&(tk||(a.ended||[]).includes('s'))?'':'idle'))+(a.wr?(' · '+esc(a.wr)):'')))
       +'</span><span class=muted>'+esc(a.err||(a.age?a.age+'s':''))+'</span></div>'
     +((a.buckets||[]).length>1?('<div class=muted style="margin-top:2px">'+a.buckets.map(b=>esc(b.name||b.id)+': '
       +b.windows.map(w=>pc(w.pct)+'/'+(w.mins>=1440?Math.round(w.mins/1440)+'d':(w.mins?Math.round(w.mins/60)+'h':'?'))).join(' ')).join(' | ')+'</div>'):'')
